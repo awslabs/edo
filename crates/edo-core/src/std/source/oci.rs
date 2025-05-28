@@ -100,7 +100,7 @@ impl SourceImpl for ImageSource {
             *id.digest() == digest,
             error::DigestSnafu {
                 actual: id.digest().clone(),
-                expected: self.digest.clone()
+                expected: digest.clone()
             }
         );
         let image = index
