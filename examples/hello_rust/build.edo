@@ -1,0 +1,38 @@
+# This is a simple rust build example using cargo vendor to precache the dependencies
+
+transform(
+    name="code",
+    kind="import",
+    source=[
+        source(
+            name="src",
+            kind="local",
+            path="hello_rust",
+            out=".",
+            is_archive=False
+        )
+    ]
+)
+
+transform(
+    name="vendor",
+    kind="script",
+    depends=["//hello_rust/code"],
+    commands = [
+        "mkdir -p {{install-root}}/.cargo",
+        "cargo vendor > vendor.toml",
+        "cp -rf {{build-root}}/vendor {{install-root}}/vendor",
+        "cp vendor.toml {{install-root}}/.cargo/config.toml"
+    ]
+)
+
+transform(
+    name="build",
+    kind="script",
+    depends=["//hello_rust/code", "//hello_rust/vendor"],
+    commands = [
+        "mkdir -p {{install-root}}/bin",
+        "cargo build --offline --release",
+        "cp target/release/hello_rust {{install-root}}/bin/hello_rust"
+    ]
+)

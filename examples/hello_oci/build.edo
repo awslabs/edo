@@ -1,0 +1,28 @@
+environment(
+    name="gcc",
+    kind="container",
+    source=source(
+        name="image",
+        kind="image",
+        url="public.ecr.aws/docker/library/gcc:latest",
+        ref="880afb9efe5095dfeeac51b9c400c0cef6ba5c613db843dd05d23285b88b437f"
+    )
+)
+
+transform(
+    name="build",
+    kind="script",
+    environment="//hello_oci/gcc",
+    source=source(
+        name="code",
+        kind="local",
+        path="hello_oci",
+        out=".",
+        is_archive=False
+    ),
+    commands=[
+        "mkdir -p {{install-root}}/bin",
+        "gcc -o hello_oci hello.c",
+        "cp hello_oci {{install-root}}/bin/hello_oci"
+    ]
+)

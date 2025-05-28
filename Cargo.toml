@@ -6,9 +6,9 @@ members = [
     "crates/edo-oci",
     "crates/edo-core",
     "crates/edo-plugin-sdk",
-    "crates/edo-starlark",
+    "crates/edo-starlark", "examples/hello_rust",
 ]
-exclude = [".edo/"]
+exclude = [".edo/", "examples/"]
 
 [workspace.dependencies]
 astral-tokio-tar = "0.5"
