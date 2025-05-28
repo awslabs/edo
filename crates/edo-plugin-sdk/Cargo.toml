@@ -1,0 +1,12 @@
+[package]
+name = "edo-plugin-sdk"
+version = "0.1.0"
+edition = "2024"
+authors = ["Jarrett Tierney <jmt@amazon.com>"]
+repository = "https://github.com/awslabs/edo"
+license = "MIT OR Apache-2.0"
+keywords = ["edo"]
+
+[dependencies]
+snafu       = { workspace = true }
+wit-bindgen = { workspace = true }

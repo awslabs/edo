@@ -1,0 +1,170 @@
+interface host {
+    resource reader {
+        read: func(size: u64) -> result<list<u8>, error>;
+    }
+
+    resource writer {
+        write: func(data: list<u8>) -> result<u64, error>;
+    }
+
+    resource id {
+        constructor(name: string, digest: string, version: option<string>, pkg: option<string>, arch: option<string>);
+        name: func() -> string;
+        digest: func() -> string;
+        set-digest: func(digest: string);
+        version: func() -> option<string>;
+        set-version: func(input: string);
+        clear-version: func();
+        pkg: func() -> option<string>;
+        arch: func() -> option<string>;
+        from-string: static func(input: string) -> id;
+    }
+
+    resource layer {
+        media-type: func() -> string;
+        digest: func() -> string;
+        size: func() -> u64;
+        platform: func() -> option<string>;
+    }
+
+    resource artifact-config {
+        constructor(id: borrow<id>, provides: list<string>, metadata: option<string>);
+        id: func() -> id;
+        provides: func() -> list<string>;
+        requires: func() -> list<tuple<string, list<tuple<string, string>>>>;
+        add-requirement: func(group: string, name: string, version: string);
+    }
+
+    resource artifact {
+        constructor(config: borrow<artifact-config>);
+        config: func() -> artifact-config;
+        layers: func() -> list<layer>;
+        add-layer: func(layer: borrow<layer>);
+    }
+
+    resource storage {
+        open: func(id: borrow<id>) -> result<artifact, error>;
+        read: func(layer: borrow<layer>) -> result<reader, error>;
+        start-layer: func() -> result<writer, error>;
+        finish-layer: func(media-type: string, platform: option<string>, writer: borrow<writer>) -> result<layer, error>;
+        save: func(artifact: borrow<artifact>) -> result<_, error>;
+    }
+
+    resource config {
+        get: func(name: string) -> option<node>;
+    }
+
+    resource log {
+        write: func(message: list<u8>) -> result<u64, error>;
+    }
+
+    resource command {
+        set: func(key: string, value: string) -> result<_, error>;
+        chdir: func(path: string) -> result<_, error>;
+        pushd: func(path: string) -> result<_, error>;
+        popd: func();
+        create-named-dir: func(key: string, path: string) -> result<_, error>;
+        create-dir: func(path: string) -> result<_, error>;
+        remove-dir: func(path: string) -> result<_, error>;
+        remove-file: func(path: string) -> result<_, error>;
+        mv: func(source: string, target: string) -> result<_, error>;
+        copy: func(source: string, target: string) -> result<_, error>;
+        run: func(cmd: string) -> result<_, error>;
+        send: func(path: string) -> result<_, error>;
+    }
+
+    resource environment {
+        defer-cmd: func(log: borrow<log>, id: borrow<id>) -> command;
+        expand: func(path: string) -> result<string, error>;
+        create-dir: func(path: string) -> result<_, error>;
+        set-env: func(key: string, value: string) -> result<_, error>;
+        get-env: func(key: string) -> option<string>;
+        setup: func(log: borrow<log>, storage: borrow<storage>) -> result<_, error>;
+        up: func(log: borrow<log>) -> result<_, error>;
+        down: func(log: borrow<log>) -> result<_, error>;
+        clean: func(log: borrow<log>) -> result<_, error>;
+        write: func(path: string, data: borrow<reader>) -> result<_, error>;
+        unpack: func(path: string, data: borrow<reader>) -> result<_, error>;
+        read: func(path: string, writer: borrow<writer>) -> result<_, error>;
+        cmd: func(log: borrow<log>, id: borrow<id>, path: string, command: string) -> result<bool, error>;
+        run: func(log: borrow<log>, id: borrow<id>, path: string, command: borrow<command>) -> result<bool, error>;
+        shell: func(path: string) -> result<_, error>;
+    }
+
+    resource source {
+        constructor(addr: string, node: borrow<node>, ctx: borrow<context>);
+        get-unique-id: func() -> result<id, error>;
+        fetch: func(log: borrow<log>, storage: borrow<storage>) -> result<artifact, error>;
+        cache: func(log: borrow<log>, storage: borrow<storage>) -> result<artifact, error>;
+        stage: func(log: borrow<log>, storage: borrow<storage>, env: borrow<environment>, path: string) -> result<_, error>;
+    }
+
+    resource handle {
+        storage: func() -> storage;
+        get: func(addr: string) -> option<transform>;
+    }
+
+    resource context {
+        get-arg: func(name: string) -> option<string>;
+        get-handle: func() -> handle;
+        config: func() -> config;
+        storage: func() -> storage;
+        get-transform: func(addr: string) -> option<transform>;
+        get-farm: func(addr: string) -> option<farm>;
+        add-source: func(addr: string, node: borrow<node>) -> result<source, error>;
+    }
+
+    resource farm {
+        setup: func(log: borrow<log>, storage: borrow<storage>) -> result<_, error>;
+        create: func(log: borrow<log>, path: string) -> result<environment, error>;
+    }
+
+    resource transform {
+        environment: func() -> string;
+        depends: func() -> result<list<string>, error>;
+        get-unique-id: func(ctx: borrow<handle>) -> result<id, error>;
+        prepare: func(log: borrow<log>, ctx: borrow<handle>) -> result<_, error>;
+        stage: func(log: borrow<log>, ctx: borrow<handle>, env: borrow<environment>) -> result<_, error>;
+        transform: func(log: borrow<log>, ctx: borrow<handle>, env: borrow<environment>) -> transform-status;
+        can-shell: func() -> bool;
+        shell: func(env: borrow<environment>) -> result<_, error>;
+    }
+
+    record definition {
+        id: string,
+        kind: string,
+        name: string,
+        table: list<tuple<string, node>>
+    }
+
+    resource node {
+        validate-keys: func(keys: list<string>) -> result<_, error>;
+        as-bool: func() -> option<bool>;
+        as-int: func() -> option<s64>;
+        as-float: func() -> option<f64>;
+        as-string: func() -> option<string>;
+        as-version: func() -> option<string>;
+        as-require: func() -> option<string>;
+        as-list: func() -> option<list<node>>;
+        as-table: func() -> option<list<tuple<string, node>>>;
+        get-id: func() -> option<string>;
+        get-kind: func() -> option<string>;
+        get-name: func() -> option<string>;
+        get-table: func() -> option<list<tuple<string, node>>>;
+    }
+
+    info: func(message: string);
+    warn: func(message: string);
+    fatal: func(message: string);
+
+    variant transform-status {
+        success(artifact),
+        retryable(tuple<option<string>, error>),
+        failed(tuple<option<string>, error>)
+    }
+
+    resource error {
+        constructor(plugin: string, message: string);
+        to-string: func() -> string;
+    }
+}

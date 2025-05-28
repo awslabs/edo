@@ -1,0 +1,89 @@
+[workspace]
+resolver = "2"
+default-members = ["crates/edo"]
+members = [
+    "crates/edo",
+    "crates/edo-oci",
+    "crates/edo-core",
+    "crates/edo-plugin-sdk",
+    "crates/edo-starlark",
+]
+exclude = [".edo/"]
+
+[workspace.dependencies]
+astral-tokio-tar = "0.5"
+async-compression = { version = "0.4", features = [
+    "tokio",
+    "zstd",
+    "gzip",
+    "bzip2",
+    "lzma",
+    "xz",
+] }
+async-recursion = "1.1"
+async-trait = "0.1"
+aws-config = "1.6"
+aws-credential-types = "1.2"
+aws-sdk-ecr = { version = "1.78", features = ["rustls"] }
+aws-sdk-ecrpublic = { version = "1.74", features = ["rustls"] }
+aws-sdk-s3 = { version = "1.89", features = ["rustls"] }
+barkml = "0.8.2"
+base16 = "0.2"
+base64 = "0.22"
+bimap = "0.6"
+blake3 = "1.8"
+bytes = "1.9"
+cfg-if = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.5", features = ["derive"] }
+daggy = "0.9"
+dashmap = { version = "6.1", features = ["serde"] }
+derive_builder = "0.20"
+dialoguer = "0.11.0"
+duct = "1.0.0"
+futures = "0.3"
+futures-util = "0.3"
+handlebars = "6.3.2"
+home = "0.5"
+indexmap = "2.9"
+indicatif = "0.17"
+keyring = "3.6"
+merkle_hash = "3.8"
+names = "0.14"
+edo-oci = { path = "./crates/edo-oci" }
+once_cell = { version = "1.21", features = ["parking_lot"] }
+os_pipe = "1.2.1"
+owo-colors = { version = "4.2", features = ["supports-colors"] }
+parking_lot = { version = "0.12", features = ["send_guard"] }
+rand = "0.9"
+rayon = "1.10"
+regex = "1.11"
+reqwest = { version = "0.12", features = [
+    "rustls-tls",
+    "json",
+    "stream",
+], default-features = false }
+resolvo = { version = "0.9", features = ["serde", "tokio", "version-ranges"] }
+semver = { version = "1.0", features = ["serde"] }
+sha2 = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+snafu = "0.8"
+starlark = "0.13.0"
+tempfile = "3.20"
+tokio = { version = "1.45", features = [
+    "full",
+    "rt-multi-thread",
+    "parking_lot",
+] }
+tokio-util = "0.7"
+toml = "0.8"
+tracing = "0.1"
+tracing-indicatif = { version = "0.3" }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1.16", features = ["v7"] }
+url = "2.5"
+wasmtime = "33.0"
+wasmtime-wasi = "33.0"
+wit-bindgen = "0.42"
+which = "7.0"

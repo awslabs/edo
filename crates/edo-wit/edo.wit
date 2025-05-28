@@ -1,0 +1,8 @@
+package edo:plugin@1.0.0;
+
+world edo {
+    use host.{node, error};
+    import host;
+
+    export abi;
+}

@@ -1,0 +1,27 @@
+wasmtime::component::bindgen!({
+    world: "edo",
+    path: "../edo-wit",
+    trappable_imports: true,
+    require_store_data_send: true,
+    with: {
+        "edo:plugin/host/error": crate::plugin::error::GuestError,
+        "edo:plugin/host/storage": crate::storage::Storage,
+        "edo:plugin/host/artifact": crate::storage::Artifact,
+        "edo:plugin/host/layer": crate::storage::Layer,
+        "edo:plugin/host/artifact-config": crate::storage::Config,
+        "edo:plugin/host/id": crate::storage::Id,
+        "edo:plugin/host/log": crate::context::Log,
+        "edo:plugin/host/command": crate::environment::Command,
+        "edo:plugin/host/environment": crate::environment::Environment,
+        "edo:plugin/host/farm": crate::environment::Farm,
+        "edo:plugin/host/source": crate::source::Source,
+        "edo:plugin/host/handle": crate::context::Handle,
+        "edo:plugin/host/context": crate::context::Context,
+        "edo:plugin/host/config": crate::context::Config,
+        "edo:plugin/host/transform": crate::transform::Transform,
+        "edo:plugin/host/node": crate::context::Node,
+        "edo:plugin/host/reader": crate::util::Reader,
+        "edo:plugin/host/writer": crate::util::Writer
+    },
+    async: true,
+});

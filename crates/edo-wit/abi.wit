@@ -1,0 +1,68 @@
+interface abi {
+    use host.{node, handle, command, context, config, storage, log, id, artifact, layer, reader, writer, environment as host-environment, transform-status, error};
+
+    resource backend {
+        ls: func() -> result<list<id>, error>;
+        has: func(id: borrow<id>) -> result<bool, error>;
+        open: func(id: borrow<id>) -> result<artifact, error>;
+        save: func(artifact: borrow<artifact>) -> result<_, error>;
+        del: func(id: borrow<id>) -> result<_, error>;
+        copy: func(source: borrow<id>, target: borrow<id>) -> result<_, error>;
+        prune: func(id: borrow<id>) -> result<_, error>;
+        prune-all: func() -> result<_, error>;
+        read: func(layer: borrow<layer>) -> result<reader, error>;
+        start-layer: func() -> result<writer, error>;
+        finish-layer: func(media-type: string, platform: option<string>, writer: borrow<writer>) -> result<layer, error>;
+    }
+
+    resource environment {
+        expand: func(path: string) -> result<string, error>;
+        create-dir: func(path: string) -> result<_, error>;
+        set-env: func(key: string, value: string) -> result<_, error>;
+        get-env: func(key: string) -> option<string>;
+        setup: func(log: borrow<log>, storage: borrow<storage>) -> result<_, error>;
+        up: func(log: borrow<log>) -> result<_, error>;
+        down: func(log: borrow<log>) -> result<_, error>;
+        clean: func(log: borrow<log>) -> result<_, error>;
+        write: func(path: string, reader: borrow<reader>) -> result<_, error>;
+        unpack: func(path: string, reader: borrow<reader>) -> result<_, error>;
+        read: func(path: string, writer: borrow<writer>) -> result<_, error>;
+        cmd: func(log: borrow<log>, id: borrow<id>, path: string, command: string) -> result<bool, error>;
+        run: func(log: borrow<log>, id: borrow<id>, path: string, command: borrow<command>) -> result<bool, error>;
+        shell: func(path: string) -> result<_, error>;
+    }
+
+    resource farm {
+        setup: func(log: borrow<log>, storage: borrow<storage>) -> result<_, error>;
+        create: func(log: borrow<log>, path: string) -> result<environment, error>;
+    }
+
+    resource source {
+        get-unique-id: func() -> result<id, error>;
+        fetch: func(log: borrow<log>, storage: borrow<storage>) -> result<artifact, error>;
+        stage: func(log: borrow<log>, storage: borrow<storage>, env: borrow<host-environment>, path: string) -> result<_, error>;
+    }
+
+    resource transform {
+        environment: func() -> result<string, error>;
+        depends: func() -> result<list<string>, error>;
+        get-unique-id: func(ctx: borrow<handle>) -> result<id, error>;
+        prepare: func(log: borrow<log>, ctx: borrow<handle>) -> result<_, error>;
+        stage: func(log: borrow<log>, ctx: borrow<handle>, env: borrow<host-environment>) -> result<_, error>;
+        transform: func(log: borrow<log>, ctx: borrow<handle>, env: borrow<host-environment>) -> transform-status;
+        can-shell: func() -> bool;
+        shell: func(env: borrow<host-environment>) -> result<_, error>;
+    }
+
+    resource vendor {
+        get-options: func(name: string) -> result<list<string>, error>;
+        resolve: func(name: string, version: string) -> result<node, error>;
+        get-dependencies: func(name: string, version: string) -> result<option<list<tuple<string, string>>>, error>;
+    }
+
+    create-storage: func(addr: string, node: borrow<node>, ctx: borrow<context>) -> result<backend, error>;
+    create-farm: func(addr: string, node: borrow<node>, ctx: borrow<context>) -> result<farm, error>;
+    create-source: func(addr: string, node: borrow<node>, ctx: borrow<context>) -> result<source, error>;
+    create-transform: func(addr: string, node: borrow<node>, ctx: borrow<context>) -> result<transform, error>;
+    create-vendor: func(addr: string, node: borrow<node>, ctx: borrow<context>) -> result<vendor, error>;
+}
