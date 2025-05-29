@@ -1,12 +1,12 @@
 use std::path::{Path, PathBuf};
 
-use crate::context::{Addr, Context, FromNode, Handle, Log, Node, non_configurable};
-use crate::environment::Environment;
-use crate::source::Source;
-use crate::storage::{
+use edo_core::context::{Addr, Context, FromNode, Handle, Log, Node, non_configurable};
+use edo_core::environment::Environment;
+use edo_core::source::Source;
+use edo_core::storage::{
     Artifact, ArtifactBuilder, Compression, ConfigBuilder, Id, IdBuilder, MediaType,
 };
-use crate::transform::{TransformError, TransformImpl, TransformResult, TransformStatus};
+use edo_core::transform::{TransformError, TransformImpl, TransformResult, TransformStatus};
 
 use async_trait::async_trait;
 use edo_oci::models::PlatformBuilder;
@@ -282,7 +282,7 @@ impl TransformImpl for ScriptTransform {
 pub mod error {
     use snafu::Snafu;
 
-    use crate::{
+    use edo_core::{
         context::{Addr, ContextError},
         plugin::error::PluginError,
         transform::TransformError,

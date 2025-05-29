@@ -1808,6 +1808,7 @@ dependencies = [
  "async-compression",
  "clap",
  "edo-core",
+ "edo-core-plugin",
  "snafu",
  "tokio",
  "tracing",
@@ -1862,6 +1863,37 @@ dependencies = [
  "uuid",
  "wasmtime",
  "wasmtime-wasi",
+ "which 7.0.3",
+]
+
+[[package]]
+name = "edo-core-plugin"
+version = "0.1.0"
+dependencies = [
+ "astral-tokio-tar",
+ "async-trait",
+ "aws-config",
+ "aws-sdk-s3",
+ "base16",
+ "blake3",
+ "dashmap",
+ "edo-core",
+ "edo-oci",
+ "futures",
+ "indexmap",
+ "merkle_hash",
+ "names",
+ "reqwest",
+ "semver",
+ "serde",
+ "serde_json",
+ "snafu",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "url",
+ "uuid",
  "which 7.0.3",
 ]
 

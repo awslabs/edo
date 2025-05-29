@@ -1,11 +1,11 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::str::FromStr;
 
-use crate::context::{Addr, Context, FromNode, Node};
-use crate::non_configurable;
-use crate::source::{SourceResult, VendorImpl};
-use crate::storage::Artifact;
 use async_trait::async_trait;
+use edo_core::context::{Addr, Context, FromNode, Node};
+use edo_core::non_configurable;
+use edo_core::source::{SourceResult, VendorImpl};
+use edo_core::storage::Artifact;
 use edo_oci::index::Index;
 use edo_oci::registry::Registry;
 use edo_oci::repository::Repository;
@@ -191,7 +191,7 @@ pub mod error {
     use semver::Version;
     use snafu::Snafu;
 
-    use crate::{context::ContextError, plugin::error::PluginError, source::SourceError};
+    use edo_core::{context::ContextError, plugin::error::PluginError, source::SourceError};
 
     #[derive(Debug, Snafu)]
     #[snafu(visibility(pub))]

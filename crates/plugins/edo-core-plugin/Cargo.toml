@@ -1,0 +1,31 @@
+[package]
+name = "edo-core-plugin"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+async-trait      = { workspace = true }
+astral-tokio-tar = { workspace = true }
+aws-config       = { workspace = true }
+aws-sdk-s3       = { workspace = true }
+base16           = { workspace = true }
+blake3           = { workspace = true }
+dashmap          = { workspace = true }
+edo-core         = { path = "../../edo-core" }
+edo-oci          = { path = "../../edo-oci" }
+futures          = { workspace = true }
+indexmap         = { workspace = true }
+merkle_hash      = { workspace = true }
+names            = { workspace = true }
+reqwest          = { workspace = true }
+semver           = { workspace = true }
+serde            = { workspace = true }
+serde_json       = { workspace = true }
+snafu            = { workspace = true }
+tokio            = { workspace = true }
+tokio-util       = { workspace = true }
+tempfile         = { workspace = true }
+tracing          = { workspace = true }
+uuid             = { workspace = true }
+url              = { workspace = true }
+which            = { workspace = true }

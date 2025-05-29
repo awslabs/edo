@@ -1,5 +1,5 @@
 interface abi {
-    use host.{node, handle, command, context, config, storage, log, id, artifact, layer, reader, writer, environment as host-environment, transform-status, error};
+    use host.{node, handle, command, component, context, config, storage, log, id, artifact, layer, reader, writer, environment as host-environment, transform-status, error};
 
     resource backend {
         ls: func() -> result<list<id>, error>;
@@ -60,6 +60,7 @@ interface abi {
         get-dependencies: func(name: string, version: string) -> result<option<list<tuple<string, string>>>, error>;
     }
 
+    supports: func(component: component, kind: string) -> bool;
     create-storage: func(addr: string, node: borrow<node>, ctx: borrow<context>) -> result<backend, error>;
     create-farm: func(addr: string, node: borrow<node>, ctx: borrow<context>) -> result<farm, error>;
     create-source: func(addr: string, node: borrow<node>, ctx: borrow<context>) -> result<source, error>;

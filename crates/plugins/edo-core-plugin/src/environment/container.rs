@@ -1,10 +1,10 @@
-use crate::context::{Addr, Context, Definable, FromNode, Log, Node};
-use crate::environment::{Command, EnvResult, Environment, EnvironmentImpl, FarmImpl};
-use crate::source::Source;
-use crate::storage::{Id, Storage};
-use crate::util::{Reader, Writer, cmd_noinput, cmd_noredirect, cmd_nulled, from_dash};
 use async_trait::async_trait;
 use dashmap::DashMap;
+use edo_core::context::{Addr, Context, Definable, FromNode, Log, Node};
+use edo_core::environment::{Command, EnvResult, Environment, EnvironmentImpl, FarmImpl};
+use edo_core::source::Source;
+use edo_core::storage::{Id, Storage};
+use edo_core::util::{Reader, Writer, cmd_noinput, cmd_noredirect, cmd_nulled, from_dash};
 use snafu::ResultExt;
 use snafu::{OptionExt, ensure};
 use std::collections::HashMap;
@@ -34,7 +34,7 @@ pub struct ContainerConfig {
 
 #[async_trait]
 impl FromNode for ContainerConfig {
-    type Error = crate::environment::error::EnvironmentError;
+    type Error = edo_core::environment::error::EnvironmentError;
 
     async fn from_node(_addr: &Addr, node: &Node, _: &Context) -> EnvResult<Self> {
         let runtime = node.get("runtime").and_then(|x| x.as_string());
@@ -47,7 +47,7 @@ impl FromNode for ContainerConfig {
 
 #[async_trait]
 impl FromNode for ContainerFarm {
-    type Error = crate::environment::error::EnvironmentError;
+    type Error = edo_core::environment::error::EnvironmentError;
 
     async fn from_node(addr: &Addr, node: &Node, ctx: &Context) -> EnvResult<Self> {
         let user = node
@@ -73,7 +73,7 @@ impl FromNode for ContainerFarm {
 }
 
 #[async_trait]
-impl Definable<crate::environment::error::EnvironmentError, ContainerConfig> for ContainerFarm {
+impl Definable<edo_core::environment::error::EnvironmentError, ContainerConfig> for ContainerFarm {
     fn key() -> &'static str {
         "container"
     }
@@ -284,7 +284,7 @@ impl EnvironmentImpl for Container {
             args.push(self.name.clone());
             args.push(self.tag.clone());
             args.push("sh".into());
-            crate::util::cmd_noinput(".", log, &self.config.cli, args, &from_dash(&self.env))
+            edo_core::util::cmd_noinput(".", log, &self.config.cli, args, &from_dash(&self.env))
                 .context(error::RuntimeSnafu)?;
             self.running.store(true, Ordering::SeqCst);
             Ok::<(), error::Error>(())
@@ -298,7 +298,7 @@ impl EnvironmentImpl for Container {
         if !self.running.load(Ordering::SeqCst) {
             return Ok(());
         }
-        crate::util::cmd_noinput(
+        edo_core::util::cmd_noinput(
             ".",
             log,
             &self.config.cli,
@@ -306,7 +306,7 @@ impl EnvironmentImpl for Container {
             &from_dash(&self.env),
         )
         .context(error::RuntimeSnafu)?;
-        crate::util::cmd_noinput(
+        edo_core::util::cmd_noinput(
             ".",
             log,
             &self.config.cli,
@@ -452,7 +452,7 @@ impl EnvironmentImpl for Container {
             run_args.push(
                 cmd.to_string(), /*format!("sh -c '{}'", cmd.replace("'", "\'"))*/
             );
-            crate::util::cmd_noinput(".", log, &self.config.cli, run_args, &from_dash(&self.env))
+            edo_core::util::cmd_noinput(".", log, &self.config.cli, run_args, &from_dash(&self.env))
                 .context(error::RuntimeSnafu)
         }
         .instrument(info_span!(
@@ -494,7 +494,7 @@ impl EnvironmentImpl for Container {
             run_args.push("sh".into());
             let script = command.to_string();
             let mut cursor = Cursor::new(script.as_bytes());
-            Ok(crate::util::cmd(
+            Ok(edo_core::util::cmd(
                 ".",
                 log,
                 &self.config.cli,
@@ -518,7 +518,7 @@ pub mod error {
     use snafu::Snafu;
     use std::path::PathBuf;
 
-    use crate::{environment::error::EnvironmentError, plugin::error::PluginError};
+    use edo_core::{environment::error::EnvironmentError, plugin::error::PluginError};
 
     #[derive(Snafu, Debug)]
     #[snafu(visibility(pub))]
@@ -549,13 +549,13 @@ pub mod error {
         Runtime { source: std::io::Error },
         #[snafu(display("{source}"))]
         Source {
-            #[snafu(source(from(crate::source::SourceError, Box::new)))]
-            source: Box<crate::source::SourceError>,
+            #[snafu(source(from(edo_core::source::SourceError, Box::new)))]
+            source: Box<edo_core::source::SourceError>,
         },
         #[snafu(display("{source}"))]
         Storage {
-            #[snafu(source(from(crate::storage::StorageError, Box::new)))]
-            source: Box<crate::storage::StorageError>,
+            #[snafu(source(from(edo_core::storage::StorageError, Box::new)))]
+            source: Box<edo_core::storage::StorageError>,
         },
         #[snafu(display("artifact does not have an image tag in its metadata"))]
         TagMissing,

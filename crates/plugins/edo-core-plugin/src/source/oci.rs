@@ -9,10 +9,10 @@ use std::path::Path;
 use tokio::task::JoinError;
 use tracing::Instrument;
 
-use crate::context::{Addr, Context, FromNode, Log, Node, non_configurable};
-use crate::environment::Environment;
-use crate::source::{SourceImpl, SourceResult};
-use crate::storage::{
+use edo_core::context::{Addr, Context, FromNode, Log, Node, non_configurable};
+use edo_core::environment::Environment;
+use edo_core::source::{SourceImpl, SourceResult};
+use edo_core::storage::{
     Artifact, ArtifactBuilder, Compression, ConfigBuilder, Id, IdBuilder, Layer, MediaType, Storage,
 };
 
@@ -195,25 +195,25 @@ where
 pub mod error {
     use snafu::Snafu;
 
-    use crate::{plugin::error::PluginError, source::SourceError};
+    use edo_core::{plugin::error::PluginError, source::SourceError};
 
     #[derive(Snafu, Debug)]
     #[snafu(visibility(pub))]
     pub enum ImageSourceError {
         #[snafu(display("failed to make artifact manifest: {source}"))]
         Artifact {
-            source: crate::storage::ArtifactBuilderError,
+            source: edo_core::storage::ArtifactBuilderError,
         },
         #[snafu(display("{}", failures.iter().map(|x| x.to_string()).collect::<Vec<_>>().join("\n")))]
         Child { failures: Vec<ImageSourceError> },
         #[snafu(display("failed to make artifact config: {source}"))]
         Config {
-            source: crate::storage::ConfigBuilderError,
+            source: edo_core::storage::ConfigBuilderError,
         },
         #[snafu(transparent)]
         Context {
-            #[snafu(source(from(crate::context::ContextError, Box::new)))]
-            source: Box<crate::context::ContextError>,
+            #[snafu(source(from(edo_core::context::ContextError, Box::new)))]
+            source: Box<edo_core::context::ContextError>,
         },
         #[snafu(display("image has digest '{actual}' when expecting '{expected}"))]
         Digest { actual: String, expected: String },
@@ -225,7 +225,7 @@ pub mod error {
         Field { field: String, type_: String },
         #[snafu(display("failed to make id: {source}"))]
         Id {
-            source: crate::storage::IdBuilderError,
+            source: edo_core::storage::IdBuilderError,
         },
         #[snafu(display("io error occured in image source: {source}"))]
         Io { source: std::io::Error },
@@ -233,7 +233,7 @@ pub mod error {
         Serialize { source: serde_json::Error },
         #[snafu(transparent)]
         Storage {
-            source: crate::storage::StorageError,
+            source: edo_core::storage::StorageError,
         },
     }
 

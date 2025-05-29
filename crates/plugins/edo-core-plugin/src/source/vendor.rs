@@ -1,15 +1,15 @@
 use std::collections::HashMap;
 use std::fs::OpenOptions;
-use std::path::{absolute, Path, PathBuf};
+use std::path::{Path, PathBuf, absolute};
 
-use crate::context::{non_configurable, Addr, Context, FromNode, Log, Node};
-use crate::environment::Environment;
-use crate::source::{SourceImpl, SourceResult};
-use crate::storage::{
+use async_trait::async_trait;
+use edo_core::context::{Addr, Context, FromNode, Log, Node, non_configurable};
+use edo_core::environment::Environment;
+use edo_core::source::{SourceImpl, SourceResult};
+use edo_core::storage::{
     Artifact, ArtifactBuilder, Compression, ConfigBuilder, Id, IdBuilder, MediaType, Storage,
 };
-use crate::util::{cmd_noinput, cmd_pipeout, copy_r};
-use async_trait::async_trait;
+use edo_core::util::{cmd_noinput, cmd_pipeout, copy_r};
 use merkle_hash::MerkleTree;
 use snafu::{OptionExt, ResultExt};
 use tempfile::TempDir;
@@ -227,7 +227,7 @@ impl SourceImpl for VendorSource {
 pub mod error {
     use snafu::Snafu;
 
-    use crate::{context::ContextError, plugin::error::PluginError, source::SourceError};
+    use edo_core::{context::ContextError, plugin::error::PluginError, source::SourceError};
 
     #[derive(Snafu, Debug)]
     #[snafu(visibility(pub))]

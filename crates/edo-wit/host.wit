@@ -1,4 +1,12 @@
 interface host {
+    enum component {
+        storage-backend,
+        environment,
+        source,
+        transform,
+        vendor
+    }
+
     resource reader {
         read: func(size: u64) -> result<list<u8>, error>;
     }

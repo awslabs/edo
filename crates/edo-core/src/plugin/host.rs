@@ -1,7 +1,8 @@
 use wasmtime::component::Resource;
-use wasmtime_wasi::p2::{IoView, WasiCtx, WasiCtxBuilder, WasiView};
 use wasmtime_wasi::ResourceTable;
+use wasmtime_wasi::p2::{IoView, WasiCtx, WasiCtxBuilder, WasiView};
 
+use crate::context::Component;
 use crate::{
     context::{Addr, Config, Context, Handle, Node},
     environment::Farm,
@@ -11,9 +12,9 @@ use crate::{
 };
 
 use super::{
-    bindings::edo::plugin::host,
-    error::{wasm_ok, GuestError},
     WasmResult,
+    bindings::edo::plugin::host,
+    error::{GuestError, wasm_ok},
 };
 
 pub struct Host {
@@ -24,6 +25,18 @@ pub struct Host {
 impl Default for Host {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Into<host::Component> for Component {
+    fn into(self) -> host::Component {
+        match self {
+            Self::Environment => host::Component::Environment,
+            Self::Source => host::Component::Source,
+            Self::StorageBackend => host::Component::StorageBackend,
+            Self::Vendor => host::Component::Vendor,
+            Self::Transform => host::Component::Transform,
+        }
     }
 }
 

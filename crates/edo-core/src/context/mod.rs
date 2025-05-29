@@ -1,14 +1,11 @@
 use std::{
     collections::{BTreeMap, HashMap},
     env::current_dir,
-    path::Path,
+    path::{Path, PathBuf},
     sync::Arc,
 };
 
-use crate::{
-    std::{core_plugin, environment::LocalFarm, storage::LocalBackend},
-    storage::{Backend, Storage},
-};
+use crate::storage::{Backend, LocalBackend, Storage};
 
 use super::{
     environment::Farm,
@@ -39,7 +36,7 @@ pub use log::*;
 pub use logmgr::*;
 pub use node::*;
 
-use snafu::{OptionExt, ResultExt};
+use snafu::{OptionExt, ResultExt, ensure};
 use tokio::fs::create_dir_all;
 use tracing::Instrument;
 
@@ -50,6 +47,8 @@ const DEFAULT_PATH: &str = ".edo";
 
 #[derive(Clone)]
 pub struct Context {
+    /// Project directory
+    project_dir: PathBuf,
     /// Loaded Shared Configuration
     config: Config,
     /// Storage Manager
@@ -75,7 +74,6 @@ impl Context {
     pub async fn init<ProjectPath, ConfigPath>(
         path: Option<ProjectPath>,
         config: Option<ConfigPath>,
-        error_on_lock: bool,
         args: HashMap<String, String>,
         verbosity: LogVerbosity,
     ) -> ContextResult<Self>
@@ -119,6 +117,7 @@ impl Context {
 
         // Create the initial context
         let ctx = Context {
+            project_dir: project_dir.clone(),
             config: config.clone(),
             args,
             log: log.clone(),
@@ -128,13 +127,12 @@ impl Context {
             plugins: Arc::new(DashMap::new()),
             transforms: Arc::new(DashMap::new()),
         };
-        ctx.farms.insert(
-            Addr::parse("//default")?,
-            Farm::from_impl(LocalFarm::default()),
-        );
-        // We now can load the project information
-        Project::load(&project_dir, &ctx, error_on_lock).await?;
         Ok(ctx.clone())
+    }
+
+    pub async fn load_project(&self, error_on_lock: bool) -> ContextResult<()> {
+        Project::load(&self.project_dir, self, error_on_lock).await?;
+        Ok(())
     }
 
     pub fn get_handle(&self) -> Handle {
@@ -177,8 +175,53 @@ impl Context {
         }
     }
 
+    pub async fn find_plugin(&self, component: Component, node: &Node) -> ContextResult<Plugin> {
+        let kind = node.get_kind().unwrap();
+        if let Some((plugin, kind)) = kind.split_once(':') {
+            let paddr = Addr::parse(plugin)?;
+            let plugin = self
+                .plugins
+                .get(&paddr)
+                .context(error::NoPluginSnafu { addr: paddr })?;
+            node.set_kind(kind.to_string());
+            ensure!(
+                plugin
+                    .supports(self, component.clone(), kind.to_string())
+                    .await?,
+                error::NoProviderSnafu {
+                    component: component.to_string(),
+                    kind: kind
+                }
+            );
+            Ok(plugin.value().clone())
+        } else {
+            for plugin in self.plugins.iter() {
+                if plugin
+                    .supports(self, component.clone(), kind.clone())
+                    .await?
+                {
+                    return Ok(plugin.value().clone());
+                }
+            }
+            error::NoProviderSnafu {
+                component: component.to_string(),
+                kind,
+            }
+            .fail()
+        }
+    }
+
     pub fn get_plugin(&self, addr: &Addr) -> Option<Plugin> {
         self.plugins.get(addr).map(|x| x.value().clone())
+    }
+
+    pub async fn add_preloaded_plugin(&self, addr: &Addr, plugin: &Plugin) -> ContextResult<()> {
+        let log = self.log.create("init").await?;
+        log.set_subject(&addr.to_string());
+        plugin.fetch(&log, self.storage()).await?;
+        plugin.setup(&log, self.storage()).await?;
+        self.plugins.insert(addr.clone(), plugin.clone());
+        Ok(())
     }
 
     pub async fn add_plugin(&self, addr: &Addr, node: &Node) -> ContextResult<()> {
@@ -207,62 +250,13 @@ impl Context {
             component = "context",
             "adding a storage backend {addr}"
         );
-        if let Some((plugin, kind)) = node.get_kind().and_then(|x| {
-            x.split_once(':')
-                .map(|y| (y.0.to_string(), y.1.to_string()))
-        }) {
-            let node = node.clone();
-            node.set_kind(kind);
-            let plugin_addr = Addr::parse(plugin.as_str())?;
-            // If the plugin name is edo it is explicity referring to the core
-            // plugin
-            if plugin == "edo" {
-                let backend = core_plugin().create_storage(addr, &node, self).await?;
-                // Now we check the addr if it matches our special addresses we handle them
-                // otherwise we add it as a source cache
-                let addr_s = addr.to_string();
-                if addr_s == "//edo-build-cache" {
-                    // This is a build cache so add it
-                    self.storage().set_build(&backend).await;
-                } else if addr_s == "//edo-output-cache" {
-                    // This is an output cache so add it
-                    self.storage().set_output(&backend).await;
-                } else {
-                    // This is a source cache
-                    self.storage()
-                        .add_source_cache(addr_s.as_str(), &backend)
-                        .await;
-                }
-                return Ok(());
-            }
-            let plugin = self
-                .plugins
-                .get(&plugin_addr)
-                .context(error::NoPluginSnafu {
-                    addr: plugin_addr.clone(),
-                })?;
-            let backend = plugin.create_storage(addr, &node, self).await?;
-            // Now we check the addr if it matches our special addresses we handle them
-            // otherwise we add it as a source cache
-            let addr_s = addr.to_string();
-            if addr_s == "//edo-build-cache" {
-                // This is a build cache so add it
-                self.storage().set_build(&backend).await;
-            } else if addr_s == "//edo-output-cache" {
-                // This is an output cache so add it
-                self.storage().set_output(&backend).await;
-            } else {
-                // This is a source cache
-                self.storage()
-                    .add_source_cache(addr_s.as_str(), &backend)
-                    .await;
-            }
-            return Ok(());
-        }
-        // If we get here use the core plugin
-        // Now we check the addr if it matches our special addresses we handle them
-        // otherwise we add it as a source cache
-        let backend = core_plugin().create_storage(addr, node, self).await?;
+        let kind = node.get_kind().unwrap();
+        let backend = if kind == "local" || kind == "edo:local" {
+            Backend::from_impl(LocalBackend::new(addr, node, self.config()).await?)
+        } else {
+            let plugin = self.find_plugin(Component::StorageBackend, node).await?;
+            plugin.create_storage(addr, node, self).await?
+        };
         let addr_s = addr.to_string();
         if addr_s == "//edo-build-cache" {
             // This is a build cache so add it
@@ -285,38 +279,10 @@ impl Context {
             component = "context",
             "adding a transform {addr}"
         );
-        if let Some((plugin, kind)) = node.get_kind().and_then(|x| {
-            x.split_once(':')
-                .map(|y| (y.0.to_string(), y.1.to_string()))
-        }) {
-            let node = node.clone();
-            node.set_kind(kind);
-            let plugin_addr = Addr::parse(plugin.as_str())?;
-            // If the plugin name is edo it is explicity referring to the core
-            // plugin
-            if plugin == "edo" {
-                self.transforms.insert(
-                    addr.clone(),
-                    core_plugin().create_transform(addr, &node, self).await?,
-                );
-                return Ok(());
-            }
-            let plugin = self
-                .plugins
-                .get(&plugin_addr)
-                .context(error::NoPluginSnafu {
-                    addr: plugin_addr.clone(),
-                })?;
-            self.transforms.insert(
-                addr.clone(),
-                plugin.create_transform(addr, &node, self).await?,
-            );
-            return Ok(());
-        }
-        // If we get here use the core plugin
+        let plugin = self.find_plugin(Component::Transform, node).await?;
         self.transforms.insert(
             addr.clone(),
-            core_plugin().create_transform(addr, node, self).await?,
+            plugin.create_transform(addr, node, self).await?,
         );
         Ok(())
     }
@@ -340,37 +306,10 @@ impl Context {
             component = "context",
             "adding a farm {addr}"
         );
-        if let Some((plugin, kind)) = node.get_kind().and_then(|x| {
-            x.split_once(':')
-                .map(|y| (y.0.to_string(), y.1.to_string()))
-        }) {
-            let node = node.clone();
-            node.set_kind(kind);
-            let plugin_addr = Addr::parse(plugin.as_str())?;
-            // If the plugin name is edo it is explicity referring to the core
-            // plugin
-            if plugin == "edo" {
-                self.farms.insert(
-                    addr.clone(),
-                    core_plugin().create_farm(addr, &node, self).await?,
-                );
-                return Ok(());
-            }
-            let plugin = self
-                .plugins
-                .get(&plugin_addr)
-                .context(error::NoPluginSnafu {
-                    addr: plugin_addr.clone(),
-                })?;
-            self.farms
-                .insert(addr.clone(), plugin.create_farm(addr, &node, self).await?);
-            return Ok(());
-        }
+        let plugin = self.find_plugin(Component::Environment, node).await?;
         // If we get here use the core plugin
-        self.farms.insert(
-            addr.clone(),
-            core_plugin().create_farm(addr, node, self).await?,
-        );
+        self.farms
+            .insert(addr.clone(), plugin.create_farm(addr, node, self).await?);
         Ok(())
     }
 
@@ -380,58 +319,14 @@ impl Context {
             component = "context",
             "adding a source {addr}"
         );
-        if let Some((plugin, kind)) = node.get_kind().and_then(|x| {
-            x.split_once(':')
-                .map(|y| (y.0.to_string(), y.1.to_string()))
-        }) {
-            let node = node.clone();
-            node.set_kind(kind);
-            let plugin_addr = Addr::parse(plugin.as_str())?;
-            // If the plugin name is edo it is explicity referring to the core
-            // plugin
-            if plugin == "edo" {
-                let result = core_plugin().create_source(addr, &node, self).await?;
-                return Ok(result);
-            }
-            let plugin = self
-                .plugins
-                .get(&plugin_addr)
-                .context(error::NoPluginSnafu {
-                    addr: plugin_addr.clone(),
-                })?;
-            let result = plugin.create_source(addr, &node, self).await?;
-            return Ok(result);
-        }
-        // If we get here use the core plugin
-        let result = core_plugin().create_source(addr, node, self).await?;
+        let plugin = self.find_plugin(Component::Source, node).await?;
+        let result = plugin.create_source(addr, node, self).await?;
         Ok(result)
     }
 
     pub async fn add_vendor(&self, addr: &Addr, node: &Node) -> ContextResult<Vendor> {
-        if let Some((plugin, kind)) = node.get_kind().and_then(|x| {
-            x.split_once(':')
-                .map(|y| (y.0.to_string(), y.1.to_string()))
-        }) {
-            let node = node.clone();
-            node.set_kind(kind);
-            let plugin_addr = Addr::parse(plugin.as_str())?;
-            // If the plugin name is edo it is explicity referring to the core
-            // plugin
-            if plugin == "edo" {
-                let result = core_plugin().create_vendor(addr, &node, self).await?;
-                return Ok(result);
-            }
-            let plugin = self
-                .plugins
-                .get(&plugin_addr)
-                .context(error::NoPluginSnafu {
-                    addr: plugin_addr.clone(),
-                })?;
-            let result = plugin.create_vendor(addr, &node, self).await?;
-            return Ok(result);
-        }
-        // If we get here use the core plugin
-        let result = core_plugin().create_vendor(addr, node, self).await?;
+        let plugin = self.find_plugin(Component::Vendor, node).await?;
+        let result = plugin.create_vendor(addr, node, self).await?;
         Ok(result)
     }
 

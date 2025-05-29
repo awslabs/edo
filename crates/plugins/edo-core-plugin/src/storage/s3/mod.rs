@@ -1,15 +1,15 @@
-use crate::{
-    context::{Addr, Config, FromNodeNoContext, Node},
-    non_configurable_no_context,
-    storage::{Artifact, BackendImpl, Id, Layer, LayerBuilder, MediaType, StorageResult},
-    util::{Reader, Writer},
-};
 use async_trait::async_trait;
 use aws_config::{BehaviorVersion, SdkConfig};
 use aws_sdk_s3::{
     client::Client,
     primitives::ByteStream,
     types::{CompletedMultipartUpload, CompletedPart},
+};
+use edo_core::{
+    context::{Addr, Config, FromNodeNoContext, Node},
+    non_configurable_no_context,
+    storage::{Artifact, BackendImpl, Id, Layer, LayerBuilder, MediaType, StorageResult},
+    util::{Reader, Writer},
 };
 use edo_oci::models::Platform;
 use snafu::{OptionExt, ResultExt};
@@ -20,7 +20,7 @@ use std::time::Duration;
 use tokio::{fs::OpenOptions, io::AsyncReadExt};
 use uuid::Uuid;
 
-use super::catalog::Catalog;
+use edo_core::storage::Catalog;
 
 mod error;
 mod reader;
@@ -40,7 +40,7 @@ unsafe impl Sync for S3Backend {}
 
 #[async_trait]
 impl FromNodeNoContext for S3Backend {
-    type Error = crate::storage::StorageError;
+    type Error = edo_core::storage::StorageError;
 
     async fn from_node(
         _addr: &Addr,
@@ -62,7 +62,7 @@ impl FromNodeNoContext for S3Backend {
     }
 }
 
-non_configurable_no_context!(S3Backend, crate::storage::StorageError);
+non_configurable_no_context!(S3Backend, edo_core::storage::StorageError);
 
 impl S3Backend {
     pub async fn new_(

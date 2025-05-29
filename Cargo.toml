@@ -6,7 +6,7 @@ members = [
     "crates/edo-oci",
     "crates/edo-core",
     "crates/edo-plugin-sdk",
-    "crates/edo-starlark", "examples/hello_rust",
+    "crates/edo-starlark", "examples/hello_rust", "crates/plugins/edo-core-plugin",
 ]
 exclude = [".edo/", "examples/"]
 

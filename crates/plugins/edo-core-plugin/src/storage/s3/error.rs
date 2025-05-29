@@ -1,6 +1,6 @@
-use crate::storage::LayerBuilderError;
-use crate::storage::StorageError;
 use aws_sdk_s3::error::SdkError;
+use edo_core::storage::LayerBuilderError;
+use edo_core::storage::StorageError;
 use snafu::Snafu;
 
 #[derive(Debug, Snafu)]
@@ -41,7 +41,7 @@ pub enum Error {
         source: SdkError<aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Error>,
     },
     #[snafu(display("storage backend does not contain an artifact with id: {id}"))]
-    NotFound { id: crate::storage::Id },
+    NotFound { id: edo_core::storage::Id },
     #[snafu(display("failed to upload part of a multipart upload to s3 cache: {source}"))]
     Part {
         source: SdkError<aws_sdk_s3::operation::upload_part::UploadPartError>,
@@ -50,7 +50,9 @@ pub enum Error {
     Put {
         source: SdkError<aws_sdk_s3::operation::put_object::PutObjectError>,
     },
-    #[snafu(display("due to the danger of it we do not support prune-all on s3 backends, if you need to clear the bucket use the s3 console"))]
+    #[snafu(display(
+        "due to the danger of it we do not support prune-all on s3 backends, if you need to clear the bucket use the s3 console"
+    ))]
     PruneAll,
     #[snafu(display("failed to serialize manifest: {source}"))]
     Serialize { source: serde_json::Error },

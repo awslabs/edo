@@ -8,7 +8,8 @@ mod util;
 use std::collections::HashMap;
 
 pub use checkout::*;
-use edo_core::context::{Context, LogVerbosity};
+use edo_core::context::{Addr, Context, LogVerbosity};
+use edo_core_plugin::core_plugin;
 pub use list::*;
 pub use prune::*;
 pub use run::*;
@@ -29,13 +30,17 @@ pub async fn create_context(
     } else {
         LogVerbosity::Info
     };
-    Context::init(
+    let ctx = Context::init(
         args.storage.clone(),
         args.config.clone(),
-        locked,
         variables,
         verbosity,
     )
-    .await
-    .map_err(|e| e.into())
+    .await?;
+    // Now we want to ensure we add the core plugin here
+    ctx.add_preloaded_plugin(&Addr::parse("edo").unwrap(), &core_plugin())
+        .await?;
+    // Now load the current project
+    ctx.load_project(locked).await?;
+    Ok(ctx)
 }

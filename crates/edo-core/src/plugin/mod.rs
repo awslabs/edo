@@ -23,7 +23,7 @@ pub mod transform;
 
 mod impl_;
 
-use crate::context::{Addr, Context, Definable, FromNode, Log, Node};
+use crate::context::{Addr, Component as EdoComponent, Context, Definable, FromNode, Log, Node};
 use crate::def_trait;
 use crate::environment::Farm;
 use crate::non_configurable;
@@ -50,6 +50,8 @@ def_trait! {
         fetch(log: &Log, storage: &Storage) -> Result<()>;
         "Run any setup steps required for this plugin" =>
         setup(log: &Log, storage: &Storage) -> Result<()>;
+        "Responds if this plugin supports a component" =>
+        supports(ctx: &Context, component: EdoComponent, kind: String) -> Result<bool>;
         "Create a storage backend using this plugin" =>
         create_storage(addr: &Addr, node: &Node, config: &Context) -> Result<Backend>;
         "Create an environment farm using this plugin" =>
@@ -151,6 +153,17 @@ impl PluginImpl for WasmPlugin {
 
     async fn setup(&self, _log: &Log, _storage: &Storage) -> Result<()> {
         Ok(())
+    }
+
+    async fn supports(&self, ctx: &Context, component: EdoComponent, kind: String) -> Result<bool> {
+        let (handle, store) = self.load(ctx.storage()).await?;
+        let store_ref = store.clone();
+        let mut store = store_ref.lock();
+        handle
+            .edo_plugin_abi()
+            .call_supports(store.as_context_mut(), component.into(), kind.as_str())
+            .await
+            .context(error::WasmExecSnafu)
     }
 
     async fn create_storage(&self, addr: &Addr, node: &Node, ctx: &Context) -> Result<Backend> {

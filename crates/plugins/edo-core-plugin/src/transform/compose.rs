@@ -1,10 +1,10 @@
-use crate::{
-    context::{non_configurable, Addr, Context, FromNode, Handle, Log, Node},
+use async_trait::async_trait;
+use edo_core::{
+    context::{Addr, Context, FromNode, Handle, Log, Node, non_configurable},
     environment::Environment,
     storage::{ArtifactBuilder, Compression, ConfigBuilder, Id, IdBuilder, MediaType},
     transform::{TransformImpl, TransformResult, TransformStatus},
 };
-use async_trait::async_trait;
 use snafu::OptionExt;
 use std::path::Path;
 
@@ -161,7 +161,7 @@ impl TransformImpl for ComposeTransform {
 pub mod error {
     use snafu::Snafu;
 
-    use crate::{
+    use edo_core::{
         context::{Addr, ContextError},
         plugin::error::PluginError,
         transform::TransformError,

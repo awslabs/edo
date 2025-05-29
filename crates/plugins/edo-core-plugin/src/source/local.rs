@@ -1,13 +1,13 @@
-use crate::context::{non_configurable, Addr, Context, FromNode, Log, Node};
-use crate::environment::Environment;
-use crate::source::{SourceImpl, SourceResult};
-use crate::storage::{
+use async_trait::async_trait;
+use edo_core::context::{Addr, Context, FromNode, Log, Node, non_configurable};
+use edo_core::environment::Environment;
+use edo_core::source::{SourceImpl, SourceResult};
+use edo_core::storage::{
     Artifact, ArtifactBuilder, Compression, ConfigBuilder, Id, IdBuilder, MediaType, Storage,
 };
-use async_trait::async_trait;
 use merkle_hash::MerkleTree;
 use snafu::{OptionExt, ResultExt};
-use std::path::{absolute, Path, PathBuf};
+use std::path::{Path, PathBuf, absolute};
 use tokio::{fs::File, io::AsyncWriteExt};
 use tokio_tar::Builder;
 
@@ -152,7 +152,7 @@ impl SourceImpl for LocalSource {
 }
 
 pub mod error {
-    use crate::{plugin::error::PluginError, source::SourceError, storage::IdBuilderError};
+    use edo_core::{plugin::error::PluginError, source::SourceError, storage::IdBuilderError};
     use snafu::Snafu;
 
     #[derive(Snafu, Debug)]
@@ -172,8 +172,8 @@ pub mod error {
         },
         #[snafu(transparent)]
         Project {
-            #[snafu(source(from(crate::context::ContextError, Box::new)))]
-            source: Box<crate::context::ContextError>,
+            #[snafu(source(from(edo_core::context::ContextError, Box::new)))]
+            source: Box<edo_core::context::ContextError>,
         },
         #[snafu(display("failed to read a file: {source}"))]
         ReadFile { source: std::io::Error },

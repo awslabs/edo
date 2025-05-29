@@ -1,11 +1,11 @@
-use crate::context::{non_configurable, Addr, Context, FromNode, Log, Node};
-use crate::environment::Environment;
-use crate::source::{SourceImpl, SourceResult};
-use crate::storage::{
+use async_trait::async_trait;
+use edo_core::context::{Addr, Context, FromNode, Log, Node, non_configurable};
+use edo_core::environment::Environment;
+use edo_core::source::{SourceImpl, SourceResult};
+use edo_core::storage::{
     Artifact, ArtifactBuilder, Compression, ConfigBuilder, Id, IdBuilder, MediaType, Storage,
 };
-use crate::util::cmd_noinput;
-use async_trait::async_trait;
+use edo_core::util::cmd_noinput;
 use snafu::{OptionExt, ResultExt};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -158,7 +158,7 @@ impl SourceImpl for GitSource {
 }
 
 pub mod error {
-    use crate::{plugin::error::PluginError, source::SourceError, storage::IdBuilderError};
+    use edo_core::{plugin::error::PluginError, source::SourceError, storage::IdBuilderError};
     use snafu::Snafu;
 
     #[derive(Snafu, Debug)]
@@ -174,8 +174,8 @@ pub mod error {
         Id { source: IdBuilderError },
         #[snafu(transparent)]
         Project {
-            #[snafu(source(from(crate::context::ContextError, Box::new)))]
-            source: Box<crate::context::error::ContextError>,
+            #[snafu(source(from(edo_core::context::ContextError, Box::new)))]
+            source: Box<edo_core::context::error::ContextError>,
         },
         #[snafu(display("failed to create temporary directory: {source}"))]
         TempDirectory { source: std::io::Error },

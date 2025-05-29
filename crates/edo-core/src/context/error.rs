@@ -36,6 +36,8 @@ pub enum ContextError {
     NoEnvironmentFound { addr: Addr },
     #[snafu(display("no plugin loaded with addr '{addr}'"))]
     NoPlugin { addr: Addr },
+    #[snafu(display("no plugin is loaded that supports a {component} of kind {kind}"))]
+    NoProvider { component: String, kind: String },
     #[snafu(display("block is not a transform definition"))]
     NotTransform,
     #[snafu(display("'{id}' is not a valid block id for a source definition"))]

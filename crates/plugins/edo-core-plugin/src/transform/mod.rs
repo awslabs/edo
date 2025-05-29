@@ -2,8 +2,8 @@ pub mod compose;
 pub mod import;
 pub mod script;
 
-use crate::context::{Addr, Context, ContextError, Node};
-use crate::source::Source;
+use edo_core::context::{Addr, Context, ContextError, Node};
+use edo_core::source::Source;
 use indexmap::IndexMap;
 
 pub use compose::ComposeTransform;

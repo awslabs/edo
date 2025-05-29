@@ -1,13 +1,34 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, fmt, sync::Arc};
 
-use super::{error, Addr, Config, ContextResult as Result};
+use super::{Addr, Config, ContextResult as Result, error};
 use async_trait::async_trait;
 use parking_lot::RwLock;
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
-use snafu::{ensure, OptionExt};
+use snafu::{OptionExt, ensure};
 use starlark::values::Value as StarlarkValue;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Component {
+    StorageBackend,
+    Environment,
+    Source,
+    Transform,
+    Vendor,
+}
+
+impl fmt::Display for Component {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::StorageBackend => f.write_str("storage-backend"),
+            Self::Environment => f.write_str("environment"),
+            Self::Source => f.write_str("source"),
+            Self::Transform => f.write_str("transform"),
+            Self::Vendor => f.write_str("vendor"),
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct Node {

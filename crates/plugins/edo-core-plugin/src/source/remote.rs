@@ -1,18 +1,20 @@
 use async_trait::async_trait;
 use futures::TryStreamExt;
 use serde_json::json;
-use snafu::{ensure, OptionExt, ResultExt};
+use snafu::{OptionExt, ResultExt, ensure};
 use std::path::Path;
 use std::path::PathBuf;
 use tokio_util::io::StreamReader;
 use tracing::Instrument;
 use url::Url;
 
-use crate::context::{non_configurable, Addr, Context, FromNode, Log, Node};
-use crate::environment::Environment;
-use crate::source::{SourceImpl, SourceResult};
-use crate::storage::ConfigBuilder;
-use crate::storage::{Artifact, ArtifactBuilder, Compression, Id, IdBuilder, MediaType, Storage};
+use edo_core::context::{Addr, Context, FromNode, Log, Node, non_configurable};
+use edo_core::environment::Environment;
+use edo_core::source::{SourceImpl, SourceResult};
+use edo_core::storage::ConfigBuilder;
+use edo_core::storage::{
+    Artifact, ArtifactBuilder, Compression, Id, IdBuilder, MediaType, Storage,
+};
 
 /// A RemoteSource is rather simple
 /// it is responsible for fetching a remote file and storing it as an
@@ -179,7 +181,7 @@ impl SourceImpl for RemoteSource {
 pub mod error {
     use snafu::Snafu;
 
-    use crate::{
+    use edo_core::{
         plugin::error::PluginError,
         source::SourceError,
         storage::{ArtifactBuilderError, IdBuilderError},
@@ -192,16 +194,14 @@ pub mod error {
         Artifact { source: ArtifactBuilderError },
         #[snafu(transparent)]
         Context {
-            #[snafu(source(from(crate::context::ContextError, Box::new)))]
-            source: Box<crate::context::ContextError>,
+            #[snafu(source(from(edo_core::context::ContextError, Box::new)))]
+            source: Box<edo_core::context::ContextError>,
         },
         #[snafu(display("failed to fetch remote source from '{url}': {message}"))]
         Failed { url: url::Url, message: String },
         #[snafu(display("remote source has hash '{actual}' instead of expected '{expected}'"))]
         Digest { actual: String, expected: String },
-        #[snafu(display(
-            "remote source definition requires a field '{field}' with type '{type_}"
-        ))]
+        #[snafu(display("remote source definition requires a field '{field}' with type '{type_}"))]
         Field { field: String, type_: String },
         #[snafu(display("failed to create artifact id: {source}"))]
         Id { source: IdBuilderError },
