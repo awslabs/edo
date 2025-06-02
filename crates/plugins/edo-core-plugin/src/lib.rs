@@ -62,7 +62,7 @@ impl PluginImpl for CorePlugin {
                 "compose" | "import" | "script" => true,
                 _ => false,
             },
-            Component::Vendor => kind.as_str() == "vendor",
+            Component::Vendor => kind.as_str() == "image",
         })
     }
 

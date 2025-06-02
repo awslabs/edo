@@ -9,8 +9,8 @@ use edo_core::storage::{
 use edo_core::transform::{TransformError, TransformImpl, TransformResult, TransformStatus};
 
 use async_trait::async_trait;
-use edo_oci::models::PlatformBuilder;
 use indexmap::IndexMap;
+use ocilot::models::PlatformBuilder;
 use snafu::OptionExt;
 
 pub struct ScriptTransform {

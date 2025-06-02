@@ -9,7 +9,7 @@ use crate::{
     storage::{Artifact, BackendImpl, Id, Layer, MediaType, StorageResult},
     util::{Reader, Writer},
 };
-use edo_oci::models::Platform;
+use ocilot::models::Platform;
 use snafu::ResultExt;
 
 pub struct PluginBackend(PluginHandle);

@@ -8,12 +8,12 @@ mod local;
 pub use artifact::*;
 pub use backend::*;
 pub use catalog::*;
-use edo_oci::models::Platform;
 pub use error::StorageError;
 pub use error::StorageResult;
 use futures::future::try_join_all;
 pub use id::*;
 pub use local::*;
+use ocilot::models::Platform;
 use tokio::task::JoinError;
 
 use crate::util::{Reader, Writer};

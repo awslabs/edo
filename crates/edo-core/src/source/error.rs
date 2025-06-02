@@ -29,7 +29,7 @@ pub enum SourceError {
     #[snafu(display("no vendor registered with name {name}"))]
     NoVendor { name: String },
     #[snafu(display("error occured with oci registry: {source}"))]
-    Oci { source: edo_oci::error::Error },
+    Oci { source: ocilot::error::Error },
     #[snafu(display("no version requirement provided for dependency"))]
     NoRequire,
     #[snafu(transparent)]

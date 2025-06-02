@@ -6,10 +6,10 @@ use edo_core::context::{Addr, Context, FromNode, Node};
 use edo_core::non_configurable;
 use edo_core::source::{SourceResult, VendorImpl};
 use edo_core::storage::Artifact;
-use edo_oci::index::Index;
-use edo_oci::registry::Registry;
-use edo_oci::repository::Repository;
-use edo_oci::uri::{Reference, RegistryUri, UriBuilder};
+use ocilot::index::Index;
+use ocilot::registry::Registry;
+use ocilot::repository::Repository;
+use ocilot::uri::{Reference, RegistryUri, UriBuilder};
 use semver::{Version, VersionReq};
 use snafu::{OptionExt, ResultExt, ensure};
 use tokio::io::AsyncReadExt;
@@ -206,7 +206,7 @@ pub mod error {
         #[snafu(display("io error occured interacting with oci registry: {source}"))]
         Io { source: std::io::Error },
         #[snafu(display("failed to interact with oci registry: {source}"))]
-        Oci { source: edo_oci::error::Error },
+        Oci { source: ocilot::error::Error },
         #[snafu(display("could not find an oci image matching {name}@{version}"))]
         Vended { name: String, version: Version },
     }

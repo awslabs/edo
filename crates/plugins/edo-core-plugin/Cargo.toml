@@ -12,11 +12,11 @@ base16           = { workspace = true }
 blake3           = { workspace = true }
 dashmap          = { workspace = true }
 edo-core         = { path = "../../edo-core" }
-edo-oci          = { path = "../../edo-oci" }
 futures          = { workspace = true }
 indexmap         = { workspace = true }
 merkle_hash      = { workspace = true }
 names            = { workspace = true }
+ocilot           = { workspace = true }
 reqwest          = { workspace = true }
 semver           = { workspace = true }
 serde            = { workspace = true }

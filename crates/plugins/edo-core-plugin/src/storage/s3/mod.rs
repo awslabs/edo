@@ -11,7 +11,7 @@ use edo_core::{
     storage::{Artifact, BackendImpl, Id, Layer, LayerBuilder, MediaType, StorageResult},
     util::{Reader, Writer},
 };
-use edo_oci::models::Platform;
+use ocilot::models::Platform;
 use snafu::{OptionExt, ResultExt};
 use std::collections::BTreeSet;
 use std::path::PathBuf;

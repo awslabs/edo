@@ -1,11 +1,16 @@
+vendor(
+    name="public-ecr",
+    kind="image",
+    uri="public.ecr.aws/docker/library"
+)
+
 environment(
     name="gcc",
     kind="container",
-    source=source(
-        name="image",
+    source=wants(
+        name="gcc",
         kind="image",
-        url="public.ecr.aws/docker/library/gcc:latest",
-        ref="880afb9efe5095dfeeac51b9c400c0cef6ba5c613db843dd05d23285b88b437f"
+        at="=14.3.0"
     )
 )
 

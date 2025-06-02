@@ -30,7 +30,7 @@ indicatif          = { workspace = true }
 indexmap           = { workspace = true }
 merkle_hash        = { workspace = true }
 names              = { workspace = true }
-edo-oci            = { path = "../edo-oci" }
+ocilot             = { workspace = true }
 owo-colors         = { workspace = true }
 os_pipe            = { workspace = true }
 parking_lot        = { workspace = true }

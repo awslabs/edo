@@ -1833,7 +1833,6 @@ dependencies = [
  "derive_builder",
  "dialoguer",
  "duct",
- "edo-oci",
  "futures",
  "handlebars",
  "home",
@@ -1841,6 +1840,7 @@ dependencies = [
  "indicatif",
  "merkle_hash",
  "names",
+ "ocilot",
  "os_pipe",
  "owo-colors",
  "parking_lot",
@@ -1878,11 +1878,11 @@ dependencies = [
  "blake3",
  "dashmap",
  "edo-core",
- "edo-oci",
  "futures",
  "indexmap",
  "merkle_hash",
  "names",
+ "ocilot",
  "reqwest",
  "semver",
  "serde",
@@ -1895,39 +1895,6 @@ dependencies = [
  "url",
  "uuid",
  "which 7.0.3",
-]
-
-[[package]]
-name = "edo-oci"
-version = "0.1.0"
-dependencies = [
- "astral-tokio-tar",
- "async-compression",
- "async-recursion",
- "async-trait",
- "aws-config",
- "aws-credential-types",
- "aws-sdk-ecr",
- "aws-sdk-ecrpublic",
- "base16",
- "base64 0.22.1",
- "bytes",
- "chrono",
- "derive_builder",
- "futures",
- "home",
- "indicatif",
- "keyring",
- "reqwest",
- "serde",
- "serde_json",
- "sha2",
- "snafu",
- "tempfile",
- "tokio",
- "tokio-util",
- "tracing",
- "url",
 ]
 
 [[package]]
@@ -3427,6 +3394,45 @@ dependencies = [
  "hashbrown 0.15.3",
  "indexmap",
  "memchr",
+]
+
+[[package]]
+name = "ocilot"
+version = "0.1.0"
+source = "git+https://github.com/awslabs/ocilot.git#dd4d0c536f78e8962176c92fd77086b158394989"
+dependencies = [
+ "anyhow",
+ "astral-tokio-tar",
+ "async-compression",
+ "async-recursion",
+ "async-trait",
+ "aws-config",
+ "aws-credential-types",
+ "aws-sdk-ecr",
+ "aws-sdk-ecrpublic",
+ "base16",
+ "base64 0.22.1",
+ "bytes",
+ "cfg-if",
+ "chrono",
+ "clap",
+ "derive_builder",
+ "futures",
+ "home",
+ "indicatif",
+ "keyring",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "snafu",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-indicatif",
+ "tracing-subscriber",
+ "url",
 ]
 
 [[package]]

@@ -6,7 +6,7 @@ use crate::non_configurable_no_context;
 use crate::storage::{Artifact, BackendImpl, Id, Layer, LayerBuilder, MediaType, StorageResult};
 use crate::util::{Reader, Writer};
 use async_trait::async_trait;
-use edo_oci::models::Platform;
+use ocilot::models::Platform;
 use parking_lot::RwLock;
 use snafu::{OptionExt, ResultExt, ensure};
 use tokio::fs::{File, OpenOptions};

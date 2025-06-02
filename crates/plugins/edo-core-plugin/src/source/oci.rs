@@ -1,6 +1,6 @@
 use async_trait::async_trait;
-use edo_oci::{index::Index, models::Platform, uri::Uri};
 use futures::future::try_join_all;
+use ocilot::{index::Index, models::Platform, uri::Uri};
 use snafu::ensure;
 use snafu::{OptionExt, ResultExt};
 use std::collections::BTreeSet;
@@ -220,7 +220,7 @@ pub mod error {
         #[snafu(display("failed to wait on parallel task: {source}"))]
         Join { source: tokio::task::JoinError },
         #[snafu(display("image source oci error: {source}"))]
-        Oci { source: edo_oci::error::Error },
+        Oci { source: ocilot::error::Error },
         #[snafu(display("image source definition requires a field '{field}' with type '{type_}"))]
         Field { field: String, type_: String },
         #[snafu(display("failed to make id: {source}"))]

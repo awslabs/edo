@@ -3,7 +3,6 @@ resolver = "2"
 default-members = ["crates/edo"]
 members = [
     "crates/edo",
-    "crates/edo-oci",
     "crates/edo-core",
     "crates/edo-plugin-sdk",
     "crates/edo-starlark", "examples/hello_rust", "crates/plugins/edo-core-plugin",
@@ -50,7 +49,7 @@ indicatif = "0.17"
 keyring = "3.6"
 merkle_hash = "3.8"
 names = { version = "0.14", features = [], default-features = false }
-edo-oci = { path = "./crates/edo-oci" }
+ocilot = { git = "https://github.com/awslabs/ocilot.git" }
 once_cell = { version = "1.21", features = ["parking_lot"] }
 os_pipe = "1.2.1"
 owo-colors = { version = "4.2", features = ["supports-colors"] }

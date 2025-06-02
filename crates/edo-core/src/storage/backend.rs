@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use edo_oci::models::Platform;
+use ocilot::models::Platform;
 
 use crate::def_trait;
 use crate::util::{Reader, Writer};

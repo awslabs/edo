@@ -5,7 +5,7 @@ use crate::{
     storage::{Artifact, ArtifactBuilder, Config, Id, IdBuilder, MediaType, Storage},
     util::{Reader, Writer},
 };
-use edo_oci::models::Platform;
+use ocilot::models::Platform;
 use semver::{Version, VersionReq};
 use snafu::ResultExt;
 use std::collections::BTreeSet;

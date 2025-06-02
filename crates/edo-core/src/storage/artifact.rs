@@ -1,6 +1,6 @@
 use super::{StorageResult, error, id::Id};
 use derive_builder::Builder;
-use edo_oci::models::Platform;
+use ocilot::models::Platform;
 use regex::Regex;
 use semver::VersionReq;
 use serde::{Deserialize, Serialize};
