@@ -1880,6 +1880,7 @@ dependencies = [
  "edo-core",
  "futures",
  "indexmap",
+ "indicatif",
  "merkle_hash",
  "names",
  "ocilot",

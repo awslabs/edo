@@ -83,7 +83,6 @@ impl SourceImpl for ImageSource {
 
     async fn fetch(&self, _log: &Log, storage: &Storage) -> SourceResult<Artifact> {
         let id = self.get_unique_id().await?;
-        let id_s = id.to_string();
         trace!(component = "source", type = "oci", "pulling oci image from {}", self.uri);
 
         // We do something rather clever for oci images, as we are going to one to one map the layers
@@ -103,56 +102,33 @@ impl SourceImpl for ImageSource {
                 expected: digest.clone()
             }
         );
-        let image = index
-            .fetch_image(&self.uri, Some(self.platform.clone()))
-            .await
-            .context(error::OciSnafu)?
-            .unwrap();
-        // Now here comes the fun part we are going to create parallel tasks for each layer in this image
-        let mut handles = Vec::new();
-        let image_config = image
-            .fetch_config(&self.uri)
-            .await
-            .context(error::OciSnafu)?;
-        let image_metadata = serde_json::to_value(&image_config).context(error::SerializeSnafu)?;
+
+        // We use ocilot to create a oci tarball for this imag
         let mut artifact = ArtifactBuilder::default()
             .config(
                 ConfigBuilder::default()
                     .id(id)
                     .provides(BTreeSet::from_iter([self.uri.to_string()]))
-                    .metadata(image_metadata)
                     .build()
                     .context(error::ConfigSnafu)?,
             )
             .media_type(MediaType::Manifest)
             .build()
             .context(error::ArtifactSnafu)?;
-        for layer in image.layers() {
-            let uri = self.uri.clone();
-            let storage = storage.clone();
-            let digest = layer.digest().to_string();
-            let layer = layer.clone();
-            handles.push(tokio::spawn(
-                async move {
-                    let mut reader = layer.open(&uri).await.context(error::OciSnafu)?;
-                    let mut writer = storage.safe_start_layer().await?;
-                    tokio::io::copy(&mut reader, &mut writer)
-                        .await
-                        .context(error::IoSnafu)?;
-                    let artifact_layer = storage
-                        .safe_finish_layer(
-                            &MediaType::File(Compression::None),
-                            layer.platform(),
-                            &writer,
-                        )
-                        .await?;
-                    Ok::<Layer, error::ImageSourceError>(artifact_layer)
-                }
-                .instrument(info_span!("download", blob = digest, id = id_s)),
-            ));
-        }
-        let layers = wait(handles).await?;
-        *artifact.layers_mut() = layers;
+
+        let writer = storage.safe_start_layer().await?;
+        index
+            .to_oci(&self.uri, Some(self.platform.clone()), writer.clone())
+            .await
+            .context(error::OciSnafu)?;
+        let layer = storage
+            .safe_finish_layer(
+                &MediaType::Oci(Compression::None),
+                Some(self.platform.clone()),
+                &writer,
+            )
+            .await?;
+        artifact.layers_mut().push(layer);
         storage.safe_save(&artifact).await?;
         Ok(artifact.clone())
     }
@@ -170,28 +146,6 @@ impl SourceImpl for ImageSource {
     }
 }
 
-async fn wait<I, R>(handles: I) -> Result<Vec<R>, error::ImageSourceError>
-where
-    R: Clone,
-    I: IntoIterator,
-    I::Item: Future<Output = std::result::Result<Result<R, error::ImageSourceError>, JoinError>>,
-{
-    let result = try_join_all(handles).await;
-    let mut success = Vec::new();
-    let mut failures = Vec::new();
-    for entry in result.context(error::JoinSnafu)? {
-        match entry {
-            Ok(result) => success.push(result),
-            Err(e) => failures.push(e),
-        }
-    }
-    if !failures.is_empty() {
-        error::ChildSnafu { failures }.fail()
-    } else {
-        Ok(success)
-    }
-}
-
 pub mod error {
     use snafu::Snafu;
 
@@ -204,8 +158,6 @@ pub mod error {
         Artifact {
             source: edo_core::storage::ArtifactBuilderError,
         },
-        #[snafu(display("{}", failures.iter().map(|x| x.to_string()).collect::<Vec<_>>().join("\n")))]
-        Child { failures: Vec<ImageSourceError> },
         #[snafu(display("failed to make artifact config: {source}"))]
         Config {
             source: edo_core::storage::ConfigBuilderError,
@@ -217,8 +169,6 @@ pub mod error {
         },
         #[snafu(display("image has digest '{actual}' when expecting '{expected}"))]
         Digest { actual: String, expected: String },
-        #[snafu(display("failed to wait on parallel task: {source}"))]
-        Join { source: tokio::task::JoinError },
         #[snafu(display("image source oci error: {source}"))]
         Oci { source: ocilot::error::Error },
         #[snafu(display("image source definition requires a field '{field}' with type '{type_}"))]

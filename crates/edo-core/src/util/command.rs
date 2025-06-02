@@ -53,6 +53,31 @@ where
     Ok(output.status.success())
 }
 
+pub fn cmd_collect_out<P, S, A, I>(
+    path: P,
+    log: &Log,
+    program: S,
+    args: I,
+    env: &HashMap<String, String>,
+) -> Result<Vec<u8>>
+where
+    P: AsRef<Path>,
+    S: IntoExecutablePath,
+    I: IntoIterator<Item = A>,
+    A: Into<OsString>,
+{
+    let mut expr = duct::cmd(program, args)
+        .stdout_capture()
+        .stderr_file(log)
+        .unchecked()
+        .dir(path.as_ref());
+    for (key, value) in env.iter() {
+        expr = expr.env(key.clone(), value.clone());
+    }
+    let output = expr.run()?;
+    Ok(output.stdout)
+}
+
 pub fn cmd_pipeout<P, F, S, A, I>(
     path: P,
     log: &Log,

@@ -4,7 +4,10 @@ use edo_core::context::{Addr, Context, Definable, FromNode, Log, Node};
 use edo_core::environment::{Command, EnvResult, Environment, EnvironmentImpl, FarmImpl};
 use edo_core::source::Source;
 use edo_core::storage::{Id, Storage};
-use edo_core::util::{Reader, Writer, cmd_noinput, cmd_noredirect, cmd_nulled, from_dash};
+use edo_core::util::{
+    Reader, Writer, cmd_collect_out, cmd_noinput, cmd_noredirect, cmd_nulled, cmd_pipeout,
+    from_dash,
+};
 use snafu::ResultExt;
 use snafu::{OptionExt, ensure};
 use std::collections::HashMap;
@@ -130,27 +133,37 @@ impl FarmImpl for ContainerFarm {
             info!(component = "environment", type = "container", "image already loaded into container engine, if this is incorrect please remove {name} first.");
             return Ok(());
         }
-        // The image source stores an oci image by its blobs and doesn't really maintain the image config
-        // so to load it into the runtime we want to create a filesystem and import that in as our image.
-        // We create a manual tempfile
-        let path = env::temp_dir().join(Uuid::now_v7().to_string());
-        let mut filesystem = File::create(&path).await.context(error::IoSnafu)?;
-        for layer in artifact.layers() {
-            info!("blob {}", layer.digest().digest());
-            let mut reader = storage.safe_read(layer).await?;
-            tokio::io::copy(&mut reader, &mut filesystem)
-                .await
-                .context(error::IoSnafu)?;
-        }
-        drop(filesystem);
+        // The image source stores an oci image as an oci archive in the first layer
+        let layer = artifact.layers().first().unwrap();
+        let mut reader = storage.safe_read(&layer).await?;
 
-        // Now that we have chained all the layer readers together we can actually send this to an import
+        let path = env::temp_dir().join(Uuid::now_v7().to_string());
+        let mut archive = File::create(&path).await.context(error::IoSnafu)?;
+        tokio::io::copy(&mut reader, &mut archive)
+            .await
+            .context(error::IoSnafu)?;
+        drop(archive);
+
         async move {
+            // Now we can load the image into the runtime using docker load then tag it accordingly
+            let output = cmd_collect_out(
+                ".",
+                log,
+                &self.config.cli,
+                ["load", "-i", path.to_str().unwrap()],
+                &HashMap::new(),
+            )
+            .context(error::RuntimeSnafu)?;
+            // The return will be the image digest
+            let string = String::from_utf8_lossy(output.as_slice());
+            let string = string
+                .strip_prefix("Loaded image: sha256:")
+                .unwrap_or(string.as_ref());
             cmd_noinput(
                 ".",
                 log,
                 &self.config.cli,
-                ["image", "import", path.to_str().unwrap(), name.as_str()],
+                ["tag", string.trim(), name.as_str()],
                 &HashMap::new(),
             )
             .context(error::RuntimeSnafu)?;
