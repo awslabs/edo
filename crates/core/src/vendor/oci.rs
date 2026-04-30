@@ -9,7 +9,7 @@ use edo::storage::Artifact;
 use ocilot::index::Index;
 use ocilot::registry::Registry;
 use ocilot::repository::Repository;
-use ocilot::uri::{Reference, RegistryUri, UriBuilder};
+use ocilot::uri::{Reference, RegistryUri, Uri};
 use semver::{Version, VersionReq};
 use snafu::{OptionExt, ResultExt, ensure};
 use tokio::io::AsyncReadExt;
@@ -42,22 +42,20 @@ impl VendorImpl for ImageVendor {
     }
 
     async fn resolve(&self, name: &str, version: &Version) -> SourceResult<Node> {
-        let mut uri = UriBuilder::default()
+        let mut uri = Uri::builder()
             .registry(self.registry.clone())
             .repository(name)
             .reference(Reference::Tag(version.to_string()))
-            .build()
-            .unwrap();
+            .build();
 
         let mut index = Index::fetch(&uri).await.context(error::OciSnafu).ok();
         if index.is_none() {
             // Adjust the tag to have a 'v' prefix
-            uri = UriBuilder::default()
+            uri = Uri::builder()
                 .registry(self.registry.clone())
                 .repository(name)
                 .reference(Reference::Tag(format!("v{version}")))
-                .build()
-                .unwrap();
+                .build();
             index = Index::fetch(&uri).await.context(error::OciSnafu).ok();
         }
         ensure!(
@@ -144,22 +142,20 @@ impl ImageVendor {
         name: &str,
         version: &Version,
     ) -> Result<Option<Artifact>, error::Error> {
-        let mut uri = UriBuilder::default()
+        let mut uri = Uri::builder()
             .registry(self.registry.clone())
             .repository(name)
             .reference(Reference::Tag(version.to_string()))
-            .build()
-            .unwrap();
+            .build();
 
         let mut index = Index::fetch(&uri).await.context(error::OciSnafu).ok();
         if index.is_none() {
             // Adjust the tag to have a 'v' prefix
-            uri = UriBuilder::default()
+            uri = Uri::builder()
                 .registry(self.registry.clone())
                 .repository(name)
                 .reference(Reference::Tag(format!("v{version}")))
-                .build()
-                .unwrap();
+                .build();
             index = Index::fetch(&uri).await.context(error::OciSnafu).ok();
         }
         if index.is_none() {

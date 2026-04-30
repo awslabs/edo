@@ -1,0 +1,7 @@
+[formatting]
+column_width        = 100
+array_auto_collapse = true
+align_comments      = true
+align_entries       = true
+indent_entries      = false
+reorder_keys =       true

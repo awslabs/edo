@@ -10,7 +10,7 @@ use edo::transform::{TransformError, TransformImpl, TransformResult, TransformSt
 
 use async_trait::async_trait;
 use indexmap::IndexMap;
-use ocilot::models::PlatformBuilder;
+use ocilot::models::Platform;
 use snafu::OptionExt;
 
 pub struct ScriptTransform {
@@ -237,15 +237,14 @@ impl TransformImpl for ScriptTransform {
                     .safe_finish_layer(
                         &MediaType::Tar(Compression::None),
                         Some(
-                            PlatformBuilder::default()
+                            Platform::builder()
                                 .os(std::env::consts::OS)
                                 .architecture(
                                     self.arch
                                         .clone()
                                         .unwrap_or(std::env::consts::OS.to_string()),
                                 )
-                                .build()
-                                .unwrap(),
+                                .build(),
                         ),
                         &writer,
                     )
