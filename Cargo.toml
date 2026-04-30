@@ -10,7 +10,7 @@ members = [
 exclude = [".edo/", "examples/"]
 
 [workspace.dependencies]
-astral-tokio-tar = "0.5"
+astral-tokio-tar = "0.6"
 async-compression = { version = "0.4", features = [
     "tokio",
     "zstd",

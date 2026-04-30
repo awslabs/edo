@@ -194,9 +194,25 @@ dependencies = [
 
 [[package]]
 name = "astral-tokio-tar"
-version = "0.5.2"
+version = "0.5.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1abb2bfba199d9ec4759b797115ba6ae435bdd920ce99783bb53aeff57ba919b"
+checksum = "ec179a06c1769b1e42e1e2cbe74c7dcdb3d6383c838454d063eaac5bbb7ebbe5"
+dependencies = [
+ "filetime",
+ "futures-core",
+ "libc",
+ "portable-atomic",
+ "rustc-hash 2.1.1",
+ "tokio",
+ "tokio-stream",
+ "xattr",
+]
+
+[[package]]
+name = "astral-tokio-tar"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4ce73b17c62717c4b6a9af10b43e87c578b0cac27e00666d48304d3b7d2c0693"
 dependencies = [
  "filetime",
  "futures-core",
@@ -1804,7 +1820,7 @@ dependencies = [
 name = "edo"
 version = "0.1.0"
 dependencies = [
- "astral-tokio-tar",
+ "astral-tokio-tar 0.6.1",
  "async-compression",
  "clap",
  "edo-core",
@@ -1818,7 +1834,7 @@ dependencies = [
 name = "edo-core"
 version = "0.1.0"
 dependencies = [
- "astral-tokio-tar",
+ "astral-tokio-tar 0.6.1",
  "async-recursion",
  "async-trait",
  "aws-config",
@@ -1870,7 +1886,7 @@ dependencies = [
 name = "edo-core-plugin"
 version = "0.1.0"
 dependencies = [
- "astral-tokio-tar",
+ "astral-tokio-tar 0.6.1",
  "async-trait",
  "aws-config",
  "aws-sdk-s3",
@@ -3403,7 +3419,7 @@ version = "0.1.0"
 source = "git+https://github.com/awslabs/ocilot.git#dd4d0c536f78e8962176c92fd77086b158394989"
 dependencies = [
  "anyhow",
- "astral-tokio-tar",
+ "astral-tokio-tar 0.5.6",
  "async-compression",
  "async-recursion",
  "async-trait",
