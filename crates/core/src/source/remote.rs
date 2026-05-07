@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use edo::record;
 use futures::TryStreamExt;
 use serde_json::json;
 use snafu::{OptionExt, ResultExt, ensure};
@@ -81,12 +82,13 @@ impl SourceImpl for RemoteSource {
         Ok(id)
     }
 
-    async fn fetch(&self, _log: &Log, storage: &Storage) -> SourceResult<Artifact> {
+    async fn fetch(&self, log: &Log, storage: &Storage) -> SourceResult<Artifact> {
         let id = self.get_unique_id().await?;
         let id_s = id.to_string();
         trace!(component = "source", type = "remote", "fetching remote file from {}", self.url);
         let url = self.url.clone();
         async move {
+            record!(log, "fetch", "fetching artifact from {url}");
             let client = reqwest::Client::new();
             let response = client
                 .get(url.clone())
@@ -147,7 +149,7 @@ impl SourceImpl for RemoteSource {
 
     async fn stage(
         &self,
-        _log: &Log,
+        log: &Log,
         storage: &Storage,
         env: &Environment,
         path: &Path,
@@ -160,9 +162,11 @@ impl SourceImpl for RemoteSource {
         let reader = storage.safe_read(layer).await?;
         if self.is_archive {
             trace!(component = "source", type = "remote", "staging contents of archive into {}", out.display());
+            record!(log, "unpack", "extracting archive into {out:?}");
             env.unpack(&out, reader).await?;
         } else {
             trace!(component = "source", type = "remote", "staging file to {}", out.display());
+            record!(log, "copy", "copying file to {out:?}");
             env.write(&out, reader).await?;
         }
         Ok(())

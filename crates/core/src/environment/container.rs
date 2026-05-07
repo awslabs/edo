@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use edo::context::{Addr, Context, Definable, FromNode, Log, Node};
 use edo::environment::{Command, EnvResult, Environment, EnvironmentImpl, FarmImpl};
+use edo::record;
 use edo::source::Source;
 use edo::storage::{Id, Storage};
 use edo::util::{
@@ -143,6 +144,7 @@ impl FarmImpl for ContainerFarm {
 
         async move {
             // Now we can load the image into the runtime using docker load then tag it accordingly
+            record!(log, "load_image", "{:?} load -i {path:?}", &self.config.cli);
             let output = cmd_collect_out(
                 ".",
                 log,
@@ -156,6 +158,13 @@ impl FarmImpl for ContainerFarm {
             let string = string
                 .strip_prefix("Loaded image: sha256:")
                 .unwrap_or(string.as_ref());
+            record!(
+                log,
+                "tag_image",
+                "{:?} tag {} {name}",
+                self.config.cli,
+                string.trim()
+            );
             cmd_noinput(
                 ".",
                 log,
@@ -238,10 +247,11 @@ impl EnvironmentImpl for Container {
         self.env.get(key).map(|x| x.value().clone())
     }
 
-    async fn setup(&self, _log: &Log, _storage: &Storage) -> EnvResult<()> {
+    async fn setup(&self, log: &Log, _storage: &Storage) -> EnvResult<()> {
         // make the directory we want exists
         if !self.path.exists() {
             trace!(component = "environment", type = "container", "creating workspace directory at {}", self.path.display());
+            record!(log, "create_dir", "{:?}", self.path);
             tokio::fs::create_dir_all(&self.path)
                 .await
                 .context(error::WorkspaceSnafu)?;
@@ -294,6 +304,7 @@ impl EnvironmentImpl for Container {
             args.push(self.name.clone());
             args.push(self.tag.clone());
             args.push("sh".into());
+            record!(log, "launch", "{:?} {}", self.config.cli, args.join(" "));
             edo::util::cmd_noinput(".", log, &self.config.cli, args, &from_dash(&self.env))
                 .context(error::RuntimeSnafu)?;
             self.running.store(true, Ordering::SeqCst);
@@ -308,6 +319,7 @@ impl EnvironmentImpl for Container {
         if !self.running.load(Ordering::SeqCst) {
             return Ok(());
         }
+        record!(log, "stop", "{:?} kill {}", self.config.cli, self.name);
         edo::util::cmd_noinput(
             ".",
             log,
@@ -316,6 +328,7 @@ impl EnvironmentImpl for Container {
             &from_dash(&self.env),
         )
         .context(error::RuntimeSnafu)?;
+        record!(log, "clean", "{:?} rm {}", self.config.cli, self.name);
         edo::util::cmd_noinput(
             ".",
             log,
@@ -462,6 +475,7 @@ impl EnvironmentImpl for Container {
             run_args.push("sh".into());
             run_args.push("-c".into());
             run_args.push(cmd.into());
+            record!(log, "exec", "{:?} {}", self.config.cli, run_args.join(" "));
             edo::util::cmd_noinput(".", log, &self.config.cli, run_args, &from_dash(&self.env))
                 .context(error::RuntimeSnafu)
         }
@@ -504,6 +518,13 @@ impl EnvironmentImpl for Container {
             run_args.push("sh".into());
             let script = command.to_string();
             let mut cursor = Cursor::new(script.as_bytes());
+            record!(
+                log,
+                "script",
+                "{:?} {}",
+                self.config.cli,
+                run_args.join(" ")
+            );
             Ok(edo::util::cmd(
                 ".",
                 log,
@@ -535,6 +556,8 @@ pub mod error {
     pub enum Error {
         #[snafu(display("failed to archive directory: {source}"))]
         Archive { source: std::io::Error },
+        #[snafu(transparent)]
+        Context { source: ContextError },
         #[snafu(display("failed to create directory: {source}"))]
         CreateDirectory { source: std::io::Error },
         #[snafu(display("failed to create file: {source}"))]

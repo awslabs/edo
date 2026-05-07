@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use edo::context::{Addr, Context, FromNode, Log, Node, non_configurable};
 use edo::environment::Environment;
+use edo::record;
 use edo::source::{SourceImpl, SourceResult};
 use edo::storage::{Artifact, Compression, Config, Id, MediaType, Storage};
 use merkle_hash::MerkleTree;
@@ -82,7 +83,7 @@ impl SourceImpl for LocalSource {
         Ok(id)
     }
 
-    async fn fetch(&self, _log: &Log, storage: &Storage) -> SourceResult<Artifact> {
+    async fn fetch(&self, log: &Log, storage: &Storage) -> SourceResult<Artifact> {
         let id = self.get_unique_id().await?;
 
         // First create the manifest
@@ -96,6 +97,7 @@ impl SourceImpl for LocalSource {
         let media_type = if self.path.is_file() {
             trace!(component = "source", type = "local", "reading file at {}", self.path.display());
             let mut reader = File::open(&self.path).await.context(error::ReadFileSnafu)?;
+            record!(log, "copy", "storing file from {:?}", self.path);
             tokio::io::copy(&mut reader, &mut writer)
                 .await
                 .context(error::ReadFileSnafu)?;
@@ -103,6 +105,12 @@ impl SourceImpl for LocalSource {
         } else {
             // We want to archive it if its a directory
             trace!(component = "source", type = "local", "archiving directory at {}", self.path.display());
+            record!(
+                log,
+                "archive",
+                "archiving contents of directory at {:?}",
+                self.path
+            );
             let mut archive = Builder::new(writer.clone());
             archive
                 .append_dir_all(".", &self.path)
@@ -125,7 +133,7 @@ impl SourceImpl for LocalSource {
 
     async fn stage(
         &self,
-        _log: &Log,
+        log: &Log,
         storage: &Storage,
         env: &Environment,
         path: &Path,
@@ -139,9 +147,11 @@ impl SourceImpl for LocalSource {
         let reader = storage.safe_read(layer).await?;
         if self.is_archive || matches!(layer.media_type(), MediaType::Tar(..)) {
             trace!(component = "source", type = "local", "staging contents of archive into {}", out.display());
+            record!(log, "extract", "extracing archive into {out:?}");
             env.unpack(&out, reader).await?;
         } else {
             trace!(component = "source", type = "local", "staging file to {}", out.display());
+            record!(log, "copy", "copying file to {out:?}");
             env.write(&out, reader).await?;
         }
         Ok(())

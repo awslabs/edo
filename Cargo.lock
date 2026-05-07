@@ -1413,6 +1413,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "tracing-indicatif",
  "url",
  "uuid",
  "which",

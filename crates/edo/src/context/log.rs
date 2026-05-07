@@ -80,10 +80,7 @@ impl Log {
     /// Writes a dedicated action to the log file
     pub fn record(&self, action: &str, message: &str) -> Result<()> {
         let mut lock = self.inner.lock();
-        let line = format!(
-            "\n--- [{}]({action}): {message} ---\n",
-            lock.subject.clone()
-        );
+        let line = format!("\n> [{}]({action}): {message}\n", lock.subject.clone());
         lock.file
             .write_all(line.as_bytes())
             .context(error::IoSnafu)?;
@@ -110,6 +107,13 @@ impl IntoRawFd for &Log {
         drop(lock);
         file.into_raw_fd()
     }
+}
+
+#[macro_export]
+macro_rules! record {
+    ($log: ident, $action: literal, $($arg: tt)*) => {
+        $log.record($action, &format!($($arg)*))?;
+    };
 }
 
 #[cfg(test)]
@@ -155,7 +159,7 @@ mod tests {
         clone.flush().unwrap();
         let contents = std::fs::read_to_string(log.path()).unwrap();
         assert!(
-            contents.contains("------ build ------"),
+            contents.contains("=== [build] ==="),
             "unexpected contents: {contents:?}"
         );
     }

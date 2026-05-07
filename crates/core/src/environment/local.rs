@@ -2,9 +2,9 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use edo::context::{Addr, Context, FromNode, Log, Node};
 use edo::environment::{Command, EnvResult, Environment, EnvironmentImpl, FarmImpl};
-use edo::non_configurable;
 use edo::storage::{Id, Storage};
 use edo::util::{Reader, Writer, cmd, cmd_noinput, cmd_noredirect, from_dash};
+use edo::{non_configurable, record};
 use snafu::{ResultExt, ensure};
 use std::io::Cursor;
 use std::path::absolute;
@@ -82,10 +82,16 @@ impl EnvironmentImpl for LocalEnv {
         self.env.get(key).map(|x| x.key().clone())
     }
 
-    async fn setup(&self, _log: &Log, _storage: &Storage) -> EnvResult<()> {
+    async fn setup(&self, log: &Log, _storage: &Storage) -> EnvResult<()> {
         // make sure the directory we want exists
         if !self.path.exists() {
             trace!(component = "environment", type = "local", "creating environment directory at {}", self.path.display());
+            record!(
+                log,
+                "create_dir",
+                "creating environment directory at {:?}",
+                self.path
+            );
             tokio::fs::create_dir_all(&self.path)
                 .await
                 .context(error::CreateDirectorySnafu)?;
@@ -104,10 +110,16 @@ impl EnvironmentImpl for LocalEnv {
         Ok(())
     }
 
-    async fn clean(&self, _log: &Log) -> EnvResult<()> {
+    async fn clean(&self, log: &Log) -> EnvResult<()> {
         // Delete the directory
         if self.path.exists() {
             trace!(component = "environment", type = "local", "removing environment directory at {}", self.path.display());
+            record!(
+                log,
+                "remove_dir",
+                "removing environment directory at {:?}",
+                self.path
+            );
             tokio::fs::remove_dir_all(&self.path)
                 .await
                 .context(error::RemoveDirectorySnafu)?;
@@ -191,6 +203,7 @@ impl EnvironmentImpl for LocalEnv {
         let work_dir = self.path.join(path);
         trace!(component = "environment", type = "local", "running command in {}", work_dir.display());
         async move {
+            record!(log, "exec", "sh -c {cmd}");
             cmd_noinput(&work_dir, log, "sh", ["-c", cmd], &from_dash(&self.env))
                 .context(error::FailedSnafu)
         }
@@ -209,6 +222,7 @@ impl EnvironmentImpl for LocalEnv {
         trace!(component = "environment", type = "local", "running command in {}", work_dir.display());
         let result = async move {
             let script = command.to_string();
+            record!(log, "script", "sh");
             let mut cursor = Cursor::new(script.as_bytes());
             cmd(
                 &work_dir,
@@ -251,6 +265,8 @@ pub mod error {
         Absolute { source: std::io::Error },
         #[snafu(display("failed to archive directory: {source}"))]
         Archive { source: std::io::Error },
+        #[snafu(transparent)]
+        Context { source: ContextError },
         #[snafu(display("failed to create a file: {source}"))]
         CreateFile { source: std::io::Error },
         #[snafu(display("failed to create a directory: {source}"))]

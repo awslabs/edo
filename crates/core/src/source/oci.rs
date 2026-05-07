@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use edo::record;
 use ocilot::{index::Index, models::Platform, uri::Uri};
 use snafu::ensure;
 use snafu::{OptionExt, ResultExt};
@@ -73,7 +74,7 @@ impl SourceImpl for ImageSource {
         Ok(id)
     }
 
-    async fn fetch(&self, _log: &Log, storage: &Storage) -> SourceResult<Artifact> {
+    async fn fetch(&self, log: &Log, storage: &Storage) -> SourceResult<Artifact> {
         let id = self.get_unique_id().await?;
         trace!(component = "source", type = "oci", "pulling oci image from {}", self.uri);
 
@@ -107,6 +108,13 @@ impl SourceImpl for ImageSource {
             .build();
 
         let writer = storage.safe_start_layer().await?;
+        record!(
+            log,
+            "pull",
+            "fetching oci archive for image at {} for platform {}",
+            self.uri,
+            self.platform
+        );
         index
             .to_oci(&self.uri, Some(self.platform.clone()), writer.clone())
             .await

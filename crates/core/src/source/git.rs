@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use edo::context::{Addr, Context, FromNode, Log, Node, non_configurable};
 use edo::environment::Environment;
+use edo::record;
 use edo::source::{SourceImpl, SourceResult};
 use edo::storage::{Artifact, Compression, Config, Id, MediaType, Storage};
 use edo::util::cmd_noinput;
@@ -72,7 +73,8 @@ impl SourceImpl for GitSource {
     async fn fetch(&self, log: &Log, storage: &Storage) -> SourceResult<Artifact> {
         let id = self.get_unique_id().await?;
         let id_s = id.to_string();
-        trace!(component = "source", type = "git", "cloning git repository: git clne -b {} {}", self.reference, self.url);
+        trace!(component = "source", type = "git", "cloning git repository: git clone -b {} {}", self.reference, self.url);
+        record!(log, "clone", "git clone -b {} {}", self.reference, self.url);
         async move {
             let temp = tempdir().context(error::TempDirectorySnafu)?;
             cmd_noinput(
@@ -133,7 +135,7 @@ impl SourceImpl for GitSource {
 
     async fn stage(
         &self,
-        _log: &Log,
+        log: &Log,
         storage: &Storage,
         env: &Environment,
         path: &Path,
@@ -142,6 +144,11 @@ impl SourceImpl for GitSource {
         trace!(component = "source", type = "git", "staging into {}", out_path.display());
         // We want to open the artifact manifest first
         let id = self.get_unique_id().await?;
+        record!(
+            log,
+            "unpack",
+            "unpacking git repository ({id}) into {out_path:?}"
+        );
         let artifact = storage.safe_open(&id).await?;
         // There should only be 1 layer that is our target
         let reader = storage
