@@ -18,6 +18,8 @@ pub enum EnvironmentError {
     Implementation {
         source: Box<dyn snafu::Error + Send + Sync>,
     },
+    #[snafu(display("IO error occured inside environment: {source}"))]
+    Io { source: std::io::Error },
     /// A command executed inside the environment returned a non-zero exit status.
     #[snafu(display("command execution failed"))]
     Run,
@@ -30,6 +32,9 @@ pub enum EnvironmentError {
     /// Handlebars template rendering failed while substituting command variables.
     #[snafu(display("failed to render substitution: {source}"))]
     Template { source: handlebars::RenderError },
+    /// Failure during VFS operation
+    #[snafu(display("vfs operation failed: {action}"))]
+    Vfs { action: String },
 }
 
 #[cfg(test)]
@@ -83,8 +88,7 @@ mod tests {
 
     #[test]
     fn implementation_variant_preserves_source() {
-        let boxed: Box<dyn snafu::Error + Send + Sync> =
-            Box::new(std::io::Error::other("boom"));
+        let boxed: Box<dyn snafu::Error + Send + Sync> = Box::new(std::io::Error::other("boom"));
         let e = EnvironmentError::Implementation { source: boxed };
         let s = e.to_string();
         // Snafu's transparent variant delegates to the inner error's Display.

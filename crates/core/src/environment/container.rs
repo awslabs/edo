@@ -439,7 +439,7 @@ impl EnvironmentImpl for Container {
         async move {
             let mut args = vec![
                 "exec".to_string(),
-                //"-i".to_string(),
+                "-i".to_string(),
                 "--workdir".to_string(),
                 format!("{}", work_dir.display()),
             ];
@@ -459,9 +459,9 @@ impl EnvironmentImpl for Container {
             }
             args.push(self.name.clone());
             let mut run_args = args.clone();
-            run_args.push(
-                cmd.to_string(), /*format!("sh -c '{}'", cmd.replace("'", "\'"))*/
-            );
+            run_args.push("sh".into());
+            run_args.push("-c".into());
+            run_args.push(cmd.into());
             edo::util::cmd_noinput(".", log, &self.config.cli, run_args, &from_dash(&self.env))
                 .context(error::RuntimeSnafu)
         }

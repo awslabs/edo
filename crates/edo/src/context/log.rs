@@ -25,6 +25,7 @@ pub struct Log {
 /// Internal state holding the file path and open file handle for a [`Log`].
 pub struct Inner {
     path: PathBuf,
+    subject: String,
     file: File,
 }
 
@@ -35,6 +36,7 @@ impl Log {
             manager: manager.clone(),
             inner: Arc::new(Mutex::new(Inner {
                 path: path.as_ref().to_path_buf(),
+                subject: "general".to_string(),
                 file: OpenOptions::new()
                     .create(true)
                     .append(true)
@@ -71,7 +73,21 @@ impl Log {
             .inner
             .lock()
             .file
-            .write_fmt(format_args!("\n------ {subject} ------\n"));
+            .write_fmt(format_args!("\n=== [{subject}] ===\n"));
+        self.inner.lock().subject = subject.to_string();
+    }
+
+    /// Writes a dedicated action to the log file
+    pub fn record(&self, action: &str, message: &str) -> Result<()> {
+        let mut lock = self.inner.lock();
+        let line = format!(
+            "\n--- [{}]({action}): {message} ---\n",
+            lock.subject.clone()
+        );
+        lock.file
+            .write_all(line.as_bytes())
+            .context(error::IoSnafu)?;
+        Ok(())
     }
 }
 

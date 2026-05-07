@@ -20,10 +20,12 @@ use std::path::{Path, PathBuf};
 mod command;
 pub mod error;
 mod farm;
+mod vfs;
 
 pub use command::*;
 pub use error::EnvironmentError;
 pub use farm::*;
+pub use vfs::*;
 
 /// Convenience result alias for fallible environment operations.
 pub type EnvResult<T> = std::result::Result<T, error::EnvironmentError>;
