@@ -1,3 +1,4 @@
+pub mod cargo_vendor;
 pub mod compose;
 pub mod import;
 pub mod script;
@@ -6,6 +7,7 @@ use edo::context::{Addr, Context, ContextError, Node};
 use edo::source::Source;
 use indexmap::IndexMap;
 
+pub use cargo_vendor::CargoVendorTransform;
 pub use compose::ComposeTransform;
 pub use import::ImportTransform;
 pub use script::ScriptTransform;

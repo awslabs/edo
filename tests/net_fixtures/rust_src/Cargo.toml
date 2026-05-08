@@ -1,0 +1,9 @@
+[package]
+name    = "rust_src"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+[dependencies]
+tokio = { version = "1", features = ["full"]}

@@ -1,4 +1,7 @@
 [workspace]
+resolver        = "2"
+members         = ["crates/cli", "crates/core", "crates/edo", "tests"]
+exclude         = [".edo/", "examples/", "tests/error_fixtures/", "tests/fixtures/", "tests/net_fixtures/", "tests/net_fixtures"]
 default-members = ["crates/cli"]
 
 [workspace.dependencies]

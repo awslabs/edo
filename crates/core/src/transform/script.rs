@@ -147,7 +147,7 @@ impl TransformImpl for ScriptTransform {
     async fn prepare(&self, log: &Log, ctx: &Handle) -> TransformResult<()> {
         // We should fetch all our sources
         for source in self.sources.values() {
-            source.fetch(log, ctx.storage()).await?;
+            source.cache(log, ctx.storage()).await?;
         }
         Ok(())
     }

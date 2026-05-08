@@ -128,8 +128,6 @@ impl SourceImpl for RemoteSource {
                 .await?;
             artifact.layers_mut().push(layer.clone());
 
-            storage.safe_save(&artifact).await?;
-
             ensure!(
                 layer.clone().digest().digest() == *id.digest(),
                 error::DigestSnafu {
@@ -137,6 +135,7 @@ impl SourceImpl for RemoteSource {
                     expected: id.digest()
                 }
             );
+            storage.safe_save(&artifact).await?;
             Ok(artifact.clone())
         }
         .instrument(info_span!(
