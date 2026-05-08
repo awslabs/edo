@@ -15,7 +15,7 @@ use storage::S3Backend;
 use transform::{ComposeTransform, ImportTransform, ScriptTransform};
 use vendor::ImageVendor;
 
-use crate::transform::CargoVendorTransform;
+use crate::transform::{CargoVendorTransform, GoVendorTransform};
 /// Environments and Farms
 pub mod environment;
 /// Sources
@@ -107,6 +107,14 @@ pub fn register_core(ctx: &Context) {
         Arc::new(async |addr, node, ctx| {
             Ok(Transform::new(
                 CargoVendorTransform::new(&addr, &node, &ctx).await?,
+            ))
+        }),
+    );
+    registry.register_transform(
+        "go-vendor",
+        Arc::new(async |addr, node, ctx| {
+            Ok(Transform::new(
+                GoVendorTransform::new(&addr, &node, &ctx).await?,
             ))
         }),
     );
