@@ -206,50 +206,55 @@ impl Graph {
                     node.set_success();
                 }
 
-                // Always decrement inflight to avoid deadlock — the dispatch loop
-                // exits when inflight reaches 0, so we must decrement for every
-                // completed task regardless of success or failure.
-                parent_inflight.lock().await.fetch_sub(1, Ordering::SeqCst);
-
-                if failure_occured {
-                    // If a failure has occured do not keep walking the dag
-                    continue;
-                }
-
-                // Now evaluate the graph to find any parents that this finished node have that are now
-                // ready to execute and add them to the queue.
-                let mut children = graph.children(index);
-                while let Some(child) = children.walk_next(&graph) {
-                    // Now check if we have a parent that still hasn't run
-                    let mut parents = graph.parents(child.1);
-                    let node = graph.index(child.1);
-                    let mut skip = false;
-                    while let Some(parent) = parents.walk_next(&graph) {
-                        let pnode = graph.index(parent.1);
-                        if pnode.is_queued() || pnode.is_pending() {
-                            debug!(
-                                thread = "queue",
-                                "determined that parent {} is still not done so {} won't be queue'd",
-                                pnode.addr,
-                                node.addr
-                            );
-                            skip = true;
-                            break;
+                // Only walk children on the success path; a failure short-circuits
+                // further dispatch. The decrement still runs below so the dispatch
+                // loop can exit cleanly (preserving the 41eb63d deadlock fix).
+                if !failure_occured {
+                    // Now evaluate the graph to find any parents that this finished node have that are now
+                    // ready to execute and add them to the queue.
+                    let mut children = graph.children(index);
+                    while let Some(child) = children.walk_next(&graph) {
+                        // Now check if we have a parent that still hasn't run
+                        let mut parents = graph.parents(child.1);
+                        let node = graph.index(child.1);
+                        let mut skip = false;
+                        while let Some(parent) = parents.walk_next(&graph) {
+                            let pnode = graph.index(parent.1);
+                            if pnode.is_queued() || pnode.is_pending() {
+                                debug!(
+                                    thread = "queue",
+                                    "determined that parent {} is still not done so {} won't be queue'd",
+                                    pnode.addr,
+                                    node.addr
+                                );
+                                skip = true;
+                                break;
+                            }
+                        }
+                        if skip {
+                            continue;
+                        }
+                        // Now make sure that this child has not executed already
+                        if node.is_pending() {
+                            debug!(thread = "queue", "determined we can execute: {}", node.addr);
+                            // Mark it so we know it is in the queue to prevent duplicates
+                            node.set_queued();
+                            parent_deq.lock().await.push_back(child.1);
+                        } else {
+                            debug!(thread = "queue", "{} is not pending", node.addr);
                         }
                     }
-                    if skip {
-                        continue;
-                    }
-                    // Now make sure that this child has not executed already
-                    if node.is_pending() {
-                        debug!(thread = "queue", "determined we can execute: {}", node.addr);
-                        // Mark it so we know it is in the queue to prevent duplicates
-                        node.set_queued();
-                        parent_deq.lock().await.push_back(child.1);
-                    } else {
-                        debug!(thread = "queue", "{} is not pending", node.addr);
-                    }
                 }
+
+                // Decrement LAST so the dispatch loop cannot observe
+                // `inflight == 0 && deque.is_empty()` until any newly-ready
+                // children have already been enqueued above. This ordering is
+                // critical: if the decrement ran before the child-enqueue walk,
+                // the dispatcher could race, exit, and strand the root
+                // transform (see commit history around scheduler race fix).
+                // The decrement runs on every completion (success or failure),
+                // which preserves the failure-path deadlock fix from 41eb63d.
+                parent_inflight.lock().await.fetch_sub(1, Ordering::SeqCst);
             }
             Ok::<(), error::SchedulerError>(())
         });
@@ -596,6 +601,13 @@ pub(crate) mod tests {
     #[derive(Clone)]
     pub(crate) enum MockOutcome {
         Success,
+        /// Fail from the `stage` lifecycle method with a synthetic
+        /// [`TransformError::Implementation`]. Failing in `stage` (rather
+        /// than returning [`TransformStatus::Failed`] from `transform`)
+        /// avoids the interactive `dialoguer::Select::interact` prompt
+        /// in `execute::execute` so the scheduler's failure path can be
+        /// exercised from a unit test.
+        FailInStage,
     }
 
     /// Configurable mock transform.
@@ -616,6 +628,11 @@ pub(crate) mod tests {
         pub max_inflight: Arc<AtomicUsize>,
         pub order_log: Arc<TokioMutex<Vec<Addr>>>,
         pub outcome: MockOutcome,
+        /// Optional sleep injected into `transform()` to widen the
+        /// scheduler's completion-to-dispatch race window so unit tests
+        /// can reliably observe ordering bugs that real-world long-running
+        /// transforms would expose.
+        pub delay: Option<std::time::Duration>,
     }
 
     impl Default for MockTransformImpl {
@@ -632,6 +649,7 @@ pub(crate) mod tests {
                 max_inflight: Arc::new(AtomicUsize::new(0)),
                 order_log: Arc::new(TokioMutex::new(Vec::new())),
                 outcome: MockOutcome::Success,
+                delay: None,
             }
         }
     }
@@ -676,6 +694,11 @@ pub(crate) mod tests {
             _env: &Environment,
         ) -> TransformResult<()> {
             self.stage_called.fetch_add(1, AtomicOrdering::SeqCst);
+            if matches!(self.outcome, MockOutcome::FailInStage) {
+                return Err(crate::transform::TransformError::Implementation {
+                    source: Box::new(std::io::Error::other("mock stage failure")),
+                });
+            }
             Ok(())
         }
 
@@ -692,10 +715,20 @@ pub(crate) mod tests {
             self.order_log.lock().await.push(self.addr.clone());
             // Small yield so concurrent transforms interleave.
             tokio::task::yield_now().await;
+            // Optional sleep to widen the race window between the parent
+            // task's inflight decrement and its child-enqueue walk.
+            if let Some(d) = self.delay {
+                tokio::time::sleep(d).await;
+            }
             self.inflight.fetch_sub(1, AtomicOrdering::SeqCst);
 
             match self.outcome {
                 MockOutcome::Success => TransformStatus::Success(make_artifact(&self.digest)),
+                // Failure is already returned from `stage` for the
+                // `FailInStage` outcome, so this arm is unreachable when
+                // the scheduler is exercised; return Success so unit tests
+                // that touch `transform` directly still behave.
+                MockOutcome::FailInStage => TransformStatus::Success(make_artifact(&self.digest)),
             }
         }
 
@@ -757,6 +790,61 @@ pub(crate) mod tests {
             max_inflight: shared_max_inflight.clone(),
             order_log: shared_order.clone(),
             outcome: MockOutcome::Success,
+            delay: None,
+        };
+        let t = Transform::new(mock);
+        ctx.insert_transform_for_test(&addr, t);
+        MockHandles {
+            addr,
+            prepare_called,
+            stage_called,
+            transform_called,
+            max_inflight: shared_max_inflight,
+            order_log: shared_order,
+        }
+    }
+
+    /// Like [`register_mock`] but allows overriding [`MockOutcome`] and
+    /// injecting an optional per-transform delay.
+    ///
+    /// The delay widens the scheduler's race window between a task's
+    /// completion and the parent-task's child-enqueue walk — critical for
+    /// reliably reproducing the ordering bug that only surfaces on
+    /// long-running real transforms.
+    pub(crate) fn register_mock_with(
+        ctx: &Context,
+        addr_str: &str,
+        deps: &[&str],
+        shared_order: Arc<TokioMutex<Vec<Addr>>>,
+        shared_max_inflight: Arc<AtomicUsize>,
+        outcome: MockOutcome,
+        delay: Option<std::time::Duration>,
+    ) -> MockHandles {
+        let addr = Addr::parse(addr_str).unwrap();
+        let deps_vec: Vec<Addr> = deps
+            .iter()
+            .map(|s| Addr::parse(s).expect("dep addr"))
+            .collect();
+        let env_addr = Addr::parse("//default").unwrap();
+        let digest = format!("{:064x}", fxhash(addr_str));
+        let prepare_called = Arc::new(AtomicUsize::new(0));
+        let stage_called = Arc::new(AtomicUsize::new(0));
+        let transform_called = Arc::new(AtomicUsize::new(0));
+        let inflight = Arc::new(AtomicUsize::new(0));
+
+        let mock = MockTransformImpl {
+            addr: addr.clone(),
+            deps: deps_vec,
+            env_addr: env_addr.clone(),
+            digest,
+            prepare_called: prepare_called.clone(),
+            stage_called: stage_called.clone(),
+            transform_called: transform_called.clone(),
+            inflight,
+            max_inflight: shared_max_inflight.clone(),
+            order_log: shared_order.clone(),
+            outcome,
+            delay,
         };
         let t = Transform::new(mock);
         ctx.insert_transform_for_test(&addr, t);
@@ -1021,6 +1109,166 @@ pub(crate) mod tests {
             mi.load(AtomicOrdering::SeqCst) <= 1,
             "max_inflight was {}, expected <= 1",
             mi.load(AtomicOrdering::SeqCst),
+        );
+    }
+
+    /// Regression test for the race between the parent task's inflight
+    /// decrement and its child-enqueue walk.
+    ///
+    /// DAG shape mirrors `examples/hello_rust/edo.toml`:
+    ///
+    ///   leaf ──▶ mid ──▶ root
+    ///     └──────────────▲
+    ///
+    /// Before the fix, `batch_size = 1` plus a delay in each transform
+    /// deterministically reproduced the failure mode where `mid`'s
+    /// completion decremented `inflight` to 0 *before* `root` was
+    /// enqueued, allowing the dispatch loop to exit and stranding
+    /// `root`. After the fix, `root` must always run exactly once.
+    #[tokio::test]
+    #[serial_test::serial(log_manager)]
+    async fn graph_run_no_stranded_root_with_delay_and_batch_one() {
+        let ctx = ctx_or_skip!();
+        ensure_default_farm(&ctx);
+        let order = Arc::new(TokioMutex::new(Vec::new()));
+        let mi = Arc::new(AtomicUsize::new(0));
+        let delay = Some(std::time::Duration::from_millis(25));
+
+        let h_leaf = register_mock_with(
+            &ctx,
+            "//rg/leaf",
+            &[],
+            order.clone(),
+            mi.clone(),
+            MockOutcome::Success,
+            delay,
+        );
+        let h_mid = register_mock_with(
+            &ctx,
+            "//rg/mid",
+            &["//rg/leaf"],
+            order.clone(),
+            mi.clone(),
+            MockOutcome::Success,
+            delay,
+        );
+        let h_root = register_mock_with(
+            &ctx,
+            "//rg/root",
+            &["//rg/leaf", "//rg/mid"],
+            order.clone(),
+            mi.clone(),
+            MockOutcome::Success,
+            delay,
+        );
+
+        let mut g = Graph::new(1);
+        let root = Addr::parse("//rg/root").unwrap();
+        g.add(&ctx, &root).await.unwrap();
+        g.fetch(&ctx).await.unwrap();
+        let ws = TempDir::new().unwrap();
+        let g = Arc::new(g);
+        g.run(ws.path(), &ctx, &root).await.expect("run");
+
+        // All three transforms must have executed.
+        assert_eq!(
+            h_leaf.transform_called.load(AtomicOrdering::SeqCst),
+            1,
+            "leaf must run",
+        );
+        assert_eq!(
+            h_mid.transform_called.load(AtomicOrdering::SeqCst),
+            1,
+            "mid must run",
+        );
+        assert_eq!(
+            h_root.transform_called.load(AtomicOrdering::SeqCst),
+            1,
+            "root must run (this is the stranded-root regression)",
+        );
+        let log = order.lock().await;
+        assert_eq!(
+            log.last().unwrap(),
+            &Addr::parse("//rg/root").unwrap(),
+            "root must complete last",
+        );
+    }
+
+    /// Regression test locking in the 41eb63d deadlock fix: if a
+    /// transform fails, the scheduler must surface the error and terminate
+    /// rather than hanging. Failure is injected in the `stage` lifecycle
+    /// so the error propagates out of the per-task future without going
+    /// through `execute::execute`'s interactive `dialoguer::Select` prompt.
+    #[tokio::test]
+    #[serial_test::serial(log_manager)]
+    async fn graph_run_failure_does_not_hang() {
+        let ctx = ctx_or_skip!();
+        ensure_default_farm(&ctx);
+        let order = Arc::new(TokioMutex::new(Vec::new()));
+        let mi = Arc::new(AtomicUsize::new(0));
+
+        // Leaf fails in stage; mid and root depend on leaf and must never
+        // be dispatched once failure is observed.
+        register_mock_with(
+            &ctx,
+            "//rgf/leaf",
+            &[],
+            order.clone(),
+            mi.clone(),
+            MockOutcome::FailInStage,
+            None,
+        );
+        let h_mid = register_mock_with(
+            &ctx,
+            "//rgf/mid",
+            &["//rgf/leaf"],
+            order.clone(),
+            mi.clone(),
+            MockOutcome::Success,
+            None,
+        );
+        let h_root = register_mock_with(
+            &ctx,
+            "//rgf/root",
+            &["//rgf/leaf", "//rgf/mid"],
+            order.clone(),
+            mi.clone(),
+            MockOutcome::Success,
+            None,
+        );
+
+        let mut g = Graph::new(1);
+        let root = Addr::parse("//rgf/root").unwrap();
+        g.add(&ctx, &root).await.unwrap();
+        g.fetch(&ctx).await.unwrap();
+        let ws = TempDir::new().unwrap();
+        let g = Arc::new(g);
+
+        // Bound the whole run with a timeout — if the scheduler ever
+        // regresses back to the pre-41eb63d deadlock this test will fail
+        // loudly instead of hanging the test binary.
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(5), g.run(ws.path(), &ctx, &root))
+                .await
+                .expect("scheduler must not hang on failure");
+
+        // Failure should surface. `execute` wraps the error before the
+        // parent task sees it, so we only care that `run` returned Ok
+        // (the parent logged the failure) or Err — never a hang.
+        // In practice the failed branch short-circuits child dispatch;
+        // the parent task returns Ok so `run` returns Ok here.
+        let _ = result;
+
+        // Children of the failing leaf must never have run.
+        assert_eq!(
+            h_mid.transform_called.load(AtomicOrdering::SeqCst),
+            0,
+            "mid must not run after leaf failure",
+        );
+        assert_eq!(
+            h_root.transform_called.load(AtomicOrdering::SeqCst),
+            0,
+            "root must not run after leaf failure",
         );
     }
 }
