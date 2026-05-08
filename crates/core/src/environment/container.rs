@@ -34,6 +34,7 @@ pub struct ContainerFarm {
 pub struct ContainerConfig {
     runtime: Option<String>,
     cli: PathBuf,
+    network: bool,
 }
 
 #[async_trait]
@@ -42,8 +43,13 @@ impl FromNode for ContainerConfig {
 
     async fn from_node(_addr: &Addr, node: &Node, _: &Context) -> EnvResult<Self> {
         let runtime = node.get("runtime").and_then(|x| x.as_string());
+        let network = node
+            .get("network")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false);
         Ok(Self {
             runtime,
+            network,
             ..Default::default()
         })
     }
@@ -268,12 +274,14 @@ impl EnvironmentImpl for Container {
                 "run".to_string(),
                 "-it".to_string(),
                 "-d".to_string(),
-                "--network=none".to_string(),
                 "--security-opt".to_string(),
                 "label=disable".to_string(),
                 "--tmpfs".to_string(),
                 "/tmp".to_string(),
             ];
+            if !self.config.network {
+                args.push("--network=none".to_string());
+            }
             if self.user == "root" {
                 args.push("--mount".to_string());
                 args.push(format!(
