@@ -1,0 +1,16 @@
+schema-version = "1"
+
+[source.src]
+kind       = "local"
+path       = "hello_script/files"
+out        = "."
+is_archive = false
+
+[transform.build]
+kind        = "script"
+interpreter = "sh"
+source      = ["src"]
+commands    = [
+  "mkdir -p {{install-root}}",
+  "sh {{build-root}}/make_hello.sh {{install-root}}/hello.txt",
+]

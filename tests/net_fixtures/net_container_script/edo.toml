@@ -1,0 +1,29 @@
+schema-version = "1"
+
+[vendor.public-ecr]
+kind = "image"
+uri  = "public.ecr.aws/docker/library"
+
+[requires.gcc]
+kind = "image"
+at   = "=14.3.0"
+
+[environment.gcc]
+kind   = "container"
+source = ["//net_container_script/gcc"]
+
+[source.code]
+kind       = "local"
+path       = "net_container_script/code"
+out        = "."
+is_archive = false
+
+[transform.build]
+kind        = "script"
+environment = "//net_container_script/gcc"
+source      = ["code"]
+commands    = [
+  "mkdir -p {{install-root}}/bin",
+  "gcc -o hello {{build-root}}/hello.c",
+  "cp hello {{install-root}}/bin/hello",
+]

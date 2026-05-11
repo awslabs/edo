@@ -1,0 +1,20 @@
+schema-version = "1"
+
+[source.src]
+kind       = "local"
+path       = "go_src"
+out        = "."
+is_archive = false
+
+[transform.vendor]
+kind   = "go-vendor"
+source = "src"
+
+[transform.build]
+kind     = "script"
+source   = ["src"]
+depends  = ["//go_src/vendor"]
+commands = [
+  "mkdir -p {{install-root}}/bin",
+  "go build -mod=vendor -o {{install-root}}/bin/go_src .",
+]

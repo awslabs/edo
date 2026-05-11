@@ -1,0 +1,25 @@
+schema-version = "1"
+
+[source.left_src]
+kind       = "local"
+path       = "hello_compose/left"
+out        = "."
+is_archive = false
+
+[source.right_src]
+kind       = "local"
+path       = "hello_compose/right"
+out        = "."
+is_archive = false
+
+[transform.left]
+kind   = "import"
+source = ["left_src"]
+
+[transform.right]
+kind   = "import"
+source = ["right_src"]
+
+[transform.bundle]
+kind    = "compose"
+depends = ["//hello_compose/left", "//hello_compose/right"]

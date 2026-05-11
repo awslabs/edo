@@ -1,0 +1,21 @@
+schema-version = "1"
+
+[source.src]
+kind       = "local"
+path       = "rust_src"
+out        = "."
+is_archive = false
+
+[transform.vendor]
+kind   = "cargo-vendor"
+source = ["src"]
+
+[transform.build]
+kind     = "script"
+source   = ["src"]
+depends  = ["//rust_src/vendor"]
+commands = [
+  "mkdir -p {{install-root}}/bin",
+  "cargo build --offline --release",
+  "cp target/release/rust_src {{install-root}}/bin/rust_src",
+]

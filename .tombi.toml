@@ -1,0 +1,13 @@
+toml-version = "v1.0.0"
+
+[files]
+include              = ["**/*.toml"]
+exclude              = [".cache/**/*.toml"]
+respect-ignore-files = true
+
+[format]
+[format.rules]
+indent-sub-tables               = false
+indent-table-key-value-pairs    = false
+key-value-equals-sign-alignment = true
+line-width                      = 200

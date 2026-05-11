@@ -1,20 +1,27 @@
 [workspace]
 default-members = ["crates/cli"]
-exclude         = [".edo/", "examples/"]
-members         = ["crates/cli", "crates/edo", "crates/core"]
-resolver        = "2"
 
 [workspace.dependencies]
 arc-handle           = "1.0"
+assert_cmd           = "2"
 astral-tokio-tar     = "0.6"
-async-compression    = { version = "0.4", features = ["tokio", "zstd", "gzip", "bzip2", "lzma", "xz"] }
+async-compression    = { version = "0.4", features = ["bzip2", "gzip", "lzma", "tokio", "xz", "zstd"] }
 async-recursion      = "1.1"
 async-trait          = "0.1"
 aws-config           = "1"
 aws-credential-types = "1"
-aws-sdk-ecr          = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
-aws-sdk-ecrpublic    = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
-aws-sdk-s3           = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-ecr          = { version = "1", default-features = false, features = [
+  "default-https-client",
+  "rt-tokio",
+] }
+aws-sdk-ecrpublic    = { version = "1", default-features = false, features = [
+  "default-https-client",
+  "rt-tokio",
+] }
+aws-sdk-s3           = { version = "1", default-features = false, features = [
+  "default-https-client",
+  "rt-tokio",
+] }
 base16               = "0.2"
 base64               = "0.22"
 bimap                = "0.6"
@@ -36,15 +43,16 @@ indexmap             = "2.14"
 indicatif            = "0.18"
 keyring              = "3.6"
 merkle_hash          = "3.8"
-names                = { version = "0.14", features = [], default-features = false }
+names                = { version = "0.14", default-features = false, features = [] }
 ocilot               = "0.1"
 os_pipe              = "1.2"
 owo-colors           = { version = "4.3", features = ["supports-colors"] }
 parking_lot          = { version = "0.12", features = ["send_guard"] }
+predicates           = "3"
 rand                 = "0.10"
 rayon                = "1.12"
 regex                = "1.12"
-reqwest              = { version = "0.13", features = ["json", "stream"], default-features = false }
+reqwest              = { version = "0.13", default-features = false, features = ["json", "stream"] }
 resolvo              = { version = "0.10", features = ["serde", "tokio", "version-ranges"] }
 semver               = { version = "1.0", features = ["serde"] }
 serde                = { version = "1", features = ["derive"] }
@@ -53,7 +61,7 @@ serial_test          = "3"
 sha2                 = "0.11"
 snafu                = "0.9"
 tempfile             = "3.27"
-tokio                = { version = "1.52", features = ["full", "rt-multi-thread", "parking_lot"] }
+tokio                = { version = "1.52", features = ["full", "parking_lot", "rt-multi-thread"] }
 tokio-util           = "0.7"
 toml                 = "1"
 tracing              = "0.1"

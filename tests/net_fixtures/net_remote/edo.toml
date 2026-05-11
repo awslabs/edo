@@ -1,0 +1,14 @@
+schema-version = "1"
+
+[source.blob]
+kind       = "remote"
+url        = "https://raw.githubusercontent.com/octocat/Hello-World/master/README"
+# `ref` on a remote source is the expected content digest of the fetched
+# file — edo refuses to accept a download whose hash does not match.
+ref        = "92dcc6e2e78a357dace30009e4edd612fb3e60c24dc9318724a3c023fd1eb9fe"
+out        = "README"
+is_archive = false
+
+[transform.build]
+kind   = "import"
+source = ["blob"]

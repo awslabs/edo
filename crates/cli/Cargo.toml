@@ -1,20 +1,20 @@
 [package]
-name = "edo-cli"
-version = "0.1.0"
-edition = "2024"
-publish = false
-authors = ["Jarrett Tierney <jmt@amazon.com>"]
+name       = "edo-cli"
+version    = "0.1.0"
+edition    = "2024"
+publish    = false
+authors    = ["Jarrett Tierney <jmt@amazon.com>"]
 repository = "https://github.com/awslabs/edo"
-license = "MIT OR Apache-2.0"
-keywords = ["edo"]
+license    = "MIT OR Apache-2.0"
+keywords   = ["edo"]
 
 [dependencies]
 astral-tokio-tar  = { workspace = true }
 async-compression = { workspace = true }
+bon               = "3.9.1"
 clap              = { workspace = true }
+edo               = { path = "../edo" }
+edo-core          = { path = "../core" }
 snafu             = { workspace = true }
 tokio             = { workspace = true }
 tracing           = { workspace = true }
-edo               = { path = "../edo" }
-edo-core          = { path = "../core" }
-bon = "3.9.1"

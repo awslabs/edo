@@ -1,0 +1,5 @@
+schema-version = "1"
+
+[transform.broken]
+kind   = "import"
+source = ["//nope/missing"]
