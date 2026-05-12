@@ -14,6 +14,7 @@ use crate::{
 use snafu::OptionExt;
 use std::collections::HashMap;
 use std::path::Path;
+use tokio_util::sync::CancellationToken;
 
 /// A handle is passed to transforms where it needs to look up
 /// things in the transform state.
@@ -24,6 +25,7 @@ pub struct Handle {
     transforms: HashMap<Addr, Transform>,
     farms: HashMap<Addr, Farm>,
     args: HashMap<String, String>,
+    cancellation: CancellationToken,
 }
 
 unsafe impl Send for Handle {}
@@ -44,7 +46,13 @@ impl Handle {
             transforms,
             farms,
             args,
+            cancellation: CancellationToken::new(),
         }
+    }
+
+    /// Returns the cancellation token
+    pub fn cancellation(&self) -> CancellationToken {
+        self.cancellation.clone()
     }
 
     /// Returns a reference to the log manager.

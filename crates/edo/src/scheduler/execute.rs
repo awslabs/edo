@@ -84,6 +84,7 @@ pub async fn execute(
                                 return Ok(false);
                             }
                             "quit" => {
+                                ctx.cancellation().cancel();
                                 break 'prompt;
                             }
                             _ => {

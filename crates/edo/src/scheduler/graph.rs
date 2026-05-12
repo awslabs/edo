@@ -1,72 +1,137 @@
-//! DAG execution graph for scheduling transforms.
+//! DAG-based execution graph for parallel transform orchestration.
 //!
-//! Constructs a directed acyclic graph from transform dependencies, resolves
-//! build-cache hits, and drives parallel execution within batch-size limits.
+//! [`Graph`] is the data structure the scheduler uses to plan and execute a
+//! build. It owns:
+//!
+//! - the directed acyclic graph itself (a `daggy::Dag<Arc<Node>, String>`),
+//! - a bidirectional [`Addr`] ↔ [`NodeIndex`] index for O(1) lookups,
+//! - per-root *subgraph* sets (the slice of nodes reachable from each
+//!   user-requested target via the `depends` relation), and
+//! - per-root *indegree templates* — precomputed maps that the dispatcher
+//!   clones and mutates while running so it never has to walk the parent set
+//!   of a node at dispatch time.
+//!
+//! ## Lifecycle
+//!
+//! A typical use of [`Graph`] looks like:
+//!
+//! ```ignore
+//! let mut g = Graph::new(workers);
+//! g.add(ctx, &target).await?;        // build the DAG
+//! g.fetch(ctx).await?;               // hash + cache-check + prepare
+//! Arc::new(g).run(path, ctx, &target).await?; // execute
+//! ```
+//!
+//! Each phase is independent and can fail without leaving the graph in a
+//! corrupt state — a partially-built graph is still safe to drop.
+//!
+//! ## Why per-root subgraphs?
+//!
+//! The graph can hold transforms that are *not* reachable from the current
+//! target (e.g. when a previous `add` call brought in an unrelated subtree).
+//! Dispatch must operate on the active slice only, otherwise the indegree
+//! count would include edges from outside the slice and a node could remain
+//! "blocked" forever. The per-root subgraph membership set lets `run` filter
+//! both the BFS frontier and child enqueue walks cheaply.
 
-use super::execute::execute;
-use super::node::Node;
-use super::{Result, error};
-use crate::context::{Addr, Context, Handle, Log};
-use crate::storage::Artifact;
-use crate::transform::Transform;
 use async_recursion::async_recursion;
 use bimap::BiHashMap;
-use daggy::petgraph::Direction;
-use daggy::petgraph::visit::IntoNeighborsDirected;
-use daggy::petgraph::visit::IntoNodeReferences;
-use daggy::{Dag, NodeIndex, Walker};
-use dashmap::DashMap;
+use daggy::{Dag, NodeIndex, Walker, petgraph::visit::IntoNodeReferences};
 use futures::future::try_join_all;
-use snafu::OptionExt;
-use snafu::ResultExt;
-use std::collections::{HashSet, VecDeque};
-use std::future::Future;
-use std::ops::Index;
-use std::path::Path;
-use std::sync::atomic::AtomicUsize;
-use std::sync::{Arc, atomic::Ordering};
+use snafu::{OptionExt, ResultExt};
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    ops::Index,
+    path::Path,
+    sync::Arc,
+};
 use tempfile::TempDir;
+use tokio::sync::{Mutex, Semaphore, mpsc::channel};
 use tokio::task::{JoinError, JoinHandle};
+use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
-/// DAG-based execution graph that manages transform dependencies and parallel execution.
+use crate::context::{Addr, Context, Handle};
+use crate::storage::{Artifact, Id};
+use crate::transform::Transform;
+
+use super::node::Node;
+use super::{Result, error};
+
+/// Execution graph: the DAG plus per-root metadata required to dispatch
+/// transforms in topological order with bounded concurrency.
+///
+/// Cheap to clone: `daggy::Dag` clones share inner `Arc<Node>`s, and the
+/// auxiliary maps are small. The scheduler wraps the whole graph in an
+/// `Arc<Graph>` once dispatch starts so workers can index into it without
+/// taking locks.
+///
+/// ## Invariants
+///
+/// - For every key `k` in [`subgraphs`][Self::subgraphs], `indegrees[k]` is
+///   defined and its keyset equals `subgraphs[k]`.
+/// - The bimap [`index`][Self::index] is in 1-to-1 correspondence with the
+///   nodes in the underlying DAG.
+/// - The DAG remains acyclic: cycles surface as
+///   [`SchedulerError::Graph`](super::error::SchedulerError::Graph) from
+///   [`Graph::add`].
 #[derive(Clone)]
 pub struct Graph {
+    /// The actual DAG. Edges carry a human-readable `"a->b"` label used in
+    /// trace output; the structural information lives in the topology.
     graph: Dag<Arc<Node>, String>,
+    /// Worker count; bounds in-flight fetches *and* in-flight transform
+    /// executions. Mirrors the `[scheduler] workers` config key.
     batch_size: u64,
+    /// Bidirectional [`Addr`] ↔ [`NodeIndex`] map. Used by `add` to dedupe
+    /// nodes during recursion and by `run` to resolve the start vertex.
     index: BiHashMap<Addr, NodeIndex>,
+    /// Per-root subgraph: the set of `NodeIndex`es reachable from a given
+    /// root via *incoming* edges (i.e. transitive dependencies). Populated
+    /// at the end of [`Graph::add`].
+    subgraphs: HashMap<Addr, HashSet<NodeIndex>>,
+    /// Per-root indegree template: `map[root] -> map[node in subgraph] ->
+    /// count of incoming edges that originate inside the same subgraph`.
+    ///
+    /// Populated once per `add` call, *after* transitive reduction so the
+    /// counts reflect the minimal DAG. Cross-subgraph edges (if any) are
+    /// excluded — they don't gate dispatch within this run.
+    ///
+    /// `run` clones the inner map at start and decrements it as nodes
+    /// complete; that's why this is a "template" rather than mutable state.
+    indegrees: HashMap<Addr, HashMap<NodeIndex, u32>>,
 }
-
-impl Default for Graph {
-    fn default() -> Self {
-        Self::new(8)
-    }
-}
-
-unsafe impl Send for Graph {}
-unsafe impl Sync for Graph {}
 
 impl Graph {
-    /// Creates a new execution graph with the given maximum batch size for parallel tasks.
+    /// Creates an empty graph sized for `batch_size` concurrent workers.
+    ///
+    /// `batch_size` is plumbed through to bound both fetch concurrency and
+    /// the work/done channel capacities used by [`Graph::run`]. It must be
+    /// at least 1; `Scheduler::new` enforces a default of 8 if the
+    /// configuration omits the key.
     pub fn new(batch_size: u64) -> Self {
-        trace!(
-            component = "execution",
-            "creating new execution graph with batch_size={batch_size}"
-        );
         Self {
             graph: Dag::new(),
             batch_size,
             index: BiHashMap::new(),
+            subgraphs: HashMap::new(),
+            indegrees: HashMap::new(),
         }
     }
 
     /// Recursively adds a transform and its dependencies to the graph.
     ///
-    /// Returns the `NodeIndex` of the added (or existing) node. Edges are created
-    /// from each dependency to the dependent node.
+    /// Returns the `NodeIndex` of the added (or existing) node. Edges are
+    /// created from each dependency *into* the dependent node so that the
+    /// natural "child" direction in `daggy` (outgoing edges) corresponds to
+    /// "thing that depends on me".
+    ///
+    /// Idempotent: if `addr` is already in the index, returns the existing
+    /// `NodeIndex` without re-walking its dependencies.
     #[async_recursion]
-    pub async fn add(&mut self, ctx: &Context, addr: &Addr) -> Result<NodeIndex> {
-        // If we already have this node don't register this
+    async fn add_recursive(&mut self, ctx: &Context, addr: &Addr) -> Result<NodeIndex> {
+        // Fast path: node already registered. Without this, a diamond DAG
+        // would infinite-loop on the shared dependency.
         if let Some(index) = self.index.get_by_left(addr) {
             return Ok(*index);
         }
@@ -77,9 +142,11 @@ impl Graph {
         let node_index = self.graph.add_node(Arc::new(Node::new(addr)));
         self.index.insert(addr.clone(), node_index);
 
-        // Create edges for all the dependencies
+        // Recurse into dependencies. Each recursive call registers the dep
+        // (or finds it via the fast path) and we wire an edge dep -> self.
+        // `add_edge` is what catches cycles — daggy returns `WouldCycle`.
         for dep in transform.depends().await? {
-            let child = self.add(ctx, &dep).await?;
+            let child = self.add_recursive(ctx, &dep).await?;
             trace!(component = "execution", "adding edge for {dep} -> {addr}");
             self.graph
                 .add_edge(child, node_index, format!("{dep}->{addr}"))
@@ -88,34 +155,127 @@ impl Graph {
         Ok(node_index)
     }
 
-    /// Fetches sources and artifacts for all nodes in parallel.
+    /// Builds (or extends) the graph for `addr` and pre-computes the
+    /// metadata that [`Graph::run`] needs to dispatch it.
     ///
-    /// Skips nodes whose builds are already cached. Each fetch operation runs
-    /// as a separate Tokio task for maximum throughput.
+    /// The work happens in three steps:
+    ///
+    /// 1. **Recursive insertion** ([`Self::add_recursive`]): walks the
+    ///    transform tree rooted at `addr`, materializing one [`Node`] per
+    ///    transform and one edge per `dep -> dependent` relation.
+    /// 2. **Subgraph BFS**: collects every node reachable from `addr` via
+    ///    *incoming* edges. This is the "active slice" the dispatcher will
+    ///    operate on, isolated from any unrelated nodes that might also
+    ///    live in `self.graph` from a prior `add` call.
+    /// 3. **indegree template**: counts in-subgraph
+    ///    parents per node — the dispatcher's indegree counter starts here.
+    pub async fn add(&mut self, ctx: &Context, addr: &Addr) -> Result<NodeIndex> {
+        let idx = self.add_recursive(ctx, addr).await?;
+
+        // ── Step 2: BFS upward to collect the active subgraph. ────────────
+        // We walk *parents* (incoming edges in daggy) because edges point
+        // dep -> dependent, so dependencies of `addr` are reached by
+        // following parents.
+        let mut subgraph: HashSet<NodeIndex> = HashSet::new();
+        let mut queue: VecDeque<NodeIndex> = VecDeque::from([idx]);
+        while let Some(n) = queue.pop_front() {
+            if subgraph.insert(n) {
+                for (_, parent) in self.graph.parents(n).iter(&self.graph) {
+                    queue.push_back(parent);
+                }
+            }
+        }
+
+        // ── Step 3: Indegree template. ───────────────────────────────────
+        // Count only edges originating *inside* the subgraph. The
+        // dispatcher decrements these counters as parents complete, and a
+        // node becomes ready when its counter hits zero.
+        let mut indegrees: HashMap<NodeIndex, u32> = HashMap::with_capacity(subgraph.len());
+        for node in &subgraph {
+            let count = self
+                .graph
+                .parents(*node)
+                .iter(&self.graph)
+                .filter(|(_, p)| subgraph.contains(p))
+                .count() as u32;
+            indegrees.insert(*node, count);
+        }
+
+        self.subgraphs.insert(addr.clone(), subgraph);
+        self.indegrees.insert(addr.clone(), indegrees);
+        Ok(idx)
+    }
+
+    /// Computes content-addressed ids, checks the build cache, and prepares
+    /// (downloads sources for) every node in the graph.
+    ///
+    /// For each node:
+    /// 1. Compute its [`Id`] via [`Transform::get_unique_id`] and stash it
+    ///    on the node.
+    /// 2. Probe the build cache. If a fully-built artifact exists for that
+    ///    id we mark the node as a cache hit and skip preparation entirely
+    ///    — `run` will short-circuit dispatch for cache-hit subtrees in its
+    ///    pre-pass cascade.
+    /// 3. Otherwise spawn a task that calls [`Transform::prepare`] (typically
+    ///    a network fetch of sources and ancillary artifacts).
+    ///
+    /// Concurrency is bounded by a [`Semaphore`] sized to `batch_size`.
+    /// Fetch parallelism is order-independent (unlike `run`'s topological
+    /// dispatch), so we don't need ready/ready-not state — just a permit
+    /// pool that throttles the network.
     pub async fn fetch(&self, ctx: &Context) -> Result<()> {
-        // Now we can parallel iterate to do the fetch
         let mut tasks = Vec::new();
         let ctx = ctx.get_handle();
-        for node in self.graph.node_references() {
-            let node = node.1.clone();
+        let max_concurrent = self.batch_size;
+
+        // Fetching is network-bound. We don't want to issue thousands of
+        // requests in parallel, but unlike execution we also don't need to
+        // respect topological order — sources for a child can pull at the
+        // same time as sources for its parent. A semaphore is the simplest
+        // way to cap in-flight fetches at `batch_size`.
+        let semaphore = Arc::new(Semaphore::new(max_concurrent as usize));
+        for node_ref in self.graph.node_references() {
+            let node: Arc<Node> = node_ref.1.clone();
             let transform = ctx.get(&node.addr).context(error::ProjectTransformSnafu {
                 addr: node.addr.clone(),
             })?;
+            // Compute the content-addressed id and stash it on the node so
+            // workers in `run` can index into the build cache without
+            // recomputing it.
             let id = transform.get_unique_id(&ctx).await?;
+            node.set_id(&id);
+
+            // Build cache probe. `find_build(.., true)` requires a *full*
+            // artifact (all layers present) — partial hits do not count.
+            // `cache_hit = true` will let `run`'s pre-pass cascade promote
+            // this node and any cache-hit ancestors to Success without
+            // ever spawning an environment.
             if ctx.storage().find_build(&id, true).await?.is_some() {
                 info!("skipped fetch for built entry {}", node.addr);
+                node.set_cache_hit(true);
                 continue;
             }
+
             let ctx = ctx.clone();
-            let node = node.clone();
-            // We create a logfile here with just the id name so that below when we
-            // run we actually will end up reusing this log :D
+            let node_for_task = node.clone();
+            // Acquire the permit *outside* the spawn so the loop blocks
+            // here when we're already at capacity. Owned permits are moved
+            // into the task and released on drop.
+            let permit = semaphore
+                .clone()
+                .acquire_owned()
+                .await
+                .ok()
+                .context(error::InfallableSnafu)?;
             tasks.push(tokio::spawn(async move {
                 let logf = ctx.log().create(format!("{id}").as_str()).await?;
                 logf.set_subject("fetch");
                 transform.prepare(&logf, &ctx).await?;
-                info!("pulled sources and artifacts for {}", node.addr);
+                info!("pulled sources and artifacts for {}", node_for_task.addr);
                 drop(logf);
+                // Explicit drop is documentation: the permit returns to
+                // the pool exactly when this task ends.
+                drop(permit);
                 Ok::<(), error::SchedulerError>(())
             }));
         }
@@ -123,296 +283,409 @@ impl Graph {
         Ok(())
     }
 
-    /// Executes the transform graph starting from the given address.
+    /// Executes every transform reachable from `addr` in topological order,
+    /// using a bounded worker pool.
     ///
-    /// Drives execution by dispatching leaf nodes first and walking the DAG
-    /// upward as dependencies complete. Respects the configured batch-size limit
-    /// for in-flight tasks and skips nodes that already have cached builds.
+    /// This is the heart of the scheduler. The algorithm is a Kahn-style
+    /// topological dispatch with a few wrinkles to support cache hits,
+    /// cooperative cancellation, and fail-fast error handling.
+    ///
+    /// ## High-level shape
+    ///
+    /// 1. **Resolve start.** Look up `addr` in the index and bail early if
+    ///    its node was already cache-hit by `fetch` — there's nothing to
+    ///    run.
+    /// 2. **Snapshot dispatch state.** Clone the per-root indegree template
+    ///    so we can mutate it without affecting future runs of the same
+    ///    graph, and grab the subgraph membership set.
+    /// 3. **Cache-hit cascade.** Walk the dependency leaves and promote
+    ///    any cache-hit nodes to `Success` *without* dispatching them.
+    ///    Their children's indegrees decrement, potentially exposing more
+    ///    cache hits to promote, and so on. Non-hit indegree-0 nodes go
+    ///    onto the `ready` queue.
+    /// 4. **Spawn workers.** Fixed-size pool of `batch_size` tasks pulling
+    ///    from a shared `work_rx` channel and reporting back through
+    ///    `done_tx`.
+    /// 5. **Driver loop.** Saturate the pool from `ready`, await one
+    ///    completion at a time, decrement children's indegrees on success,
+    ///    short-circuit on first failure, and exit when no more work is
+    ///    in flight.
+    /// 6. **Drain workers.** Drop `work_tx` to signal end-of-stream, await
+    ///    every worker task, and surface the first error (or cancellation).
+    ///
+    /// ## Why one driver, many workers?
+    ///
+    /// All scheduling state (`ready` queue, mutable indegree map, failure
+    /// flag) lives in this function and is mutated only on the driver task.
+    /// Workers are pure executors: receive a `NodeIndex`, run the lifecycle,
+    /// post the result. That keeps the scheduling logic single-threaded and
+    /// lock-free without giving up parallelism on the actual work.
     pub async fn run(&self, path: &Path, ctx: &Context, addr: &Addr) -> Result<()> {
-        // Check if this address is already built, if so then do nothing
-        let ctx = ctx.get_handle();
-        let transform = ctx
-            .get(addr)
-            .context(error::ProjectTransformSnafu { addr: addr.clone() })?;
-        let id = transform.get_unique_id(&ctx).await?;
-        if ctx.storage().find_build(&id, false).await?.is_some() {
+        let ctx_handle = ctx.get_handle();
+        let token = ctx_handle.cancellation();
+
+        // ── Step 1: resolve the target node. ──────────────────────────────
+        let start = self
+            .index
+            .get_by_left(addr)
+            .context(error::NodeSnafu { addr: addr.clone() })?;
+        let root_node = self.graph.index(*start);
+
+        // Early exit: the target itself is already built. `fetch` populates
+        // `cache_hit`; if the root is one we don't even need to walk its
+        // dependencies — they only matter if we have to rebuild.
+        if root_node.is_cache_hit() {
             info!("{addr} is already built, skipping...");
             return Ok(());
         }
-        // Before we start our run we want to simplify the execution graph
-        let graph = self.graph.clone();
-        let start = self.index.get_by_left(addr).unwrap();
 
-        // We use find_leafs to find the first set of leaf nodes
-        let leafs = Self::find_leafs(&graph, start).unwrap_or_default();
+        // ── Step 2: snapshot per-root dispatch state. ─────────────────────
+        // The indegree map is the *mutable* working set; we clone the
+        // template so subsequent `run` calls on the same graph start fresh.
+        // The subgraph membership set is read-only and stays borrowed.
+        let subgraph = self
+            .subgraphs
+            .get(addr)
+            .context(error::NodeSnafu { addr: addr.clone() })?;
+        let mut indegree = self
+            .indegrees
+            .get(addr)
+            .context(error::NodeSnafu { addr: addr.clone() })?
+            .clone();
 
-        // Now we can execute our task graph. To do so we want to do a maximum optimization of
-        // the allowed workers, this means live dispatching new tasks when one finishes if they have parents that
-        // can run.
-
-        // Every tokio task spawned must be awaited on so we have a table of JoinHandles
-        // here for each node index.
-        let handles: Arc<DashMap<NodeIndex<u32>, JoinHandle<Result<Artifact>>>> =
-            Arc::new(DashMap::new());
-
-        // We initialize a Dequeue from the first set of leafs, this dequeue will act as our in-progress queue
-        let dequeue = Arc::new(tokio::sync::Mutex::new(VecDeque::from_iter(leafs.clone())));
-
-        // We want to one time toggle all of the dequeue nodes into queue state
-        let lock = dequeue.lock().await;
-        for index in lock.iter() {
-            let node = self.graph.index(*index);
-            node.set_queued();
-        }
-        drop(lock);
-
-        // We also track an atomic counter of how many tasks are currently executing
-        let inflight = Arc::new(tokio::sync::Mutex::new(AtomicUsize::new(0)));
-
-        // We need a mpsc channel that is buffered to our batch size, this is used to communicate between each individual
-        // task coroutine and the controller parent task.
-        let (sender, mut receiver) = tokio::sync::mpsc::channel(self.batch_size as usize);
-
-        // Clone handles to relevant objects and spawn the controller parent task
-        // this task will handle receiving all results, checking error status and also
-        // adding the next set of tasks to the dequeue
-        let parent_handle = handles.clone();
-        let parent_inflight = inflight.clone();
-        let parent_deq = dequeue.clone();
-        let parent = tokio::spawn(async move {
-            // Iterate on receiving nodes that have completed
-            debug!(thread = "queue", "starting queue receiver");
-            let mut failure_occured = false;
-            while let Some(index) = receiver.recv().await {
-                debug!(thread = "queue", "received notice that {:?} is done", index);
-                // Now before continuing we need to check if the node is in success or not
-                let node: &Arc<Node> = graph.index(index);
-                debug!(thread = "queue", "determined node to be {}", node.addr);
-                // Check if this node has a join handle, the only case it will not
-                // is if the task was pre-built
-                if let Some(handle) = parent_handle.remove(&index) {
-                    debug!(thread = "queue", "waiting on the handle");
-                    // Ensure to await here, if you do not runtime can cancel tasks leading to issues
-                    match handle.1.await.context(error::JoinSnafu)? {
-                        Ok(_) => node.set_success(),
-                        Err(e) => {
-                            error!("{} failed: {e}", node.addr);
-                            node.set_failed();
-                            failure_occured = true;
-                        }
+        // ── Step 3: cache-hit cascade. ────────────────────────────────────
+        // Initial Kahn frontier: all indegree-0 nodes (the dependency
+        // leaves). For each, if it's already in the build cache we skip
+        // dispatch, mark it Success, and propagate to its children — which
+        // may themselves be cache hits, and so on. The cascade can promote
+        // entire subtrees to Success without ever spawning a worker.
+        //
+        // Non-hit frontier nodes drop into `ready` for the dispatcher.
+        let mut cascade: VecDeque<NodeIndex> = indegree
+            .iter()
+            .filter_map(|(n, d)| if *d == 0 { Some(*n) } else { None })
+            .collect();
+        let mut ready: VecDeque<NodeIndex> = VecDeque::new();
+        while let Some(n) = cascade.pop_front() {
+            let node = self.graph.index(n);
+            if node.is_cache_hit() {
+                node.set_success();
+                // Decrement each in-subgraph child's indegree; any that
+                // hit zero join the cascade so we can keep promoting.
+                for (_, c) in self.graph.children(n).iter(&self.graph) {
+                    if !subgraph.contains(&c) {
+                        continue;
                     }
-                } else {
-                    // In the prebuilt case always flag success
-                    node.set_success();
+                    let d = indegree.get_mut(&c).context(error::SubgraphSnafu)?;
+                    *d = d.saturating_sub(1);
+                    if *d == 0 {
+                        cascade.push_back(c);
+                    }
                 }
+            } else {
+                // Not a cache hit — this is real work for the worker pool.
+                ready.push_back(n);
+            }
+        }
 
-                // Only walk children on the success path; a failure short-circuits
-                // further dispatch. The decrement still runs below so the dispatch
-                // loop can exit cleanly (preserving the 41eb63d deadlock fix).
-                if !failure_occured {
-                    // Now evaluate the graph to find any parents that this finished node have that are now
-                    // ready to execute and add them to the queue.
-                    let mut children = graph.children(index);
-                    while let Some(child) = children.walk_next(&graph) {
-                        // Now check if we have a parent that still hasn't run
-                        let mut parents = graph.parents(child.1);
-                        let node = graph.index(child.1);
-                        let mut skip = false;
-                        while let Some(parent) = parents.walk_next(&graph) {
-                            let pnode = graph.index(parent.1);
-                            if pnode.is_queued() || pnode.is_pending() {
-                                debug!(
-                                    thread = "queue",
-                                    "determined that parent {} is still not done so {} won't be queue'd",
-                                    pnode.addr,
-                                    node.addr
-                                );
-                                skip = true;
-                                break;
-                            }
-                        }
-                        if skip {
+        // ── Step 4: spawn the worker pool. ────────────────────────────────
+        // Two MPSC channels:
+        //   - work_tx/work_rx: driver -> workers, carries NodeIndex.
+        //   - done_tx/done_rx: workers -> driver, carries (idx, result).
+        // Capacities equal `batch_size` so the driver never blocks on send
+        // while the pool has free slots.
+        //
+        // `work_rx` is wrapped in `Arc<Mutex<_>>` because tokio's MPSC
+        // receiver isn't `Clone`; the lock is held only across `recv()`
+        // and contention is rare (workers are usually busy executing).
+        let (work_tx, work_rx) = channel::<NodeIndex>(self.batch_size as usize);
+        let (done_tx, mut done_rx) =
+            channel::<(NodeIndex, Result<Artifact>)>(self.batch_size as usize);
+        let work_rx = Arc::new(Mutex::new(work_rx));
+
+        let mut worker_handles: Vec<JoinHandle<Result<()>>> = Vec::new();
+        for _ in 0..self.batch_size {
+            let work_rx = work_rx.clone();
+            let done_tx = done_tx.clone();
+            let ctx_clone = ctx_handle.clone();
+            let path_buf = path.to_path_buf();
+            let graph = self.graph.clone();
+            let token = token.clone();
+            worker_handles.push(tokio::spawn(async move {
+                loop {
+                    // Briefly hold the receive lock just long enough to
+                    // pull one item — releasing it before the (long-running)
+                    // transform lifecycle so siblings can pick up new work.
+                    let next = {
+                        let mut guard = work_rx.lock().await;
+                        guard.recv().await
+                    };
+                    // `None` means the driver dropped `work_tx`; we're done.
+                    let Some(idx) = next else {
+                        return Ok::<(), error::SchedulerError>(());
+                    };
+                    let node = graph.index(idx).clone();
+                    let transform = match ctx_clone.get(&node.addr) {
+                        Some(t) => t,
+                        None => {
+                            // Vanishingly unlikely (the transform was here
+                            // when `add` ran) but report it cleanly anyway.
+                            let _ = done_tx
+                                .send((
+                                    idx,
+                                    error::ProjectTransformSnafu {
+                                        addr: node.addr.clone(),
+                                    }
+                                    .fail(),
+                                ))
+                                .await;
                             continue;
                         }
-                        // Now make sure that this child has not executed already
-                        if node.is_pending() {
-                            debug!(thread = "queue", "determined we can execute: {}", node.addr);
-                            // Mark it so we know it is in the queue to prevent duplicates
-                            node.set_queued();
-                            parent_deq.lock().await.push_back(child.1);
-                        } else {
-                            debug!(thread = "queue", "{} is not pending", node.addr);
+                    };
+                    // `fetch` is required to have run before `run`, so the
+                    // id is always populated by this point.
+                    let id = node.id().context(error::InfallableSnafu)?.clone();
+                    let result = run_transform_lifecycle(
+                        &ctx_clone, &path_buf, &node, &transform, &id, &token,
+                    )
+                    .instrument(info_span!("transforming", addr = node.addr.to_string()))
+                    .await;
+                    // If the driver has gone away (done_rx dropped) there's
+                    // nobody left to report to — exit quietly.
+                    if done_tx.send((idx, result)).await.is_err() {
+                        return Ok::<(), error::SchedulerError>(());
+                    }
+                }
+            }));
+        }
+        // Drop the driver's clone of `done_tx` so once every worker exits,
+        // `done_rx.recv()` returns `None` instead of hanging forever.
+        drop(done_tx);
+
+        // ── Step 5: driver loop. ──────────────────────────────────────────
+        // Invariants:
+        //   - `inflight` == number of items posted on `work_tx` minus
+        //     number of items received on `done_rx`.
+        //   - `ready` only contains nodes whose indegree has reached 0 and
+        //     which are not already cache hits.
+        //   - Once `failed` is set or the cancellation token fires, no new
+        //     work is dispatched; we drain in-flight tasks then exit.
+        let mut inflight: usize = 0;
+        let mut failed = false;
+        let mut first_error: Option<error::SchedulerError> = None;
+
+        loop {
+            // Saturate the pool: push ready work into `work_tx` until
+            // either we run out of ready nodes or hit the concurrency cap.
+            // We pause dispatching on failure or cancellation so the
+            // remaining in-flight tasks can drain naturally.
+            while !ready.is_empty()
+                && inflight < self.batch_size as usize
+                && !failed
+                && !token.is_cancelled()
+            {
+                let n = ready.pop_front().context(error::InfallableSnafu)?;
+                self.graph.index(n).set_running();
+                // `try_send` is infallible here: channel capacity is
+                // `batch_size` and `inflight < batch_size` guarantees space.
+                work_tx.try_send(n).ok().context(error::InfallableSnafu)?;
+                inflight += 1;
+            }
+
+            // Termination condition: nothing in flight means no more work
+            // can become ready. (`ready` may still hold items if we exited
+            // the dispatch loop via `failed`/`cancelled`; that's fine —
+            // they're abandoned on purpose.)
+            if inflight == 0 {
+                break;
+            }
+
+            // Block on the next completion. `unwrap` is safe because we
+            // hold the original `work_tx`, so `done_tx` clones held by
+            // workers stay alive while there's anything to wait for.
+            let (idx, res) = done_rx.recv().await.context(error::InfallableSnafu)?;
+            inflight -= 1;
+            let node = self.graph.index(idx);
+            match res {
+                Ok(_) => {
+                    node.set_success();
+                    // On success, decrement children's indegrees and queue
+                    // any newly-ready ones. Suppressed during failure /
+                    // cancellation so we don't widen the dispatch front.
+                    if !failed && !token.is_cancelled() {
+                        for (_, c) in self.graph.children(idx).iter(&self.graph) {
+                            if !subgraph.contains(&c) {
+                                continue;
+                            }
+                            let d = indegree.get_mut(&c).context(error::InfallableSnafu)?;
+                            *d = d.saturating_sub(1);
+                            if *d == 0 {
+                                ready.push_back(c);
+                            }
                         }
                     }
                 }
-
-                // Decrement LAST so the dispatch loop cannot observe
-                // `inflight == 0 && deque.is_empty()` until any newly-ready
-                // children have already been enqueued above. This ordering is
-                // critical: if the decrement ran before the child-enqueue walk,
-                // the dispatcher could race, exit, and strand the root
-                // transform (see commit history around scheduler race fix).
-                // The decrement runs on every completion (success or failure),
-                // which preserves the failure-path deadlock fix from 41eb63d.
-                parent_inflight.lock().await.fetch_sub(1, Ordering::SeqCst);
-            }
-            Ok::<(), error::SchedulerError>(())
-        });
-
-        // Now we are ready to have our dispatch loop which is handled by the current scope
-        let loop_deq = dequeue.clone();
-        let loop_inflight = inflight.clone();
-        // Iterate as long as the queue is not empty and there are tasks in flight, the inflight count will only go fully 0 once
-        // we are done
-        while !loop_deq.lock().await.is_empty()
-            || loop_inflight.lock().await.load(Ordering::SeqCst) > 0
-        {
-            let current = loop_inflight.lock().await.load(Ordering::SeqCst);
-            // We want to ensure we only ever have at max batch-size tasks in operation
-            let send_amount = std::cmp::min(
-                self.batch_size - current as u64,
-                loop_deq.lock().await.len() as u64,
-            );
-            // For how many slots open dispatch the next tasks
-            for _ in 0..send_amount {
-                if let Some(index) = dequeue.lock().await.pop_front() {
-                    let node = self.graph.index(index).clone();
-                    let addr = node.addr.clone();
-                    let path = path.to_path_buf();
-                    let handles = handles.clone();
-                    let transform = ctx
-                        .get(&addr)
-                        .context(error::ProjectTransformSnafu { addr: addr.clone() })?;
-                    let id = transform.get_unique_id(&ctx).await?;
-                    let sender = sender.clone();
-                    inflight.lock().await.fetch_add(1, Ordering::SeqCst);
-                    if ctx.storage().find_build(&id, false).await?.is_some() {
-                        info!("{addr} is already built, skipping...");
-                        sender.send(index).await.context(error::SignalSnafu)?;
-                        break;
+                Err(e) => {
+                    // Fail-fast: latch the first error, mark the node
+                    // failed, and clear `ready` so no further dispatch
+                    // happens. We still need to drain `inflight` tasks
+                    // so workers don't leak.
+                    error!("{} failed: {e}", node.addr);
+                    node.set_failed();
+                    if first_error.is_none() {
+                        first_error = Some(e);
                     }
-                    let ctx = ctx.clone();
-                    let node = node.clone();
-                    handles.insert(
-                        index,
-                        tokio::spawn(async move {
-                            trace!(component = "execution", "performing transform {addr}");
-                            let logf = ctx.log().create(format!("{id}").as_str()).await?;
-                            node.set_running();
-                            let result = Self::transform(&logf, &path, &ctx, &addr, &transform)
-                                .instrument(info_span!("transforming", addr = addr.to_string()))
-                                .await;
-                            drop(logf);
-                            sender.send(index).await.context(error::SignalSnafu)?;
-                            result
-                        }),
-                    );
-                } else {
-                    // If we've reached the end of a wave exit out
-                    break;
+                    failed = true;
+                    ready.clear();
                 }
             }
-            // Yield to allow the parent task to process completions and decrement
-            // inflight, preventing busy-spin starvation on low-concurrency runtimes.
-            tokio::task::yield_now().await;
+            // Cooperative cancellation: a quit prompt from `execute`
+            // flips the same token. Clear `ready` so we stop feeding the
+            // pool but let the drain proceed normally.
+            if token.is_cancelled() {
+                ready.clear();
+            }
         }
-        // We need to make sure we drop the sender here to avoid hanging on the final task
-        drop(sender);
-        // We now need to await on the parent to exit
-        parent.await.context(error::JoinSnafu)??;
+        // Closing `work_tx` lets workers see end-of-stream and exit their
+        // recv loops; we then await each so panics surface as `JoinError`.
+        drop(work_tx);
+        for h in worker_handles {
+            h.await.context(error::JoinSnafu)??;
+        }
+
+        // Failure takes precedence over cancellation in error reporting:
+        // a real failure is more actionable than the generic "cancelled".
+        if let Some(e) = first_error {
+            return Err(e);
+        }
+        if token.is_cancelled() {
+            return error::CancelledSnafu.fail();
+        }
 
         Ok(())
     }
+}
 
-    fn find_leafs(graph: &Dag<Arc<Node>, String>, index: &NodeIndex) -> Option<HashSet<NodeIndex>> {
-        let mut leafs = HashSet::new();
-        let mut count = 0;
-        for node in graph.neighbors_directed(*index, Direction::Incoming) {
-            if let Some(children) = Self::find_leafs(graph, &node) {
-                for entry in children {
-                    leafs.insert(entry);
-                }
-            }
-            count += 1;
-        }
-        if count == 0 {
-            // if we didn't have any leaf nodes discovered by this node's children than this is a leaf node
-            leafs.insert(*index);
-        }
-        if leafs.is_empty() { None } else { Some(leafs) }
+/// Runs the full per-transform lifecycle for one node.
+///
+/// The lifecycle has five user-visible stages, each guarded by a
+/// cancellation check so a `quit` prompt aborts as quickly as possible:
+///
+/// 1. **create-environment** — ask the [`Handle`] to materialize an
+///    [`Environment`] from the transform's farm address. The temp dir
+///    backing it lives under `workspace` and is dropped at function exit.
+/// 2. **setup-environment** — populate the environment with anything the
+///    farm needs (e.g. base layers from storage).
+/// 3. **spinup environment** — start the environment (e.g. boot a
+///    container). After this point, `down` and `clean` are best-effort
+///    invoked unconditionally so we never leak a running environment.
+/// 4. **staging + execution** — ask the transform to stage its inputs and
+///    then run via [`execute::execute`](super::execute::execute), which
+///    handles interactive retry/quit prompts on failure.
+/// 5. **spindown + clean** — best-effort teardown. Errors here are
+///    swallowed so a clean-up failure doesn't mask the real outcome.
+///
+/// The function returns the staging+execution outcome — environment
+/// teardown errors are intentionally not propagated.
+async fn run_transform_lifecycle(
+    ctx: &Handle,
+    workspace: &Path,
+    node: &Arc<Node>,
+    transform: &Transform,
+    id: &Id,
+    token: &CancellationToken,
+) -> Result<Artifact> {
+    // Per-transform scratch directory; dropped (and removed) when this
+    // function returns regardless of success/failure path.
+    let temp = TempDir::new_in(workspace).context(error::TemporaryDirectorySnafu)?;
+    let logf = ctx.log().create(format!("{id}").as_str()).await?;
+
+    logf.set_subject("create-environment");
+    let env_addr = transform.environment().await?;
+    let environment = ctx
+        .create_environment(&logf, &env_addr, temp.path())
+        .instrument(info_span!(
+            "creating environment",
+            addr = node.addr.to_string()
+        ))
+        .await?;
+
+    if token.is_cancelled() {
+        return error::CancelledSnafu.fail();
     }
 
-    async fn transform(
-        log: &Log,
-        workspace: &Path,
-        ctx: &Handle,
-        addr: &Addr,
-        transform: &Transform,
-    ) -> Result<Artifact> {
-        let temp = TempDir::new_in(workspace).context(error::TemporaryDirectorySnafu)?;
-        log.set_subject("create-environment");
-        let env_addr = transform.environment().await?;
-        let environment = ctx
-            .create_environment(log, &env_addr, temp.path())
-            .instrument(info_span!("creating environment", addr = addr.to_string(),))
-            .await?;
-        // Setup the environment
-        log.set_subject("setup-environment");
-        environment
-            .setup(log, ctx.storage())
-            .instrument(info_span!(
-                "setting up environment",
-                addr = addr.to_string()
-            ))
-            .await?;
-        info!("created environment");
+    logf.set_subject("setup-environment");
+    environment
+        .setup(&logf, ctx.storage())
+        .instrument(info_span!(
+            "setting up environment",
+            addr = node.addr.to_string()
+        ))
+        .await?;
 
-        // Bring the environment up
-        log.set_subject("spinup environment");
-        environment.up(log).await?;
+    if token.is_cancelled() {
+        return error::CancelledSnafu.fail();
+    }
 
-        // Stage transform
-        log.set_subject("staging");
+    logf.set_subject("spinup environment");
+    environment.up(&logf).await?;
+
+    // Past this point the environment is "up" and we owe it teardown.
+    // Compute the outcome inside an inner async block so the `down` /
+    // `clean` calls below run on every exit path — including the
+    // cancellation early-returns inside the block.
+    let outcome: Result<Artifact> = async {
+        if token.is_cancelled() {
+            return error::CancelledSnafu.fail();
+        }
+        logf.set_subject("staging");
         transform
-            .stage(log, ctx, &environment)
+            .stage(&logf, ctx, &environment)
             .instrument(info_span!(
                 "staging into environment",
-                addr = addr.to_string()
+                addr = node.addr.to_string()
             ))
             .await?;
-        info!("staged dependencies and sources");
 
-        // Perform the transform
-        log.set_subject("execution");
-        let artifact = execute(log, ctx, transform, &environment)
-            .instrument(info_span!("transforming", addr = addr.to_string()))
-            .await;
+        if token.is_cancelled() {
+            return error::CancelledSnafu.fail();
+        }
+        logf.set_subject("execution");
+        super::execute::execute(&logf, ctx, transform, &environment).await
+    }
+    .await;
 
-        // Shutdown the environment
-        log.set_subject("spindown environment");
-        environment.down(log).await?;
+    // Best-effort teardown: errors are logged-and-swallowed so a clean-up
+    // failure never overrides a successful build (or vice versa).
+    logf.set_subject("spindown environment");
+    let _ = environment.down(&logf).await;
+    logf.set_subject("clean environment");
+    let _ = environment
+        .clean(&logf)
+        .instrument(info_span!("cleaning up", addr = node.addr.to_string()))
+        .await;
 
-        // Clean the environment
-        log.set_subject("clean environment");
-        environment
-            .clean(log)
-            .instrument(info_span!("cleaning up", addr = addr.to_string(),))
-            .await?;
-
-        match artifact {
-            Ok(artifact) => {
-                info!("transformation complete");
-                Ok(artifact)
-            }
-            Err(e) => {
-                error!("transformation failed: {e}");
-                Err(e)
-            }
+    drop(logf);
+    match outcome {
+        Ok(artifact) => {
+            info!("transformation complete");
+            Ok(artifact)
+        }
+        Err(e) => {
+            error!("transformation failed: {e}");
+            Err(e)
         }
     }
 }
 
-/// Awaits all join handles, collecting successes or returning aggregated failures.
+/// Awaits all join handles, collecting successes or returning aggregated
+/// failures.
+///
+/// Used by [`Graph::fetch`] to wait on the parallel prepare tasks.
+/// `JoinError`s (panics or cancellations of the outer task) short-circuit
+/// via `try_join_all` and propagate as [`SchedulerError::Join`]; logical
+/// errors returned by the inner futures are accumulated and surfaced as a
+/// single [`SchedulerError::Child`].
 async fn wait<I, R>(handles: I) -> Result<Vec<R>>
 where
     R: Clone,
@@ -878,7 +1151,7 @@ pub(crate) mod tests {
 
     #[test]
     fn default_uses_batch_size_8() {
-        let g = Graph::default();
+        let g = Graph::new(8);
         assert_eq!(g.batch_size, 8);
     }
 
@@ -1194,6 +1467,116 @@ pub(crate) mod tests {
         );
     }
 
+    /// Regression test for the parent-status check in the child-enqueue
+    /// walk. With the previous predicate `is_queued() || is_pending()`, a
+    /// parent in `Running` state was treated as "done enough" and the child
+    /// could be enqueued before all its dependencies completed.
+    ///
+    /// DAG shape (diamond):
+    ///
+    ///         A
+    ///        / \
+    ///       B   C
+    ///        \ /
+    ///         D
+    ///
+    /// With `batch_size = 2` and asymmetric delays (B fast, C slow), B
+    /// finishes first. The parent task then walks B's children and finds D.
+    /// Before the fix, D's parents `[B = Success, C = Running]` would pass
+    /// the old predicate (C is neither Queued nor Pending) and D would be
+    /// dispatched while C is still running. After the fix, the predicate
+    /// `!is_done()` correctly blocks on Running parents.
+    #[tokio::test]
+    #[serial_test::serial(log_manager)]
+    async fn graph_run_no_premature_root_with_diamond() {
+        let ctx = ctx_or_skip!();
+        ensure_default_farm(&ctx);
+        let order = Arc::new(TokioMutex::new(Vec::new()));
+        let mi = Arc::new(AtomicUsize::new(0));
+
+        let h_a = register_mock_with(
+            &ctx,
+            "//rgd/a",
+            &[],
+            order.clone(),
+            mi.clone(),
+            MockOutcome::Success,
+            None,
+        );
+        let h_b = register_mock_with(
+            &ctx,
+            "//rgd/b",
+            &["//rgd/a"],
+            order.clone(),
+            mi.clone(),
+            MockOutcome::Success,
+            Some(std::time::Duration::from_millis(5)),
+        );
+        let h_c = register_mock_with(
+            &ctx,
+            "//rgd/c",
+            &["//rgd/a"],
+            order.clone(),
+            mi.clone(),
+            MockOutcome::Success,
+            Some(std::time::Duration::from_millis(100)),
+        );
+        let h_d = register_mock_with(
+            &ctx,
+            "//rgd/d",
+            &["//rgd/b", "//rgd/c"],
+            order.clone(),
+            mi.clone(),
+            MockOutcome::Success,
+            None,
+        );
+
+        let mut g = Graph::new(2);
+        let root = Addr::parse("//rgd/d").unwrap();
+        g.add(&ctx, &root).await.unwrap();
+        g.fetch(&ctx).await.unwrap();
+        let ws = TempDir::new().unwrap();
+        let g = Arc::new(g);
+        g.run(ws.path(), &ctx, &root).await.expect("run");
+
+        // Each node ran exactly once.
+        assert_eq!(h_a.transform_called.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(h_b.transform_called.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(h_c.transform_called.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(h_d.transform_called.load(AtomicOrdering::SeqCst), 1);
+
+        // D must enter the order log strictly after both B and C — the
+        // bug-version would log D between B and C because D dispatches
+        // while C is still running.
+        let log = order.lock().await;
+        let pos = |a: &str| {
+            log.iter()
+                .position(|x| x == &Addr::parse(a).unwrap())
+                .unwrap()
+        };
+        let pa = pos("//rgd/a");
+        let pb = pos("//rgd/b");
+        let pc = pos("//rgd/c");
+        let pd = pos("//rgd/d");
+        assert!(pa < pb && pa < pc, "A must run before B and C");
+        assert!(
+            pd > pb && pd > pc,
+            "D must enter after both B and C (got order_log positions a={pa} b={pb} c={pc} d={pd})",
+        );
+
+        // Batch size of 2 must never be exceeded. Crucially this also fails
+        // the bug: with the broken predicate, D dispatches while C is still
+        // running and B has just finished — the moment D's transform
+        // increments inflight, max_inflight observes 2 (D + C) which is
+        // still <= 2, so this alone does not catch the bug. The position
+        // assertion above is the primary signal; this is a sanity check.
+        assert!(
+            mi.load(AtomicOrdering::SeqCst) <= 2,
+            "max_inflight was {}, expected <= 2",
+            mi.load(AtomicOrdering::SeqCst),
+        );
+    }
+
     /// Regression test locking in the 41eb63d deadlock fix: if a
     /// transform fails, the scheduler must surface the error and terminate
     /// rather than hanging. Failure is injected in the `stage` lifecycle
@@ -1247,10 +1630,12 @@ pub(crate) mod tests {
         // Bound the whole run with a timeout — if the scheduler ever
         // regresses back to the pre-41eb63d deadlock this test will fail
         // loudly instead of hanging the test binary.
-        let result =
-            tokio::time::timeout(std::time::Duration::from_secs(5), g.run(ws.path(), &ctx, &root))
-                .await
-                .expect("scheduler must not hang on failure");
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            g.run(ws.path(), &ctx, &root),
+        )
+        .await
+        .expect("scheduler must not hang on failure");
 
         // Failure should surface. `execute` wraps the error before the
         // parent task sees it, so we only care that `run` returned Ok
@@ -1269,6 +1654,134 @@ pub(crate) mod tests {
             h_root.transform_called.load(AtomicOrdering::SeqCst),
             0,
             "root must not run after leaf failure",
+        );
+    }
+
+    /// Regression test for the bottlerocket-buildstream ordering inversion:
+    /// a wide compose root with many leaf packages plus a handful of
+    /// mid-tier packages that share a deep-leaf dependency (`glibc`).
+    /// In production this DAG dispatched `nvidia-container-toolkit/rpm`
+    /// before its dependency `glibc/rpm` had even started.
+    ///
+    /// Shape (mirrors `kits/bottlerocket-core-kit/pkgs`):
+    ///
+    /// ```text
+    ///   root ─┬── leaf_0 .. leaf_N            (independent leaves)
+    ///         ├── glibc                       (shared leaf)
+    ///         ├── libnv  (deps: glibc)
+    ///         └── nvct   (deps: glibc, libnv)
+    /// ```
+    ///
+    /// With sufficient leaves and a non-trivial `batch_size`, the bug
+    /// surfaces as `nvct` being recorded in `order_log` before `glibc`.
+    #[tokio::test]
+    #[serial_test::serial(log_manager)]
+    async fn graph_run_shared_deep_dep_respected_with_wide_root() {
+        let ctx = ctx_or_skip!();
+        ensure_default_farm(&ctx);
+        let order = Arc::new(TokioMutex::new(Vec::new()));
+        let mi = Arc::new(AtomicUsize::new(0));
+
+        // Tiny delay so the cascade race window is wide enough to be
+        // observable across machines / CI shapes.
+        let delay = Some(std::time::Duration::from_millis(10));
+
+        // Independent leaves — alphabetically sorted before "glibc" in
+        // the depends list, so a buggy scheduler that walks deps in
+        // insertion order will dispatch them first and exhaust the
+        // worker pool before `glibc` ever gets a slot.
+        let leaf_addrs: Vec<String> = (0..32).map(|i| format!("//bw/leaf_{i:02}")).collect();
+        for a in &leaf_addrs {
+            register_mock_with(
+                &ctx,
+                a.as_str(),
+                &[],
+                order.clone(),
+                mi.clone(),
+                MockOutcome::Success,
+                delay,
+            );
+        }
+        register_mock_with(
+            &ctx,
+            "//bw/glibc",
+            &[],
+            order.clone(),
+            mi.clone(),
+            MockOutcome::Success,
+            delay,
+        );
+        register_mock_with(
+            &ctx,
+            "//bw/libnv",
+            &["//bw/glibc"],
+            order.clone(),
+            mi.clone(),
+            MockOutcome::Success,
+            delay,
+        );
+        register_mock_with(
+            &ctx,
+            "//bw/nvct",
+            &["//bw/glibc", "//bw/libnv"],
+            order.clone(),
+            mi.clone(),
+            MockOutcome::Success,
+            delay,
+        );
+
+        // Root depends on every leaf + the three mid/deep nodes. Note
+        // `glibc` is listed *after* the leaves to ensure the wide
+        // independent fan-out is encountered first during recursive
+        // graph construction — matching the alphabetical layout in
+        // `kits/bottlerocket-core-kit/edo.toml`.
+        let mut root_deps: Vec<String> = leaf_addrs.clone();
+        root_deps.push("//bw/glibc".to_string());
+        root_deps.push("//bw/libnv".to_string());
+        root_deps.push("//bw/nvct".to_string());
+        let root_dep_refs: Vec<&str> = root_deps.iter().map(|s| s.as_str()).collect();
+        register_mock_with(
+            &ctx,
+            "//bw/root",
+            &root_dep_refs,
+            order.clone(),
+            mi.clone(),
+            MockOutcome::Success,
+            delay,
+        );
+
+        // batch_size = 8 mirrors the production default and the
+        // configured value in bottlerocket-buildstream.
+        let mut g = Graph::new(8);
+        let root = Addr::parse("//bw/root").unwrap();
+        g.add(&ctx, &root).await.unwrap();
+        g.fetch(&ctx).await.unwrap();
+        let ws = TempDir::new().unwrap();
+        let g = Arc::new(g);
+        g.run(ws.path(), &ctx, &root).await.expect("run");
+
+        // The smoking gun from the bottlerocket logs: `nvct` started
+        // before `glibc`. With the bug, `pos(nvct) < pos(glibc)`.
+        let log = order.lock().await;
+        let pos = |a: &str| -> usize {
+            log.iter()
+                .position(|x| x == &Addr::parse(a).unwrap())
+                .unwrap_or_else(|| panic!("{a} did not run; log = {log:?}"))
+        };
+        let p_glibc = pos("//bw/glibc");
+        let p_libnv = pos("//bw/libnv");
+        let p_nvct = pos("//bw/nvct");
+        assert!(
+            p_glibc < p_libnv,
+            "glibc ({p_glibc}) must run before libnv ({p_libnv})",
+        );
+        assert!(
+            p_glibc < p_nvct,
+            "glibc ({p_glibc}) must run before nvct ({p_nvct})",
+        );
+        assert!(
+            p_libnv < p_nvct,
+            "libnv ({p_libnv}) must run before nvct ({p_nvct})",
         );
     }
 }

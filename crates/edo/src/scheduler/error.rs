@@ -13,6 +13,8 @@ pub enum SchedulerError {
     Cache {
         source: crate::storage::StorageError,
     },
+    #[snafu(display("execution was cancelled"))]
+    Cancelled,
     #[snafu(display("errors occured during execution: {}", children.iter().map(|x| x.to_string()).collect::<Vec<_>>().join("\n")))]
     Child { children: Vec<SchedulerError> },
     #[snafu(display("dependency does not exist in execution graph: {addr}"))]
@@ -25,6 +27,8 @@ pub enum SchedulerError {
     Graph { source: daggy::WouldCycle<String> },
     #[snafu(display("failed to prompt user: {source}"))]
     Inquire { source: dialoguer::Error },
+    #[snafu(display("FATAL: infallible error occured in scheduler"))]
+    Infallable,
     #[snafu(display("io error: {source}"))]
     Io { source: std::io::Error },
     #[snafu(display("failed to wait for execution tasks: {source}"))]
@@ -47,6 +51,8 @@ pub enum SchedulerError {
     },
     #[snafu(display("could not await on a result from a non-building node"))]
     State,
+    #[snafu(display("expected a subgraph membership that did not exist"))]
+    Subgraph,
     #[snafu(display("failed to create temporary directory: {source}"))]
     TemporaryDirectory { source: std::io::Error },
     #[snafu(transparent)]

@@ -1,7 +1,50 @@
 //! Scheduler module for DAG-based parallel transform execution.
 //!
-//! Orchestrates build tasks by constructing a dependency graph and executing
-//! transforms in topological order with configurable concurrency.
+//! The scheduler is the engine's task orchestrator. Given a target
+//! [`Addr`], it walks the project's transform graph, prepares each
+//! transform's inputs, and executes them in topological order with a
+//! bounded worker pool.
+//!
+//! ## Lifecycle
+//!
+//! A scheduler run proceeds in three phases (see [`Inner::run`]):
+//!
+//! 1. **Build** — [`Graph::add`](graph::Graph::add) recursively walks
+//!    `addr` and its transitive dependencies, constructing a DAG of
+//!    [`Node`](node::Node)s, performing transitive reduction, and
+//!    pre-computing per-root indegree templates.
+//! 2. **Fetch** — [`Graph::fetch`](graph::Graph::fetch) computes a
+//!    content-addressed [`Id`](crate::storage::Id) for every node,
+//!    queries the build cache, and downloads sources only for nodes that
+//!    aren't already built. This is bounded by a [`Semaphore`] sized to
+//!    `workers` to avoid hammering remote storage.
+//! 3. **Run** — [`Graph::run`](graph::Graph::run) drives the actual
+//!    DAG execution: ready nodes are pushed into a worker pool, completed
+//!    nodes unblock their children, and cache hits are cascaded so that
+//!    fully-built subtrees never spin up an environment.
+//!
+//! ## Concurrency model
+//!
+//! Worker count comes from the `[scheduler] workers` TOML key (default
+//! `8`). The same number bounds:
+//!
+//! - the worker tasks in [`Graph::run`](graph::Graph::run),
+//! - the in-flight fetch permits in [`Graph::fetch`](graph::Graph::fetch),
+//! - the work/done channel capacities (so dispatch never blocks while
+//!   the pool has free slots).
+//!
+//! All shared state ([`Node`](node::Node), the [`Graph`](graph::Graph)
+//! itself) is `Arc`-wrapped and uses atomics rather than locks on the hot
+//! path.
+//!
+//! ## Cancellation
+//!
+//! The scheduler cooperates with the [`Context`]'s
+//! [`CancellationToken`](tokio_util::sync::CancellationToken). Workers
+//! check the token between lifecycle stages, and the dispatcher refuses
+//! to enqueue new work once cancellation is observed. A first failure or
+//! a user-driven `quit` from [`execute::execute`] both flip the same
+//! switch.
 
 use super::context::Context;
 use crate::context::{Addr, Config};
@@ -24,9 +67,12 @@ pub mod node;
 
 type Result<T> = std::result::Result<T, error::SchedulerError>;
 
-/// Parallel task scheduler that builds a dependency graph and executes transforms concurrently.
+/// Parallel task scheduler that builds a dependency graph and executes
+/// transforms concurrently.
 ///
-/// Wraps an inner state behind an `Arc` for cheap cloning across async tasks.
+/// `Scheduler` is a thin façade over an `Arc<Inner>`; cloning is cheap and
+/// safe across async tasks. The interesting orchestration lives in
+/// [`graph::Graph`].
 #[derive(Clone)]
 pub struct Scheduler {
     inner: Arc<Inner>,
@@ -35,13 +81,21 @@ pub struct Scheduler {
 impl Scheduler {
     /// Creates a new scheduler rooted at the given workspace path.
     ///
-    /// Reads the `scheduler.workers` config key to determine concurrency (defaults to 8).
-    /// Creates the workspace directory if it does not already exist.
+    /// The workspace directory is the parent for per-transform temp
+    /// directories created during execution; it is created on demand if
+    /// it does not yet exist.
+    ///
+    /// Worker concurrency is read from the `[scheduler] workers` config
+    /// key. Falls back to `8` when the key is missing or not an integer
+    /// — we prefer a sane default over an error so misconfigured
+    /// projects still build.
     pub async fn new<P: AsRef<Path>>(path: P, config: &Config) -> Result<Self> {
         let path = path.as_ref();
         if !path.exists() {
             create_dir_all(path).await.context(error::IoSnafu)?;
         }
+        // Pull `[scheduler] workers` if present; non-int values fall
+        // through to the default below rather than failing the build.
         let workers = if let Some(node) = config.get("scheduler") {
             node.get("workers").and_then(|x| x.as_int())
         } else {
@@ -61,18 +115,42 @@ impl Scheduler {
 }
 
 impl Scheduler {
-    /// Builds the dependency graph for the given address and executes all transforms.
+    /// Builds the dependency graph for `addr` and executes every reachable
+    /// transform.
+    ///
+    /// Convenience wrapper around [`Inner::run`]; see that method for the
+    /// phase-by-phase walk-through.
     pub async fn run(&self, ctx: &Context, addr: &Addr) -> Result<()> {
         self.inner.run(ctx, addr).await
     }
 }
 
+/// Inner state held behind the [`Scheduler`]'s `Arc`.
 struct Inner {
+    /// Workspace directory used as the parent for per-transform temp
+    /// directories.
     path: PathBuf,
+    /// Number of concurrent worker tasks. Also bounds fetch concurrency
+    /// and the work/done channel capacities.
     workers: u64,
 }
 
 impl Inner {
+    /// Drives a single end-to-end build for `addr`.
+    ///
+    /// Sequencing matters here:
+    ///
+    /// 1. `Graph::new` allocates an empty DAG sized for `workers`
+    ///    concurrent tasks.
+    /// 2. `Graph::add` recursively pulls in `addr` and its transitive
+    ///    dependencies, computes the active subgraph, and pre-builds an
+    ///    indegree template for the dispatcher.
+    /// 3. `Graph::fetch` populates each node's [`Id`](crate::storage::Id),
+    ///    consults the build cache, and prepares (downloads sources for)
+    ///    every node that isn't already built.
+    /// 4. The graph is wrapped in an `Arc` (cheap; `Graph` is `Clone` but
+    ///    we want shared ownership across worker tasks) and `Graph::run`
+    ///    spawns the worker pool and drives the topological dispatch.
     pub async fn run(&self, ctx: &Context, addr: &Addr) -> Result<()> {
         let mut graph = Graph::new(self.workers);
         graph.add(ctx, addr).await?;
