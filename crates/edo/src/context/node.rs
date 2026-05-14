@@ -202,9 +202,13 @@ impl<'a> TryFrom<&'a toml::Value> for Data {
             Ok(Self::new_bool(flag))
         } else if let Some(string) = value.as_str() {
             // If we have a string we need to try and fail some things
-            if let Ok(require) = VersionReq::parse(string) {
+            if string.starts_with(['^', '>', '=', '<', '~'])
+                && let Ok(require) = VersionReq::parse(string)
+            {
                 Ok(Self::new_require(require))
-            } else if let Ok(version) = Version::parse(string) {
+            } else if string.starts_with('v')
+                && let Ok(version) = Version::parse(string.strip_prefix('v').unwrap())
+            {
                 Ok(Self::new_version(version))
             } else {
                 Ok(Self::new_string(string.to_string()))
@@ -881,7 +885,7 @@ mod tests {
     fn toml_string_that_parses_as_version_req() {
         // "1.2.3" is a valid VersionReq (semver parses it as >=1.2.3, <2); the
         // TryFrom implementation tries VersionReq first, so this becomes Require.
-        let v: toml::Value = toml::from_str(r#"s = "1.2.3""#).unwrap();
+        let v: toml::Value = toml::from_str(r#"s = "^1.2.3""#).unwrap();
         let n = Node::try_from(v.get("s").unwrap()).unwrap();
         // VersionReq is tried before Version: assert Require (not Version)
         assert!(

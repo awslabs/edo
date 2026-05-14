@@ -164,6 +164,11 @@ impl Context {
         Ok(ctx.clone())
     }
 
+    /// Adds any project found config nodes to the config
+    pub fn add_config(&self, config: &BTreeMap<String, Node>) {
+        self.config.merge(config);
+    }
+
     /// Loads the project from the current directory, resolving dependencies
     /// and registering all components.
     pub async fn load_project(&self, error_on_lock: bool) -> ContextResult<()> {
@@ -180,6 +185,7 @@ impl Context {
     pub fn get_handle(&self) -> Handle {
         Handle::new(
             self.log.clone(),
+            self.config.clone(),
             self.storage.clone(),
             self.transforms
                 .iter()

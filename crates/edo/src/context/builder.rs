@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 /// they are resolved and registered with the [`Context`].
 pub struct Project {
     project_path: PathBuf,
+    config_nodes: BTreeMap<String, Node>,
     source_caches: BTreeMap<Addr, Node>,
     build_cache: Option<Node>,
     output_cache: Option<Node>,
@@ -85,6 +86,7 @@ impl Project {
     pub async fn load<P: AsRef<Path>>(path: P, ctx: &Context, error_on_lock: bool) -> Result<()> {
         let mut project = Self {
             project_path: path.as_ref().to_path_buf(),
+            config_nodes: BTreeMap::new(),
             source_caches: BTreeMap::new(),
             build_cache: None,
             output_cache: None,
@@ -178,6 +180,9 @@ impl Project {
         let config: Schema = toml::from_slice(&config_bytes).context(error::DeserializeSnafu)?;
         match config {
             Schema::V1(config) => {
+                for (name, node) in config.get_config()? {
+                    self.config_nodes.insert(name, node);
+                }
                 let mut sources = BTreeMap::new();
                 for (name, node) in config.get_sources()? {
                     let addr = namespace.join(&name);
@@ -218,6 +223,7 @@ impl Project {
     pub async fn build(&mut self, ctx: &Context, error_on_lock: bool) -> Result<()> {
         // Calculate the digest of the project configuration
         let digest = self.calculate_digest()?;
+        ctx.add_config(&self.config_nodes);
         // Check for an existing lockfile
         let lock_file = self.project_path.join("edo.lock.json");
         if lock_file.exists() {
@@ -409,6 +415,7 @@ mod tests {
     fn empty_project(path: &Path) -> Project {
         Project {
             project_path: path.to_path_buf(),
+            config_nodes: BTreeMap::new(),
             source_caches: BTreeMap::new(),
             build_cache: None,
             output_cache: None,

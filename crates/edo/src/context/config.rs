@@ -7,11 +7,14 @@
 //! components that need no configuration. [`Config`] loads and queries the
 //! user-level configuration file.
 
+use crate::context::ArcMap;
+
 use super::{Addr, Context, ContextResult as Result, FromNode, FromNodeNoContext, Node, error};
 use async_trait::async_trait;
+use dashmap::DashMap;
 use home::home_dir;
 use snafu::{OptionExt, ResultExt};
-use std::{collections::BTreeMap, marker::PhantomData, path::Path};
+use std::{collections::BTreeMap, marker::PhantomData, path::Path, sync::Arc};
 
 /// A component that can be configured from a [`Node`] with access to the
 /// build [`Context`].
@@ -118,9 +121,9 @@ impl<E> FromNodeNoContext for NonConfigurable<E> {
 }
 
 /// User-level configuration loaded from `~/.config/edo.toml` (or a custom path).
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct Config {
-    configs: BTreeMap<String, Node>,
+    configs: ArcMap<String, Node>,
 }
 
 impl Config {
@@ -136,18 +139,28 @@ impl Config {
         };
         if !path.exists() {
             return Ok(Self {
-                configs: BTreeMap::new(),
+                configs: Arc::new(DashMap::new()),
             });
         }
         let bytes = tokio::fs::read(path).await.context(error::IoSnafu)?;
-        let configs = toml::from_slice(&bytes).context(error::DeserializeSnafu)?;
+        let configs: BTreeMap<String, Node> =
+            toml::from_slice(&bytes).context(error::DeserializeSnafu)?;
 
-        Ok(Self { configs })
+        Ok(Self {
+            configs: Arc::new(DashMap::from_iter(configs)),
+        })
     }
 
     /// Returns the configuration node for the given key, if present.
     pub fn get(&self, name: &str) -> Option<Node> {
-        self.configs.get(name).cloned()
+        self.configs.get(name).map(|x| x.value().clone())
+    }
+
+    /// Merges in another set of nodes
+    pub fn merge(&self, right: &BTreeMap<String, Node>) {
+        for (key, value) in right {
+            self.configs.insert(key.clone(), value.clone());
+        }
     }
 }
 

@@ -7,6 +7,7 @@
 
 use super::{Addr, ContextResult, Log, LogManager, error};
 use crate::{
+    context::Config,
     environment::{Environment, Farm},
     storage::Storage,
     transform::Transform,
@@ -21,6 +22,7 @@ use tokio_util::sync::CancellationToken;
 #[derive(Clone)]
 pub struct Handle {
     log: LogManager,
+    config: Config,
     storage: Storage,
     transforms: HashMap<Addr, Transform>,
     farms: HashMap<Addr, Farm>,
@@ -35,6 +37,7 @@ impl Handle {
     /// Creates a new `Handle` with the given components.
     pub fn new(
         log: LogManager,
+        config: Config,
         storage: Storage,
         transforms: HashMap<Addr, Transform>,
         farms: HashMap<Addr, Farm>,
@@ -42,12 +45,18 @@ impl Handle {
     ) -> Self {
         Self {
             log,
+            config,
             storage,
             transforms,
             farms,
             args,
             cancellation: CancellationToken::new(),
         }
+    }
+
+    /// Returns the project wide configuration nodes
+    pub fn config(&self) -> Config {
+        self.config.clone()
     }
 
     /// Returns the cancellation token
@@ -133,6 +142,7 @@ mod tests {
 
         let handle = Handle::new(
             log_mgr,
+            Config::default(),
             storage,
             HashMap::new(),
             HashMap::new(),
@@ -155,6 +165,7 @@ mod tests {
 
         let handle = Handle::new(
             log_mgr.clone(),
+            Config::default(),
             storage,
             HashMap::new(),
             HashMap::new(),

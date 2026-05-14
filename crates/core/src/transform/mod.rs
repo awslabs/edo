@@ -25,10 +25,24 @@ where
     E: snafu::Error + From<ContextError>,
     F: Fn(&str, &str) -> E,
 {
+    parse_sources_with_name("source", addr, node, ctx, field_error).await
+}
+
+pub async fn parse_sources_with_name<E, F>(
+    field: &str,
+    addr: &Addr,
+    node: &Node,
+    ctx: &Context,
+    field_error: F,
+) -> Result<IndexMap<String, Source>, E>
+where
+    E: snafu::Error + From<ContextError>,
+    F: Fn(&str, &str) -> E,
+{
     let mut sources = IndexMap::new();
     let standin = Node::new_list(vec![]);
     let list = node
-        .get("source")
+        .get(field)
         .unwrap_or(standin)
         .as_list()
         .ok_or(field_error("source", "source definition"))?;
