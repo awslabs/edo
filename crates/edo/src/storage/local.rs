@@ -78,29 +78,30 @@ impl LocalBackend {
 }
 
 impl LocalBackend {
-    fn load(&self) -> StorageResult<Catalog> {
-        // Acquire a lock on the catalog
-        let lock = self.catalog_file.read();
-        if !lock.exists() {
+    fn load_at(path: &Path) -> StorageResult<Catalog> {
+        if !path.exists() {
             return Ok(Catalog::default());
         }
-        let mut reader = std::fs::File::open(lock.as_path()).context(error::ReadCatalogSnafu)?;
+        let mut reader = std::fs::File::open(path).context(error::ReadCatalogSnafu)?;
         let catalog: Catalog =
             serde_json::from_reader(&mut reader).context(error::DeserializeSnafu)?;
         Ok(catalog)
     }
 
-    fn flush(&self, catalog: &Catalog) -> StorageResult<()> {
-        // Acquire a write lock
-        let lock = self.catalog_file.write();
+    fn flush_at(path: &Path, catalog: &Catalog) -> StorageResult<()> {
         let mut writer = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
-            .open(lock.as_path())
+            .open(path)
             .context(error::WriteCatalogSnafu)?;
         serde_json::to_writer(&mut writer, catalog).context(error::SerializeSnafu)?;
         Ok(())
+    }
+
+    fn load(&self) -> StorageResult<Catalog> {
+        let lock = self.catalog_file.read();
+        Self::load_at(lock.as_path())
     }
 }
 
@@ -135,26 +136,32 @@ impl BackendImpl for LocalBackend {
                 }
             );
         }
-        // Now we can write everything into the catalog
-        let mut catalog = self.load()?;
+        // Hold the write lock across load+mutate+flush so concurrent saves
+        // cannot read a stale catalog and clobber each other's writes.
+        let lock = self.catalog_file.write();
+        let mut catalog = Self::load_at(lock.as_path())?;
         catalog.add(artifact);
-        self.flush(&catalog)?;
+        Self::flush_at(lock.as_path(), &catalog)?;
         Ok(())
     }
 
     async fn del(&self, id: &Id) -> StorageResult<()> {
-        if !self.has(id).await? {
-            // Do nothing if we don't have this id
-            return Ok(());
-        }
-        // First load the existing metadata
-        let mut catalog = self.load()?;
-        let artifact = catalog
-            .get(id)
-            .context(error::NotFoundSnafu { id: id.clone() })?
-            .clone();
-        catalog.del(id);
-        self.flush(&catalog)?;
+        // Hold the write lock across the read-modify-write so concurrent
+        // saves/dels cannot interleave and lose updates.
+        let (artifact, catalog) = {
+            let lock = self.catalog_file.write();
+            let mut catalog = Self::load_at(lock.as_path())?;
+            if !catalog.has(id) {
+                return Ok(());
+            }
+            let artifact = catalog
+                .get(id)
+                .context(error::NotFoundSnafu { id: id.clone() })?
+                .clone();
+            catalog.del(id);
+            Self::flush_at(lock.as_path(), &catalog)?;
+            (artifact, catalog)
+        };
         for layer in artifact.layers() {
             let digest = layer.digest().digest();
             let blob_path = self.layer_dir.join(digest.clone());
