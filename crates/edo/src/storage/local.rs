@@ -148,7 +148,7 @@ impl BackendImpl for LocalBackend {
     async fn del(&self, id: &Id) -> StorageResult<()> {
         // Hold the write lock across the read-modify-write so concurrent
         // saves/dels cannot interleave and lose updates.
-        let (artifact, catalog) = {
+        let artifact = {
             let lock = self.catalog_file.write();
             let mut catalog = Self::load_at(lock.as_path())?;
             if !catalog.has(id) {
@@ -160,11 +160,13 @@ impl BackendImpl for LocalBackend {
                 .clone();
             catalog.del(id);
             Self::flush_at(lock.as_path(), &catalog)?;
-            (artifact, catalog)
+            artifact
         };
         for layer in artifact.layers() {
             let digest = layer.digest().digest();
             let blob_path = self.layer_dir.join(digest.clone());
+            let lock = self.catalog_file.read();
+            let catalog = Self::load_at(lock.as_path())?;
             if catalog.count(layer) <= 0 && blob_path.exists() {
                 tokio::fs::remove_file(&blob_path)
                     .await
