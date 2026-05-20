@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use dashmap::DashMap;
 use edo::context::{Addr, Context, Definable, FromNode, Log, Node};
-use edo::environment::{Command, EnvResult, Environment, EnvironmentImpl, FarmImpl};
+use edo::environment::{EnvResult, Environment, EnvironmentImpl, FarmImpl};
 use edo::record;
 use edo::source::Source;
 use edo::storage::{Id, Storage};
@@ -12,10 +12,10 @@ use snafu::ResultExt;
 use snafu::{OptionExt, ensure};
 use std::collections::HashMap;
 use std::env;
-use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::fs::{File, create_dir_all, remove_file};
+use tokio::io::AsyncWriteExt;
 use tracing::Instrument;
 use uuid::Uuid;
 use which::which;
@@ -363,7 +363,23 @@ impl EnvironmentImpl for Container {
         Ok(())
     }
 
-    async fn write(&self, path: &Path, mut reader: Reader) -> EnvResult<()> {
+    async fn write_bytes(&self, path: &Path, buffer: &[u8]) -> EnvResult<()> {
+        let file_path = self.path.join(path);
+        if let Some(parent) = file_path.parent() {
+            if !parent.exists() {
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .context(error::CreateDirectorySnafu)?;
+            }
+        }
+        trace!(component = "environment", type = "container", "writing contents to file at {}", file_path.display());
+        tokio::fs::write(&file_path, buffer)
+            .await
+            .context(error::WriteFileSnafu)?;
+        Ok(())
+    }
+
+    async fn write_stream(&self, path: &Path, mut reader: Reader) -> EnvResult<()> {
         let file_path = self.path.join(path);
         if let Some(parent) = file_path.parent() {
             if !parent.exists() {
@@ -382,7 +398,7 @@ impl EnvironmentImpl for Container {
         Ok(())
     }
 
-    async fn unpack(&self, path: &Path, reader: Reader) -> EnvResult<()> {
+    async fn unpack_stream(&self, path: &Path, reader: Reader) -> EnvResult<()> {
         let file_path = self.path.join(path);
         if !file_path.exists() {
             tokio::fs::create_dir_all(&file_path)
@@ -390,7 +406,9 @@ impl EnvironmentImpl for Container {
                 .context(error::CreateDirectorySnafu)?;
         }
         trace!(component = "environment", type = "container", "unpacking archive into {}", file_path.display());
-        let mut archive = tokio_tar::Archive::new(reader);
+        let mut archive = tokio_tar::ArchiveBuilder::new(reader)
+            .set_preserve_permissions(true)
+            .build();
         archive
             .unpack(&file_path)
             .await
@@ -398,7 +416,7 @@ impl EnvironmentImpl for Container {
         Ok(())
     }
 
-    async fn read(&self, path: &Path, mut writer: Writer) -> EnvResult<()> {
+    async fn read_stream(&self, path: &Path, mut writer: Writer) -> EnvResult<()> {
         let file_path = self.path.join(path);
         ensure!(
             file_path.exists(),
@@ -422,6 +440,19 @@ impl EnvironmentImpl for Container {
             archive.finish().await.context(error::ArchiveSnafu)?;
         }
         Ok(())
+    }
+
+    async fn read_bytes(&self, path: &Path) -> EnvResult<Vec<u8>> {
+        let file_path = self.path.join(path);
+        ensure!(
+            file_path.exists(),
+            error::NotFoundSnafu {
+                path: path.to_path_buf()
+            }
+        );
+        Ok(tokio::fs::read(&file_path)
+            .await
+            .context(error::ReadFileSnafu)?)
     }
 
     fn shell(&self, path: &Path) -> EnvResult<()> {
@@ -454,7 +485,7 @@ impl EnvironmentImpl for Container {
         Ok(())
     }
 
-    async fn cmd(&self, log: &Log, id: &Id, path: &Path, cmd: &str) -> EnvResult<bool> {
+    async fn execute(&self, log: &Log, id: &Id, path: &Path, cmd: &str) -> EnvResult<bool> {
         let work_dir = Path::new("/root").join(path);
         trace!(component = "environment", type = "container", "running command in {}", work_dir.display());
         async move {
@@ -495,61 +526,6 @@ impl EnvironmentImpl for Container {
         ))
         .await
         .map_err(|e| e.into())
-    }
-
-    async fn run(&self, log: &Log, id: &Id, path: &Path, command: &Command) -> EnvResult<bool> {
-        let work_dir = Path::new("/root").join(path);
-        trace!(component = "environment", type = "container", "running command in {}", work_dir.display());
-        async move {
-            let mut args = vec![
-                "exec".to_string(),
-                "-i".to_string(),
-                "--workdir".to_string(),
-                format!("{}", work_dir.display()),
-            ];
-            if self.user == "root" {
-                args.push("-u".into());
-                args.push("0:0".into());
-            }
-            if !self.env.is_empty() {
-                args.push("--env".into());
-                let env_list = self
-                    .env
-                    .iter()
-                    .map(|x| format!("{}={}", x.key(), x.value()))
-                    .collect::<Vec<_>>()
-                    .join(",");
-                args.push(env_list);
-            }
-            args.push(self.name.clone());
-            let mut run_args = args.clone();
-            run_args.push("sh".into());
-            let script = command.to_string();
-            let mut cursor = Cursor::new(script.as_bytes());
-            record!(
-                log,
-                "script",
-                "{:?} {}",
-                self.config.cli,
-                run_args.join(" ")
-            );
-            Ok(edo::util::cmd(
-                ".",
-                log,
-                &self.config.cli,
-                run_args,
-                &mut cursor,
-                &from_dash(&self.env),
-            )
-            .context(error::RuntimeSnafu)?)
-        }
-        .instrument(info_span!(
-            target: "container",
-            "executing in environment",
-            id = id.to_string(),
-            log = log.log_name()
-        ))
-        .await
     }
 }
 

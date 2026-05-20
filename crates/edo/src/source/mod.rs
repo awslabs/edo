@@ -14,6 +14,8 @@ use crate::environment::Environment;
 use crate::storage::{Artifact, Id, Storage};
 use arc_handle::arc_handle;
 use async_trait::async_trait;
+#[cfg(test)]
+use mockall::automock;
 use std::path::Path;
 
 mod error;
@@ -36,6 +38,7 @@ pub use version::*;
 /// (e.g. git clone, local copy, OCI pull). Use [`Source::cache`] in preference
 /// to [`Source::fetch`] to benefit from the local artifact cache.
 #[arc_handle]
+#[cfg_attr(test, automock)]
 #[async_trait]
 pub trait Source {
     /// The unique id for this source
