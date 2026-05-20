@@ -178,7 +178,6 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::Ordering as AtomicOrdering;
     use tempfile::TempDir;
-    use tokio::sync::Mutex as TokioMutex;
 
     /// Build a `Config` from an inline TOML snippet. Using a real file is
     /// the only public path — `Config::load` has no in-memory constructor.
@@ -256,7 +255,7 @@ mod tests {
         };
         ensure_default_farm(&ctx);
 
-        let order = Arc::new(TokioMutex::new(Vec::new()));
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
         let mi = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let h_c = register_mock(&ctx, "//sr/c", &[], order.clone(), mi.clone());
         let h_b = register_mock(&ctx, "//sr/b", &["//sr/c"], order.clone(), mi.clone());

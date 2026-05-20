@@ -1,15 +1,17 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use edo::context::{Addr, Context, FromNode, Handle, Log, Node, non_configurable};
-use edo::environment::Environment;
+use edo::environment::{Environment, Vfs};
 use edo::source::Source;
 use edo::storage::{Artifact, Compression, Config, Id, MediaType};
 use edo::transform::{TransformError, TransformImpl, TransformResult, TransformStatus};
 
 use async_trait::async_trait;
+use handlebars::Handlebars;
 use indexmap::IndexMap;
 use ocilot::models::Platform;
-use snafu::OptionExt;
+use snafu::{OptionExt, ResultExt};
 
 /// A transform that executes shell commands in a build environment to produce an artifact.
 pub struct ScriptTransform {
@@ -170,7 +172,7 @@ impl TransformImpl for ScriptTransform {
                 let reader = ctx.storage().safe_read(layer).await?;
                 match layer.media_type() {
                     MediaType::Tar(..) => {
-                        env.unpack(build_root, reader).await?;
+                        env.unpack_stream(build_root, reader).await?;
                     }
                     _ => {
                         warn!(
@@ -193,27 +195,48 @@ impl TransformImpl for ScriptTransform {
         match async move {
             // Run the script in our environment
             let id = self.get_unique_id(ctx).await?;
-            let mut cmd = env.defer_cmd(log, &id);
-            cmd.set_interpreter(self.interpreter.as_str());
-            cmd.create_named_dir("build-root", "build-root").await?;
-            cmd.create_named_dir("install-root", "install-root").await?;
-            if let Some(arch) = self.arch.as_ref() {
-                cmd.set("arch", arch.as_str())?;
+            let handlebars = Handlebars::new();
+            let vfs = Vfs::new(&id, env, log).await?;
+
+            let mut script = vec![format!("#!/usr/bin/env {}", self.interpreter)];
+            let build_root = vfs.create_dir("build-root").await?;
+            let install_root = vfs.create_dir("install-root").await?;
+            let mut commands = self.commands.clone();
+
+            script.append(&mut commands);
+
+            let arch = if let Some(arch) = self.arch.as_ref() {
+                arch.as_str()
             } else {
-                cmd.set("arch", std::env::consts::ARCH)?;
-            }
+                std::env::consts::ARCH
+            };
+            let mut args = HashMap::from([
+                ("build-root", build_root.path().to_str().unwrap()),
+                ("install-root", install_root.path().to_str().unwrap()),
+                ("arch", arch),
+            ]);
+
             for (key, value) in ctx.args() {
                 if key == "arch" {
                     continue;
                 }
-                cmd.set(key, value)?;
+                args.insert(key, value);
             }
 
-            for command in self.commands.iter() {
-                cmd.run(command).await?;
-            }
+            let script_string = script.join("\n");
+            let resolved_script = handlebars
+                .render_template(&script_string, &args)
+                .context(error::RenderSnafu)?;
 
-            cmd.send("{{build-root}}").await?;
+            // Write the scripot into the vfs
+            let script = vfs.entry("script.sh").await;
+            vfs.write(script.path(), resolved_script.as_bytes()).await?;
+            // Make it executable
+            vfs.command("chmod", "chmod", &["+x", script.as_ref()])
+                .await?;
+            // Run the script
+            vfs.command("script", script.clone(), &Vec::<&str>::new())
+                .await?;
 
             // The result of a script transform is everything put in the install-root
             let mut artifact = Artifact::builder()
@@ -227,7 +250,7 @@ impl TransformImpl for ScriptTransform {
             if let Some(path) = self.artifact.as_ref() {
                 apath = apath.join(path);
             }
-            env.read(apath.as_path(), writer.clone()).await?;
+            env.read_stream(apath.as_path(), writer.clone()).await?;
             artifact.layers_mut().push(
                 ctx.storage()
                     .safe_finish_layer(
@@ -298,6 +321,10 @@ pub mod error {
         Field { field: String, type_: String },
         #[snafu(display("could not find dependent transform with address {addr}"))]
         NotFound { addr: Addr },
+        #[snafu(display("failed to render handlebars template for script: {source}"))]
+        Render { source: handlebars::RenderError },
+        #[snafu(display("script path is not valid utf-8"))]
+        ScriptPath,
     }
 
     impl From<Error> for TransformError {

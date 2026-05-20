@@ -712,25 +712,23 @@ where
 pub(crate) mod tests {
     //! Integration-style tests for [`Graph`].
     //!
-    //! Mocks for `Transform`, `Farm`, and `Environment` live here so that
-    //! every test file in this module can re-use them via the
-    //! `#[path]` include pattern — see `execute.rs::tests` for the
-    //! second (duplicated) mock copy.  We keep the mocks inline (per
-    //! plan) instead of in a shared `test_support.rs`.
+    //! Mocks come from `mockall::automock` on `EnvironmentImpl`, `FarmImpl`,
+    //! and `TransformImpl`. The trivial pass-through configuration lives in
+    //! `mock_env` / `mock_farm`; the heavily-instrumented transform mock is
+    //! built by `build_mock_transform` and registered via `register_mock` /
+    //! `register_mock_with`.
 
     use super::*;
-    use crate::context::{Addr, Context, Handle, LogVerbosity};
-    use crate::environment::{Command, EnvResult, Environment, EnvironmentImpl, Farm, FarmImpl};
+    use crate::context::{Addr, Context, LogVerbosity};
+    use crate::environment::{Environment, Farm, MockEnvironmentImpl, MockFarmImpl};
     use crate::storage::{Artifact as StorageArtifact, Config as ArtifactConfig, Id, MediaType};
-    use crate::transform::{Transform, TransformImpl, TransformResult, TransformStatus};
-    use crate::util::{Reader, Writer};
-    use async_trait::async_trait;
+    use crate::transform::{MockTransformImpl, Transform, TransformStatus};
     use std::collections::HashMap;
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use tempfile::TempDir;
-    use tokio::sync::{Mutex as TokioMutex, OnceCell};
+    use tokio::sync::OnceCell;
 
     // ── context bootstrapping (mirrors context/mod.rs pattern) ──────────────
 
@@ -777,95 +775,35 @@ pub(crate) mod tests {
         };
     }
 
-    // ── mock Environment ─────────────────────────────────────────────────────
+    // ── mock Environment / Farm ──────────────────────────────────────────────
 
-    /// Trivial environment used by mock transforms. Every method either
-    /// succeeds with a default value or records nothing of interest — the
-    /// scheduler tests only care that the calls do not return errors.
-    pub(crate) struct MockEnvironmentImpl;
-
-    #[async_trait]
-    impl EnvironmentImpl for MockEnvironmentImpl {
-        async fn expand(&self, path: &Path) -> EnvResult<PathBuf> {
-            Ok(path.to_path_buf())
-        }
-        async fn create_dir(&self, _path: &Path) -> EnvResult<()> {
-            Ok(())
-        }
-        async fn set_env(&self, _key: &str, _value: &str) -> EnvResult<()> {
-            Ok(())
-        }
-        async fn get_env(&self, _key: &str) -> Option<String> {
-            None
-        }
-        async fn setup(
-            &self,
-            _log: &crate::context::Log,
-            _storage: &crate::storage::Storage,
-        ) -> EnvResult<()> {
-            Ok(())
-        }
-        async fn up(&self, _log: &crate::context::Log) -> EnvResult<()> {
-            Ok(())
-        }
-        async fn down(&self, _log: &crate::context::Log) -> EnvResult<()> {
-            Ok(())
-        }
-        async fn clean(&self, _log: &crate::context::Log) -> EnvResult<()> {
-            Ok(())
-        }
-        async fn write(&self, _path: &Path, _reader: Reader) -> EnvResult<()> {
-            Ok(())
-        }
-        async fn unpack(&self, _path: &Path, _reader: Reader) -> EnvResult<()> {
-            Ok(())
-        }
-        async fn read(&self, _path: &Path, _writer: Writer) -> EnvResult<()> {
-            Ok(())
-        }
-        async fn cmd(
-            &self,
-            _log: &crate::context::Log,
-            _id: &Id,
-            _path: &Path,
-            _command: &str,
-        ) -> EnvResult<bool> {
-            Ok(true)
-        }
-        async fn run(
-            &self,
-            _log: &crate::context::Log,
-            _id: &Id,
-            _path: &Path,
-            _command: &Command,
-        ) -> EnvResult<bool> {
-            Ok(true)
-        }
-        fn shell(&self, _path: &Path) -> EnvResult<()> {
-            Ok(())
-        }
-    }
-
-    // ── mock Farm ────────────────────────────────────────────────────────────
-
-    pub(crate) struct MockFarmImpl;
-
-    #[async_trait]
-    impl FarmImpl for MockFarmImpl {
-        async fn setup(
-            &self,
-            _log: &crate::context::Log,
-            _storage: &crate::storage::Storage,
-        ) -> EnvResult<()> {
-            Ok(())
-        }
-        async fn create(&self, _log: &crate::context::Log, _path: &Path) -> EnvResult<Environment> {
-            Ok(Environment::new(MockEnvironmentImpl))
-        }
+    /// Trivial pass-through environment built from `MockEnvironmentImpl`.
+    /// Every method returns `Ok(())` (or a sensible default).
+    fn mock_env() -> Environment {
+        let mut m = MockEnvironmentImpl::new();
+        m.expect_expand().returning(|p| Ok(p.to_path_buf()));
+        m.expect_create_dir().returning(|_| Ok(()));
+        m.expect_set_env().returning(|_, _| Ok(()));
+        m.expect_get_env().returning(|_| None);
+        m.expect_setup().returning(|_, _| Ok(()));
+        m.expect_up().returning(|_| Ok(()));
+        m.expect_down().returning(|_| Ok(()));
+        m.expect_clean().returning(|_| Ok(()));
+        m.expect_write_bytes().returning(|_, _| Ok(()));
+        m.expect_write_stream().returning(|_, _| Ok(()));
+        m.expect_unpack_stream().returning(|_, _| Ok(()));
+        m.expect_read_bytes().returning(|_| Ok(Vec::new()));
+        m.expect_read_stream().returning(|_, _| Ok(()));
+        m.expect_execute().returning(|_, _, _, _| Ok(true));
+        m.expect_shell().returning(|_| Ok(()));
+        Environment::new(m)
     }
 
     pub(crate) fn mock_farm() -> Farm {
-        Farm::new(MockFarmImpl)
+        let mut f = MockFarmImpl::new();
+        f.expect_setup().returning(|_, _| Ok(()));
+        f.expect_create().returning(|_, _| Ok(mock_env()));
+        Farm::new(f)
     }
 
     // ── mock Transform ───────────────────────────────────────────────────────
@@ -883,50 +821,6 @@ pub(crate) mod tests {
         FailInStage,
     }
 
-    /// Configurable mock transform.
-    ///
-    /// Exposes atomic counters for each lifecycle method so that tests can
-    /// assert which parts of the pipeline ran, and an `order_log` that
-    /// records the address of every `transform` entry (for topological
-    /// ordering assertions).
-    pub(crate) struct MockTransformImpl {
-        pub addr: Addr,
-        pub deps: Vec<Addr>,
-        pub env_addr: Addr,
-        pub digest: String,
-        pub prepare_called: Arc<AtomicUsize>,
-        pub stage_called: Arc<AtomicUsize>,
-        pub transform_called: Arc<AtomicUsize>,
-        pub inflight: Arc<AtomicUsize>,
-        pub max_inflight: Arc<AtomicUsize>,
-        pub order_log: Arc<TokioMutex<Vec<Addr>>>,
-        pub outcome: MockOutcome,
-        /// Optional sleep injected into `transform()` to widen the
-        /// scheduler's completion-to-dispatch race window so unit tests
-        /// can reliably observe ordering bugs that real-world long-running
-        /// transforms would expose.
-        pub delay: Option<std::time::Duration>,
-    }
-
-    impl Default for MockTransformImpl {
-        fn default() -> Self {
-            Self {
-                addr: Addr::parse("//proj/unset").unwrap(),
-                deps: Vec::new(),
-                env_addr: Addr::parse("//default").unwrap(),
-                digest: "0000".into(),
-                prepare_called: Arc::new(AtomicUsize::new(0)),
-                stage_called: Arc::new(AtomicUsize::new(0)),
-                transform_called: Arc::new(AtomicUsize::new(0)),
-                inflight: Arc::new(AtomicUsize::new(0)),
-                max_inflight: Arc::new(AtomicUsize::new(0)),
-                order_log: Arc::new(TokioMutex::new(Vec::new())),
-                outcome: MockOutcome::Success,
-                delay: None,
-            }
-        }
-    }
-
     fn make_artifact(digest: &str) -> StorageArtifact {
         let id = Id::builder()
             .name("mock".to_string())
@@ -938,80 +832,98 @@ pub(crate) mod tests {
             .build()
     }
 
-    #[async_trait]
-    impl TransformImpl for MockTransformImpl {
-        async fn environment(&self) -> TransformResult<Addr> {
-            Ok(self.env_addr.clone())
-        }
+    /// Configure a `MockTransformImpl` with the given instrumentation.
+    ///
+    /// All async lifecycle methods are wired through `.returning(...)`
+    /// closures. The `transform` body uses `std::sync::Mutex` for the
+    /// shared order log and `std::thread::sleep` for the optional delay
+    /// because mockall's `.returning` closure is sync (the generated
+    /// async-trait wrapper turns the returned value into a ready future,
+    /// so `.await` is not available inside the closure body).
+    #[allow(clippy::too_many_arguments)]
+    fn build_mock_transform(
+        addr: Addr,
+        deps: Vec<Addr>,
+        env_addr: Addr,
+        digest: String,
+        prepare_called: Arc<AtomicUsize>,
+        stage_called: Arc<AtomicUsize>,
+        transform_called: Arc<AtomicUsize>,
+        inflight: Arc<AtomicUsize>,
+        max_inflight: Arc<AtomicUsize>,
+        order_log: Arc<std::sync::Mutex<Vec<Addr>>>,
+        outcome: MockOutcome,
+        delay: Option<std::time::Duration>,
+    ) -> MockTransformImpl {
+        let mut m = MockTransformImpl::new();
 
-        async fn get_unique_id(&self, _ctx: &Handle) -> TransformResult<Id> {
-            Ok(Id::builder()
-                .name(self.addr.to_string())
-                .digest(self.digest.clone())
-                .build())
+        {
+            let env_addr = env_addr.clone();
+            m.expect_environment()
+                .returning(move || Ok(env_addr.clone()));
         }
-
-        async fn depends(&self) -> TransformResult<Vec<Addr>> {
-            Ok(self.deps.clone())
+        {
+            let addr = addr.clone();
+            let digest = digest.clone();
+            m.expect_get_unique_id().returning(move |_ctx| {
+                Ok(Id::builder()
+                    .name(addr.to_string())
+                    .digest(digest.clone())
+                    .build())
+            });
         }
-
-        async fn prepare(&self, _log: &crate::context::Log, _ctx: &Handle) -> TransformResult<()> {
-            self.prepare_called.fetch_add(1, AtomicOrdering::SeqCst);
-            Ok(())
+        {
+            let deps = deps.clone();
+            m.expect_depends().returning(move || Ok(deps.clone()));
         }
-
-        async fn stage(
-            &self,
-            _log: &crate::context::Log,
-            _ctx: &Handle,
-            _env: &Environment,
-        ) -> TransformResult<()> {
-            self.stage_called.fetch_add(1, AtomicOrdering::SeqCst);
-            if matches!(self.outcome, MockOutcome::FailInStage) {
-                return Err(crate::transform::TransformError::Implementation {
-                    source: Box::new(std::io::Error::other("mock stage failure")),
-                });
-            }
-            Ok(())
+        {
+            let prepare_called = prepare_called.clone();
+            m.expect_prepare().returning(move |_log, _ctx| {
+                prepare_called.fetch_add(1, AtomicOrdering::SeqCst);
+                Ok(())
+            });
         }
-
-        async fn transform(
-            &self,
-            _log: &crate::context::Log,
-            _ctx: &Handle,
-            _env: &Environment,
-        ) -> TransformStatus {
-            self.transform_called.fetch_add(1, AtomicOrdering::SeqCst);
-            let now = self.inflight.fetch_add(1, AtomicOrdering::SeqCst) + 1;
-            // Track peak concurrency for batch-size assertions.
-            self.max_inflight.fetch_max(now, AtomicOrdering::SeqCst);
-            self.order_log.lock().await.push(self.addr.clone());
-            // Small yield so concurrent transforms interleave.
-            tokio::task::yield_now().await;
-            // Optional sleep to widen the race window between the parent
-            // task's inflight decrement and its child-enqueue walk.
-            if let Some(d) = self.delay {
-                tokio::time::sleep(d).await;
-            }
-            self.inflight.fetch_sub(1, AtomicOrdering::SeqCst);
-
-            match self.outcome {
-                MockOutcome::Success => TransformStatus::Success(make_artifact(&self.digest)),
-                // Failure is already returned from `stage` for the
-                // `FailInStage` outcome, so this arm is unreachable when
-                // the scheduler is exercised; return Success so unit tests
-                // that touch `transform` directly still behave.
-                MockOutcome::FailInStage => TransformStatus::Success(make_artifact(&self.digest)),
-            }
+        {
+            let stage_called = stage_called.clone();
+            let outcome = outcome.clone();
+            m.expect_stage().returning(move |_log, _ctx, _env| {
+                stage_called.fetch_add(1, AtomicOrdering::SeqCst);
+                if matches!(outcome, MockOutcome::FailInStage) {
+                    return Err(crate::transform::TransformError::Implementation {
+                        source: Box::new(std::io::Error::other("mock stage failure")),
+                    });
+                }
+                Ok(())
+            });
         }
-
-        fn can_shell(&self) -> bool {
-            false
+        {
+            let transform_called = transform_called.clone();
+            let inflight = inflight.clone();
+            let max_inflight = max_inflight.clone();
+            let order_log = order_log.clone();
+            let addr_for_log = addr.clone();
+            let digest_for_status = digest.clone();
+            m.expect_transform().returning(move |_log, _ctx, _env| {
+                transform_called.fetch_add(1, AtomicOrdering::SeqCst);
+                let now = inflight.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+                // Track peak concurrency for batch-size assertions.
+                max_inflight.fetch_max(now, AtomicOrdering::SeqCst);
+                order_log.lock().unwrap().push(addr_for_log.clone());
+                // Optional blocking sleep to widen the scheduler's
+                // completion-to-dispatch race window. Safe under the default
+                // multi-thread Tokio runtime used by `#[tokio::test]`.
+                if let Some(d) = delay {
+                    std::thread::sleep(d);
+                }
+                inflight.fetch_sub(1, AtomicOrdering::SeqCst);
+                // Both Success and FailInStage map to Success here — the
+                // `FailInStage` outcome short-circuits earlier in `stage()`.
+                TransformStatus::Success(make_artifact(&digest_for_status))
+            });
         }
-
-        fn shell(&self, _env: &Environment) -> TransformResult<()> {
-            Ok(())
-        }
+        m.expect_can_shell().return_const(false);
+        m.expect_shell().returning(|_env| Ok(()));
+        m
     }
 
     /// Handle bundle returned to tests so they can observe counters after
@@ -1023,7 +935,7 @@ pub(crate) mod tests {
         pub stage_called: Arc<AtomicUsize>,
         pub transform_called: Arc<AtomicUsize>,
         pub max_inflight: Arc<AtomicUsize>,
-        pub order_log: Arc<TokioMutex<Vec<Addr>>>,
+        pub order_log: Arc<std::sync::Mutex<Vec<Addr>>>,
     }
 
     /// Build and register a mock transform at `addr` with the given deps.
@@ -1036,45 +948,18 @@ pub(crate) mod tests {
         ctx: &Context,
         addr_str: &str,
         deps: &[&str],
-        shared_order: Arc<TokioMutex<Vec<Addr>>>,
+        shared_order: Arc<std::sync::Mutex<Vec<Addr>>>,
         shared_max_inflight: Arc<AtomicUsize>,
     ) -> MockHandles {
-        let addr = Addr::parse(addr_str).unwrap();
-        let deps_vec: Vec<Addr> = deps
-            .iter()
-            .map(|s| Addr::parse(s).expect("dep addr"))
-            .collect();
-        let env_addr = Addr::parse("//default").unwrap();
-        let digest = format!("{:064x}", fxhash(addr_str));
-        let prepare_called = Arc::new(AtomicUsize::new(0));
-        let stage_called = Arc::new(AtomicUsize::new(0));
-        let transform_called = Arc::new(AtomicUsize::new(0));
-        let inflight = Arc::new(AtomicUsize::new(0));
-
-        let mock = MockTransformImpl {
-            addr: addr.clone(),
-            deps: deps_vec,
-            env_addr: env_addr.clone(),
-            digest,
-            prepare_called: prepare_called.clone(),
-            stage_called: stage_called.clone(),
-            transform_called: transform_called.clone(),
-            inflight,
-            max_inflight: shared_max_inflight.clone(),
-            order_log: shared_order.clone(),
-            outcome: MockOutcome::Success,
-            delay: None,
-        };
-        let t = Transform::new(mock);
-        ctx.insert_transform_for_test(&addr, t);
-        MockHandles {
-            addr,
-            prepare_called,
-            stage_called,
-            transform_called,
-            max_inflight: shared_max_inflight,
-            order_log: shared_order,
-        }
+        register_mock_with(
+            ctx,
+            addr_str,
+            deps,
+            shared_order,
+            shared_max_inflight,
+            MockOutcome::Success,
+            None,
+        )
     }
 
     /// Like [`register_mock`] but allows overriding [`MockOutcome`] and
@@ -1088,7 +973,7 @@ pub(crate) mod tests {
         ctx: &Context,
         addr_str: &str,
         deps: &[&str],
-        shared_order: Arc<TokioMutex<Vec<Addr>>>,
+        shared_order: Arc<std::sync::Mutex<Vec<Addr>>>,
         shared_max_inflight: Arc<AtomicUsize>,
         outcome: MockOutcome,
         delay: Option<std::time::Duration>,
@@ -1105,22 +990,21 @@ pub(crate) mod tests {
         let transform_called = Arc::new(AtomicUsize::new(0));
         let inflight = Arc::new(AtomicUsize::new(0));
 
-        let mock = MockTransformImpl {
-            addr: addr.clone(),
-            deps: deps_vec,
-            env_addr: env_addr.clone(),
+        let mock = build_mock_transform(
+            addr.clone(),
+            deps_vec,
+            env_addr,
             digest,
-            prepare_called: prepare_called.clone(),
-            stage_called: stage_called.clone(),
-            transform_called: transform_called.clone(),
+            prepare_called.clone(),
+            stage_called.clone(),
+            transform_called.clone(),
             inflight,
-            max_inflight: shared_max_inflight.clone(),
-            order_log: shared_order.clone(),
+            shared_max_inflight.clone(),
+            shared_order.clone(),
             outcome,
             delay,
-        };
-        let t = Transform::new(mock);
-        ctx.insert_transform_for_test(&addr, t);
+        );
+        ctx.insert_transform_for_test(&addr, Transform::new(mock));
         MockHandles {
             addr,
             prepare_called,
@@ -1166,7 +1050,7 @@ pub(crate) mod tests {
     async fn graph_add_registers_single_node() {
         let ctx = ctx_or_skip!();
         ensure_default_farm(&ctx);
-        let order = Arc::new(TokioMutex::new(Vec::new()));
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
         let mi = Arc::new(AtomicUsize::new(0));
         register_mock(&ctx, "//gadd/single", &[], order, mi);
 
@@ -1191,7 +1075,7 @@ pub(crate) mod tests {
         // A → B → C : adding A should register three nodes and two edges.
         let ctx = ctx_or_skip!();
         ensure_default_farm(&ctx);
-        let order = Arc::new(TokioMutex::new(Vec::new()));
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
         let mi = Arc::new(AtomicUsize::new(0));
         register_mock(&ctx, "//gtrans/c", &[], order.clone(), mi.clone());
         register_mock(
@@ -1232,7 +1116,7 @@ pub(crate) mod tests {
         // A depends on B, B depends on A — cycle.
         let ctx = ctx_or_skip!();
         ensure_default_farm(&ctx);
-        let order = Arc::new(TokioMutex::new(Vec::new()));
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
         let mi = Arc::new(AtomicUsize::new(0));
         register_mock(&ctx, "//gcyc/a", &["//gcyc/b"], order.clone(), mi.clone());
         register_mock(&ctx, "//gcyc/b", &["//gcyc/a"], order, mi);
@@ -1253,7 +1137,7 @@ pub(crate) mod tests {
     async fn graph_fetch_calls_prepare_per_node() {
         let ctx = ctx_or_skip!();
         ensure_default_farm(&ctx);
-        let order = Arc::new(TokioMutex::new(Vec::new()));
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
         let mi = Arc::new(AtomicUsize::new(0));
         // NOTE: we cannot easily forge a cached build without real layer
         // bytes, so this test only validates the positive path: every
@@ -1276,7 +1160,7 @@ pub(crate) mod tests {
     async fn graph_run_linear_chain_in_topological_order() {
         let ctx = ctx_or_skip!();
         ensure_default_farm(&ctx);
-        let order = Arc::new(TokioMutex::new(Vec::new()));
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
         let mi = Arc::new(AtomicUsize::new(0));
         let h_c = register_mock(&ctx, "//glin/c", &[], order.clone(), mi.clone());
         let h_b = register_mock(&ctx, "//glin/b", &["//glin/c"], order.clone(), mi.clone());
@@ -1298,7 +1182,7 @@ pub(crate) mod tests {
         // Ordering: C must finish before B, B before A. The shared log
         // records entry order which — for a linear chain under any
         // batch-size — must match topological order.
-        let log = order.lock().await;
+        let log = order.lock().unwrap();
         assert_eq!(
             log.as_slice(),
             &[
@@ -1320,7 +1204,7 @@ pub(crate) mod tests {
         //       A
         let ctx = ctx_or_skip!();
         ensure_default_farm(&ctx);
-        let order = Arc::new(TokioMutex::new(Vec::new()));
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
         let mi = Arc::new(AtomicUsize::new(0));
         register_mock(&ctx, "//gdia/d", &[], order.clone(), mi.clone());
         register_mock(&ctx, "//gdia/b", &["//gdia/d"], order.clone(), mi.clone());
@@ -1341,7 +1225,7 @@ pub(crate) mod tests {
         let g = Arc::new(g);
         g.run(ws.path(), &ctx, &root).await.expect("run");
 
-        let log = order.lock().await;
+        let log = order.lock().unwrap();
         // D must be first; A must be last.
         assert_eq!(log.first().unwrap(), &Addr::parse("//gdia/d").unwrap());
         assert_eq!(log.last().unwrap(), &Addr::parse("//gdia/a").unwrap());
@@ -1356,7 +1240,7 @@ pub(crate) mod tests {
         // the dispatcher has real parallel opportunity.
         let ctx = ctx_or_skip!();
         ensure_default_farm(&ctx);
-        let order = Arc::new(TokioMutex::new(Vec::new()));
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
         let mi = Arc::new(AtomicUsize::new(0));
         register_mock(&ctx, "//gb/l1", &[], order.clone(), mi.clone());
         register_mock(&ctx, "//gb/l2", &[], order.clone(), mi.clone());
@@ -1403,7 +1287,7 @@ pub(crate) mod tests {
     async fn graph_run_no_stranded_root_with_delay_and_batch_one() {
         let ctx = ctx_or_skip!();
         ensure_default_farm(&ctx);
-        let order = Arc::new(TokioMutex::new(Vec::new()));
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
         let mi = Arc::new(AtomicUsize::new(0));
         let delay = Some(std::time::Duration::from_millis(25));
 
@@ -1459,7 +1343,7 @@ pub(crate) mod tests {
             1,
             "root must run (this is the stranded-root regression)",
         );
-        let log = order.lock().await;
+        let log = order.lock().unwrap();
         assert_eq!(
             log.last().unwrap(),
             &Addr::parse("//rg/root").unwrap(),
@@ -1491,7 +1375,7 @@ pub(crate) mod tests {
     async fn graph_run_no_premature_root_with_diamond() {
         let ctx = ctx_or_skip!();
         ensure_default_farm(&ctx);
-        let order = Arc::new(TokioMutex::new(Vec::new()));
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
         let mi = Arc::new(AtomicUsize::new(0));
 
         let h_a = register_mock_with(
@@ -1548,7 +1432,7 @@ pub(crate) mod tests {
         // D must enter the order log strictly after both B and C — the
         // bug-version would log D between B and C because D dispatches
         // while C is still running.
-        let log = order.lock().await;
+        let log = order.lock().unwrap();
         let pos = |a: &str| {
             log.iter()
                 .position(|x| x == &Addr::parse(a).unwrap())
@@ -1587,7 +1471,7 @@ pub(crate) mod tests {
     async fn graph_run_failure_does_not_hang() {
         let ctx = ctx_or_skip!();
         ensure_default_farm(&ctx);
-        let order = Arc::new(TokioMutex::new(Vec::new()));
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
         let mi = Arc::new(AtomicUsize::new(0));
 
         // Leaf fails in stage; mid and root depend on leaf and must never
@@ -1679,7 +1563,7 @@ pub(crate) mod tests {
     async fn graph_run_shared_deep_dep_respected_with_wide_root() {
         let ctx = ctx_or_skip!();
         ensure_default_farm(&ctx);
-        let order = Arc::new(TokioMutex::new(Vec::new()));
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
         let mi = Arc::new(AtomicUsize::new(0));
 
         // Tiny delay so the cascade race window is wide enough to be
@@ -1762,7 +1646,7 @@ pub(crate) mod tests {
 
         // The smoking gun from the bottlerocket logs: `nvct` started
         // before `glibc`. With the bug, `pos(nvct) < pos(glibc)`.
-        let log = order.lock().await;
+        let log = order.lock().unwrap();
         let pos = |a: &str| -> usize {
             log.iter()
                 .position(|x| x == &Addr::parse(a).unwrap())

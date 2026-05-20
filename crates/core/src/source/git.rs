@@ -154,7 +154,7 @@ impl SourceImpl for GitSource {
         let reader = storage
             .safe_read(artifact.layers().first().unwrap())
             .await?;
-        env.unpack(&out_path, reader).await?;
+        env.unpack_stream(&out_path, reader).await?;
         Ok(())
     }
 }

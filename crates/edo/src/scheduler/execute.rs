@@ -122,25 +122,21 @@ mod tests {
     //! Scope: success-path only. `TransformStatus::Retryable` and
     //! `TransformStatus::Failed` both route through `dialoguer::Select::interact`
     //! which requires an interactive TTY and cannot be driven from a unit
-    //! test without a harness we do not have. Those branches are therefore
-    //! deliberately uncovered here — see the plan at
-    //! `/Users/jmt/.maki/plans/stable-solid-penguin.md` for the rationale.
+    //! test without a harness we do not have.
     //!
-    //! Per the plan, we keep a duplicated minimal copy of the transform/
-    //! environment mocks instead of importing from `graph::tests`, so this
-    //! file can be read standalone.
+    //! Mocks come from `mockall::automock` on the trait definitions; the
+    //! builders below configure them with the minimal pass-through behavior
+    //! required by `execute`.
 
     use super::*;
     use crate::context::{Addr, Context, LogVerbosity};
-    use crate::environment::{Command, EnvResult, Environment, EnvironmentImpl, Farm, FarmImpl};
+    use crate::environment::{Environment, Farm, MockEnvironmentImpl, MockFarmImpl};
     use crate::storage::{
         Artifact as StorageArtifact, Compression, Config as ArtifactConfig, Id, MediaType,
     };
-    use crate::transform::{Transform, TransformImpl, TransformResult};
-    use crate::util::{Reader, Writer};
-    use async_trait::async_trait;
+    use crate::transform::{MockTransformImpl, Transform, TransformStatus};
     use std::collections::HashMap;
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
     use std::sync::Arc;
     use tempfile::TempDir;
     use tokio::sync::OnceCell;
@@ -172,124 +168,68 @@ mod tests {
         }
     }
 
-    // ── minimal environment mock ────────────────────────────────────────────
-
-    struct MiniEnvImpl;
-
-    #[async_trait]
-    impl EnvironmentImpl for MiniEnvImpl {
-        async fn expand(&self, path: &Path) -> EnvResult<PathBuf> {
-            Ok(path.to_path_buf())
-        }
-        async fn create_dir(&self, _path: &Path) -> EnvResult<()> {
-            Ok(())
-        }
-        async fn set_env(&self, _k: &str, _v: &str) -> EnvResult<()> {
-            Ok(())
-        }
-        async fn get_env(&self, _k: &str) -> Option<String> {
-            None
-        }
-        async fn setup(&self, _log: &Log, _storage: &crate::storage::Storage) -> EnvResult<()> {
-            Ok(())
-        }
-        async fn up(&self, _log: &Log) -> EnvResult<()> {
-            Ok(())
-        }
-        async fn down(&self, _log: &Log) -> EnvResult<()> {
-            Ok(())
-        }
-        async fn clean(&self, _log: &Log) -> EnvResult<()> {
-            Ok(())
-        }
-        async fn write(&self, _p: &Path, _r: Reader) -> EnvResult<()> {
-            Ok(())
-        }
-        async fn unpack(&self, _p: &Path, _r: Reader) -> EnvResult<()> {
-            Ok(())
-        }
-        async fn read(&self, _p: &Path, _w: Writer) -> EnvResult<()> {
-            Ok(())
-        }
-        async fn cmd(&self, _log: &Log, _id: &Id, _p: &Path, _c: &str) -> EnvResult<bool> {
-            Ok(true)
-        }
-        async fn run(&self, _log: &Log, _id: &Id, _p: &Path, _c: &Command) -> EnvResult<bool> {
-            Ok(true)
-        }
-        fn shell(&self, _p: &Path) -> EnvResult<()> {
-            Ok(())
-        }
+    fn mini_env() -> Environment {
+        let mut m = MockEnvironmentImpl::new();
+        m.expect_expand().returning(|p| Ok(p.to_path_buf()));
+        m.expect_create_dir().returning(|_| Ok(()));
+        m.expect_set_env().returning(|_, _| Ok(()));
+        m.expect_get_env().returning(|_| None);
+        m.expect_setup().returning(|_, _| Ok(()));
+        m.expect_up().returning(|_| Ok(()));
+        m.expect_down().returning(|_| Ok(()));
+        m.expect_clean().returning(|_| Ok(()));
+        m.expect_write_bytes().returning(|_, _| Ok(()));
+        m.expect_write_stream().returning(|_, _| Ok(()));
+        m.expect_unpack_stream().returning(|_, _| Ok(()));
+        m.expect_read_bytes().returning(|_| Ok(Vec::new()));
+        m.expect_read_stream().returning(|_, _| Ok(()));
+        m.expect_execute().returning(|_, _, _, _| Ok(true));
+        m.expect_shell().returning(|_| Ok(()));
+        Environment::new(m)
     }
 
-    struct MiniFarmImpl;
-
-    #[async_trait]
-    impl FarmImpl for MiniFarmImpl {
-        async fn setup(&self, _log: &Log, _storage: &crate::storage::Storage) -> EnvResult<()> {
-            Ok(())
-        }
-        async fn create(&self, _log: &Log, _p: &Path) -> EnvResult<Environment> {
-            Ok(Environment::new(MiniEnvImpl))
-        }
+    fn mini_farm() -> Farm {
+        let mut f = MockFarmImpl::new();
+        f.expect_setup().returning(|_, _| Ok(()));
+        f.expect_create().returning(|_, _| Ok(mini_env()));
+        Farm::new(f)
     }
 
-    // ── minimal transform mock (success only) ───────────────────────────────
-
-    struct SuccessTransform {
-        digest: String,
-    }
-
-    fn mk_artifact(digest: &str) -> StorageArtifact {
-        let id = Id::builder()
-            .name("exec-mock".to_string())
-            .digest(digest.to_string())
-            .build();
-        StorageArtifact::builder()
-            .media_type(MediaType::File(Compression::None))
-            .config(ArtifactConfig::builder().id(id).build())
-            .build()
-    }
-
-    #[async_trait]
-    impl TransformImpl for SuccessTransform {
-        async fn environment(&self) -> TransformResult<Addr> {
-            Ok(Addr::parse("//default").unwrap())
+    fn success_transform(digest: &str) -> Transform {
+        let digest = digest.to_string();
+        let mut t = MockTransformImpl::new();
+        t.expect_environment()
+            .returning(|| Ok(Addr::parse("//default").unwrap()));
+        {
+            let d = digest.clone();
+            t.expect_get_unique_id().returning(move |_ctx| {
+                Ok(Id::builder()
+                    .name("exec_mock".to_string())
+                    .digest(d.clone())
+                    .build())
+            });
         }
-        async fn get_unique_id(&self, _ctx: &Handle) -> TransformResult<Id> {
-            Ok(Id::builder()
-                .name("exec-mock".to_string())
-                .digest(self.digest.clone())
-                .build())
+        t.expect_depends().returning(|| Ok(Vec::new()));
+        t.expect_prepare().returning(|_, _| Ok(()));
+        t.expect_stage().returning(|_, _, _| Ok(()));
+        {
+            let d = digest.clone();
+            t.expect_transform().returning(move |_, _, _| {
+                let id = Id::builder()
+                    .name("exec_mock".to_string())
+                    .digest(d.clone())
+                    .build();
+                TransformStatus::Success(
+                    StorageArtifact::builder()
+                        .media_type(MediaType::File(Compression::None))
+                        .config(ArtifactConfig::builder().id(id).build())
+                        .build(),
+                )
+            });
         }
-        async fn depends(&self) -> TransformResult<Vec<Addr>> {
-            Ok(Vec::new())
-        }
-        async fn prepare(&self, _log: &Log, _ctx: &Handle) -> TransformResult<()> {
-            Ok(())
-        }
-        async fn stage(
-            &self,
-            _log: &Log,
-            _ctx: &Handle,
-            _env: &Environment,
-        ) -> TransformResult<()> {
-            Ok(())
-        }
-        async fn transform(
-            &self,
-            _log: &Log,
-            _ctx: &Handle,
-            _env: &Environment,
-        ) -> TransformStatus {
-            TransformStatus::Success(mk_artifact(&self.digest))
-        }
-        fn can_shell(&self) -> bool {
-            false
-        }
-        fn shell(&self, _env: &Environment) -> TransformResult<()> {
-            Ok(())
-        }
+        t.expect_can_shell().return_const(false);
+        t.expect_shell().returning(|_| Ok(()));
+        Transform::new(t)
     }
 
     // ── actual test ─────────────────────────────────────────────────────────
@@ -305,11 +245,9 @@ mod tests {
         // so a Success path must still return the artifact cleanly.
         let handle = ctx.get_handle();
         let log = handle.log().create("execute-test").await.expect("log");
-        let farm = Farm::new(MiniFarmImpl);
+        let farm = mini_farm();
         let env = farm.create(&log, Path::new("/")).await.expect("env");
-        let transform = Transform::new(SuccessTransform {
-            digest: "deadbeef".to_string(),
-        });
+        let transform = success_transform("deadbeef");
 
         let artifact = execute(&log, &handle, &transform, &env)
             .await

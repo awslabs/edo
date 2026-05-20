@@ -89,7 +89,12 @@ impl SourceImpl for RemoteSource {
         let url = self.url.clone();
         async move {
             record!(log, "fetch", "fetching artifact from {url}");
-            let client = reqwest::Client::new();
+            let client = reqwest::Client::builder()
+                .user_agent(concat!("edo/", env!("CARGO_PKG_VERSION")))
+                .referer(false)
+                .redirect(reqwest::redirect::Policy::limited(10))
+                .build()
+                .context(error::RequestSnafu)?;
             let response = client
                 .get(url.clone())
                 .send()
@@ -162,11 +167,11 @@ impl SourceImpl for RemoteSource {
         if self.is_archive {
             trace!(component = "source", type = "remote", "staging contents of archive into {}", out.display());
             record!(log, "unpack", "extracting archive into {out:?}");
-            env.unpack(&out, reader).await?;
+            env.unpack_stream(&out, reader).await?;
         } else {
             trace!(component = "source", type = "remote", "staging file to {}", out.display());
             record!(log, "copy", "copying file to {out:?}");
-            env.write(&out, reader).await?;
+            env.write_stream(&out, reader).await?;
         }
         Ok(())
     }

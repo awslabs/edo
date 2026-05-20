@@ -54,4 +54,5 @@ uuid               = { workspace = true }
 which              = { workspace = true }
 
 [dev-dependencies]
+mockall     = { workspace = true }
 serial_test = { workspace = true }

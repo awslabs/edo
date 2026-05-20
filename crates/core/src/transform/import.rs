@@ -95,7 +95,7 @@ impl TransformImpl for ImportTransform {
                 .media_type(MediaType::Manifest)
                 .build();
             let writer = ctx.storage().safe_start_layer().await?;
-            env.read(Path::new("output"), writer.clone()).await?;
+            env.read_stream(Path::new("output"), writer.clone()).await?;
             artifact.layers_mut().push(
                 ctx.storage()
                     .safe_finish_layer(&MediaType::Tar(Compression::None), None, &writer)

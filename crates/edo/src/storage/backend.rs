@@ -2,6 +2,9 @@ use std::collections::BTreeSet;
 
 use arc_handle::arc_handle;
 use async_trait::async_trait;
+#[cfg(test)]
+#[allow(unused_imports)]
+use mockall::automock;
 use ocilot::models::Platform;
 
 use crate::util::{Reader, Writer};

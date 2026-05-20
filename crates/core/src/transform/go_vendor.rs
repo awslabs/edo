@@ -200,7 +200,7 @@ impl TransformImpl for GoVendorTransform {
             // Now we build an artifact containing an archive of the resulting vendor directories
             // that can overlay with the source
             let writer = ctx.storage().safe_start_layer().await?;
-            env.read(install_root.path(), writer.clone()).await?;
+            env.read_stream(install_root.path(), writer.clone()).await?;
             let layer = ctx.storage().safe_finish_layer(&MediaType::Tar(Compression::None), None, &writer).await?;
 
             let artifact = Artifact::builder()
