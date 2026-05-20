@@ -2,6 +2,8 @@ use super::SourceResult;
 use crate::context::Node;
 use arc_handle::arc_handle;
 use async_trait::async_trait;
+#[cfg(test)]
+use mockall::automock;
 use semver::{Version, VersionReq};
 use std::collections::{HashMap, HashSet};
 
@@ -11,6 +13,7 @@ use std::collections::{HashMap, HashSet};
 /// available versions and transitive dependencies, and later to materialize
 /// concrete [`Node`] definitions for fetching.
 #[arc_handle]
+#[cfg_attr(test, automock)]
 #[async_trait]
 pub trait Vendor {
     /// Get all versions of a given package/source name

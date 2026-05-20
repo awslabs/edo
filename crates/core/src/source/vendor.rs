@@ -214,8 +214,7 @@ impl SourceImpl for VendorSource {
         let layer = artifact.layers().first().unwrap();
         let reader = storage.safe_read(layer).await?;
         trace!(component = "source", type = "vendor", "staging contents to {}", out.display());
-        env.unpack(&out, reader).await?;
-
+        env.unpack_stream(&out, reader).await?;
         Ok(())
     }
 }

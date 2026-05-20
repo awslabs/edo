@@ -14,6 +14,8 @@ use crate::environment::Environment;
 use crate::storage::{Artifact, Id};
 use arc_handle::arc_handle;
 use async_trait::async_trait;
+#[cfg(test)]
+use mockall::automock;
 use std::path::PathBuf;
 
 /// Convenience result alias for fallible transform operations.
@@ -26,6 +28,7 @@ pub use error::TransformError;
 /// environment, and execute the actual build logic. The scheduler drives
 /// transforms through their lifecycle: `prepare` → `stage` → `transform`.
 #[arc_handle]
+#[cfg_attr(test, automock)]
 #[async_trait]
 pub trait Transform {
     /// Returns the address of the environment farm to use for execution.

@@ -112,6 +112,7 @@ impl SourceImpl for LocalSource {
                 self.path
             );
             let mut archive = Builder::new(writer.clone());
+            archive.mode(tokio_tar::HeaderMode::Complete);
             archive
                 .append_dir_all(".", &self.path)
                 .await
@@ -148,11 +149,11 @@ impl SourceImpl for LocalSource {
         if self.is_archive || matches!(layer.media_type(), MediaType::Tar(..)) {
             trace!(component = "source", type = "local", "staging contents of archive into {}", out.display());
             record!(log, "extract", "extracing archive into {out:?}");
-            env.unpack(&out, reader).await?;
+            env.unpack_stream(&out, reader).await?;
         } else {
             trace!(component = "source", type = "local", "staging file to {}", out.display());
             record!(log, "copy", "copying file to {out:?}");
-            env.write(&out, reader).await?;
+            env.write_stream(&out, reader).await?;
         }
         Ok(())
     }

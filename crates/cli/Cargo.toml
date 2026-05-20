@@ -15,6 +15,7 @@ bon               = "3.9.1"
 clap              = { workspace = true }
 edo               = { path = "../edo" }
 edo-core          = { path = "../core" }
+mockall = "0.14.0"
 snafu             = { workspace = true }
 tokio             = { workspace = true }
 tracing           = { workspace = true }

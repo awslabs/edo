@@ -22,11 +22,11 @@ use edo::{
     source::Source,
     storage::{Artifact, Compression, Config, Id, MediaType},
     transform::{TransformError, TransformImpl, TransformResult, TransformStatus},
-    util::Reader,
 };
 use indexmap::IndexMap;
 use snafu::OptionExt;
-use std::{collections::VecDeque, io::Cursor, path::Path};
+use std::collections::VecDeque;
+use std::path::Path;
 
 /// A transform that runs `cargo vendor` over one or more sources and packages
 /// the result (vendored crates + generated `.cargo/config.toml`) as an artifact.
@@ -225,17 +225,17 @@ impl TransformImpl for CargoVendorTransform {
             vfs.command("cargo-vendor", "cargo", args).await?;
 
             // Now we want to generate the config.toml
-            let cargo_config = cargo_dir.entry("config.toml").await;
-            let cargo_toml = r###"[source.crates-io]
+            let cargo_toml = format!(
+                r###"[source.crates-io]
 replace-with = "vendored-sources"
 
 [source.vendored-sources]
 directory = ".cargo/vendor"
 "###
-            .to_string();
-
-            let reader = Reader::new(Cursor::new(cargo_toml));
-            env.write(cargo_config.path(), reader).await?;
+            );
+            cargo_dir
+                .write("config.toml", cargo_toml.as_bytes())
+                .await?;
 
             // Now we build an artifact containing an archive of the resulting vendoring
             let mut artifact = Artifact::builder()
@@ -244,7 +244,7 @@ directory = ".cargo/vendor"
                 .build();
 
             let writer = ctx.storage().safe_start_layer().await?;
-            env.read(install_root.path(), writer.clone()).await?;
+            env.read_stream(install_root.path(), writer.clone()).await?;
 
             artifact.layers_mut().push(
                 ctx.storage()
