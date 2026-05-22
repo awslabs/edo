@@ -1,20 +1,18 @@
 use async_trait::async_trait;
 use edo::context::{Addr, Context, FromNode, Log, Node, non_configurable};
-use edo::environment::Environment;
 use edo::record;
 use edo::source::{SourceImpl, SourceResult};
-use edo::storage::{Artifact, Compression, Config, Id, MediaType, Storage};
+use edo::storage::{Artifact, Compression, Config, Id, LayerOptions, MediaType, Storage};
 use merkle_hash::MerkleTree;
 use snafu::{OptionExt, ResultExt};
-use std::path::{Path, PathBuf, absolute};
+use std::path::{PathBuf, absolute};
 use tokio::{fs::File, io::AsyncWriteExt};
 use tokio_tar::Builder;
 
 /// A source backed by a local filesystem path.
 pub struct LocalSource {
     path: PathBuf,
-    out: PathBuf,
-    is_archive: bool,
+    out: Option<PathBuf>,
 }
 
 #[async_trait]
@@ -22,7 +20,7 @@ impl FromNode for LocalSource {
     type Error = error::Error;
 
     async fn from_node(_: &Addr, node: &Node, _: &Context) -> Result<Self, error::Error> {
-        node.validate_keys(&["path", "out", "is_archive"])?;
+        node.validate_keys(&["path"])?;
         let path = node
             .get("path")
             .unwrap()
@@ -33,24 +31,11 @@ impl FromNode for LocalSource {
             })?;
         let out = node
             .get("out")
-            .unwrap()
-            .as_string()
-            .context(error::FieldSnafu {
-                field: "out",
-                type_: "string",
-            })?;
-        let is_archive = node
-            .get("is_archive")
-            .unwrap()
-            .as_bool()
-            .context(error::FieldSnafu {
-                field: "is_archive",
-                type_: "bool",
-            })?;
+            .and_then(|x| x.as_string())
+            .map(PathBuf::from);
         Ok(Self {
             path: PathBuf::from(path),
-            out: PathBuf::from(out),
-            is_archive,
+            out,
         })
     }
 }
@@ -94,14 +79,25 @@ impl SourceImpl for LocalSource {
         // Start our layer
         let mut writer = storage.safe_start_layer().await?;
         // If the path is a file we do that
-        let media_type = if self.path.is_file() {
+        let (media_type, path_hint) = if self.path.is_file() {
             trace!(component = "source", type = "local", "reading file at {}", self.path.display());
             let mut reader = File::open(&self.path).await.context(error::ReadFileSnafu)?;
             record!(log, "copy", "storing file from {:?}", self.path);
             tokio::io::copy(&mut reader, &mut writer)
                 .await
                 .context(error::ReadFileSnafu)?;
-            MediaType::File(Compression::None)
+            (
+                MediaType::File(Compression::None),
+                Some(
+                    self.out.clone().unwrap_or(
+                        self.path
+                            .file_name()
+                            .map(|x| x.to_str().unwrap())
+                            .map(PathBuf::from)
+                            .unwrap(),
+                    ),
+                ),
+            )
         } else {
             // We want to archive it if its a directory
             trace!(component = "source", type = "local", "archiving directory at {}", self.path.display());
@@ -118,44 +114,24 @@ impl SourceImpl for LocalSource {
                 .await
                 .context(error::ArchiveSnafu)?;
             archive.finish().await.context(error::ArchiveSnafu)?;
-            MediaType::Tar(Compression::None)
+            (MediaType::Tar(Compression::None), self.out.clone())
         };
         writer.flush().await.context(error::ReadFileSnafu)?;
         // Save the layer
         artifact.layers_mut().push(
             storage
-                .safe_finish_layer(&media_type, None, &writer)
+                .safe_finish_layer(
+                    &writer,
+                    &LayerOptions::builder()
+                        .media_type(media_type)
+                        .maybe_path_hint(path_hint)
+                        .build(),
+                )
                 .await?,
         );
         // Save the artifact
         storage.safe_save(&artifact).await?;
         Ok(artifact)
-    }
-
-    async fn stage(
-        &self,
-        log: &Log,
-        storage: &Storage,
-        env: &Environment,
-        path: &Path,
-    ) -> SourceResult<()> {
-        // Staging is rather simple as we just want to move the remote file to the expected location
-        let out = path.join(self.out.clone());
-        let id = self.get_unique_id().await?;
-        // Get the artifact
-        let artifact = storage.safe_open(&id).await?;
-        let layer = artifact.layers().first().unwrap();
-        let reader = storage.safe_read(layer).await?;
-        if self.is_archive || matches!(layer.media_type(), MediaType::Tar(..)) {
-            trace!(component = "source", type = "local", "staging contents of archive into {}", out.display());
-            record!(log, "extract", "extracing archive into {out:?}");
-            env.unpack_stream(&out, reader).await?;
-        } else {
-            trace!(component = "source", type = "local", "staging file to {}", out.display());
-            record!(log, "copy", "copying file to {out:?}");
-            env.write_stream(&out, reader).await?;
-        }
-        Ok(())
     }
 }
 

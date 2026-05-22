@@ -1361,6 +1361,7 @@ version = "0.1.0"
 dependencies = [
  "arc-handle",
  "astral-tokio-tar",
+ "async-compression",
  "async-recursion",
  "async-trait",
  "aws-config",

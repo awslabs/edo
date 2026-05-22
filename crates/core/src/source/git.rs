@@ -1,13 +1,12 @@
 use async_trait::async_trait;
 use edo::context::{Addr, Context, FromNode, Log, Node, non_configurable};
-use edo::environment::Environment;
 use edo::record;
 use edo::source::{SourceImpl, SourceResult};
-use edo::storage::{Artifact, Compression, Config, Id, MediaType, Storage};
+use edo::storage::{Artifact, Compression, Config, Id, LayerOptions, MediaType, Storage};
 use edo::util::cmd_noinput;
 use snafu::{OptionExt, ResultExt};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use tempfile::tempdir;
 use tokio::io::AsyncWriteExt;
 use tracing::Instrument;
@@ -16,7 +15,7 @@ use tracing::Instrument;
 pub struct GitSource {
     url: String,
     reference: String,
-    out: PathBuf,
+    out: Option<PathBuf>,
 }
 
 #[async_trait]
@@ -24,7 +23,7 @@ impl FromNode for GitSource {
     type Error = error::Error;
 
     async fn from_node(_addr: &Addr, node: &Node, _: &Context) -> Result<Self, error::Error> {
-        node.validate_keys(&["url", "ref", "out"])?;
+        node.validate_keys(&["url", "ref"])?;
         let url = node
             .get("url")
             .unwrap()
@@ -43,16 +42,12 @@ impl FromNode for GitSource {
             })?;
         let out = node
             .get("out")
-            .unwrap()
-            .as_string()
-            .context(error::FieldSnafu {
-                field: "out",
-                type_: "string",
-            })?;
+            .and_then(|x| x.as_string())
+            .map(PathBuf::from);
         Ok(Self {
             url,
             reference,
-            out: PathBuf::from(out),
+            out,
         })
     }
 }
@@ -117,7 +112,13 @@ impl SourceImpl for GitSource {
             // Now we can add the the layer to the artifact
             artifact.layers_mut().push(
                 storage
-                    .safe_finish_layer(&MediaType::Tar(Compression::None), None, &writer)
+                    .safe_finish_layer(
+                        &writer,
+                        &LayerOptions::builder()
+                            .media_type(MediaType::Tar(Compression::None))
+                            .maybe_path_hint(self.out.clone())
+                            .build(),
+                    )
                     .await?,
             );
             // Now save the artifact itself
@@ -131,31 +132,6 @@ impl SourceImpl for GitSource {
             component = "source"
         ))
         .await
-    }
-
-    async fn stage(
-        &self,
-        log: &Log,
-        storage: &Storage,
-        env: &Environment,
-        path: &Path,
-    ) -> SourceResult<()> {
-        let out_path = path.join(self.out.clone());
-        trace!(component = "source", type = "git", "staging into {}", out_path.display());
-        // We want to open the artifact manifest first
-        let id = self.get_unique_id().await?;
-        record!(
-            log,
-            "unpack",
-            "unpacking git repository ({id}) into {out_path:?}"
-        );
-        let artifact = storage.safe_open(&id).await?;
-        // There should only be 1 layer that is our target
-        let reader = storage
-            .safe_read(artifact.layers().first().unwrap())
-            .await?;
-        env.unpack_stream(&out_path, reader).await?;
-        Ok(())
     }
 }
 

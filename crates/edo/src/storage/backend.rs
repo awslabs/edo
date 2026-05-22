@@ -5,12 +5,11 @@ use async_trait::async_trait;
 #[cfg(test)]
 #[allow(unused_imports)]
 use mockall::automock;
-use ocilot::models::Platform;
 
+use crate::storage::LayerOptions;
 use crate::util::{Reader, Writer};
 
 use super::StorageResult;
-use super::artifact::MediaType;
 use super::{
     artifact::{Artifact, Layer},
     id::Id,
@@ -45,10 +44,5 @@ pub trait Backend {
     /// Creates a new layer writer for an artifact
     async fn start_layer(&self) -> StorageResult<Writer>;
     /// Saves and adds a layer to an artifact
-    async fn finish_layer(
-        &self,
-        media_type: &MediaType,
-        platform: Option<Platform>,
-        writer: &Writer,
-    ) -> StorageResult<Layer>;
+    async fn finish_layer(&self, writer: &Writer, options: &LayerOptions) -> StorageResult<Layer>;
 }

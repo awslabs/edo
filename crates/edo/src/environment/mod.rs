@@ -11,7 +11,9 @@
 
 use super::storage::Id;
 use super::storage::Storage;
+use crate::context::Handle;
 use crate::context::Log;
+use crate::storage::ArtifactStageOptions;
 use crate::util::{Reader, Writer};
 use arc_handle::arc_handle;
 use async_trait::async_trait;
@@ -63,4 +65,36 @@ pub trait Environment {
     async fn execute(&self, log: &Log, id: &Id, path: &Path, command: &str) -> EnvResult<bool>;
     /// Open a shell in the environment
     fn shell(&self, path: &Path) -> EnvResult<()>;
+}
+
+impl Environment {
+    /// Helper that stages an artifact from storage into an environment
+    /// using the media_type to determine how
+    pub async fn stage(&self, ctx: &Handle, options: ArtifactStageOptions) -> EnvResult<()> {
+        let artifact = ctx.storage().safe_open(options.id()).await?;
+        for layer in artifact.layers() {
+            let mut reader = ctx.storage().safe_read(layer).await?;
+            if layer.media_type().is_compressed() && options.decompress() {
+                reader = Reader::with_decompression(reader, &layer.media_type().compression());
+            }
+            if layer.media_type().is_archive() && options.extract() {
+                let path = if let Some(hint) = layer.path_hint() {
+                    options.path().join(hint)
+                } else {
+                    options.path().to_path_buf()
+                };
+                self.unpack_stream(&path, reader).await?;
+            } else {
+                // We assume path is a directory if we are writing a file we need to pick a filename
+                // we do this by seeing if a filename has been set
+                let filename = layer
+                    .path_hint()
+                    .clone()
+                    .unwrap_or(PathBuf::from(layer.digest().digest()));
+                let filepath = options.path().join(filename);
+                self.write_stream(&filepath, reader).await?;
+            }
+        }
+        Ok(())
+    }
 }

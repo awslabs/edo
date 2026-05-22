@@ -1,3 +1,8 @@
+use crate::storage::Compression;
+use async_compression::tokio::write::{
+    BzDecoder, BzEncoder, GzipDecoder, GzipEncoder, LzmaDecoder, LzmaEncoder, XzDecoder, XzEncoder,
+    ZstdDecoder, ZstdEncoder,
+};
 use parking_lot::Mutex;
 use std::pin::Pin;
 use std::rc::Rc;
@@ -19,6 +24,54 @@ impl Writer {
         Self {
             inner: Rc::new(Mutex::new(Inner {
                 writer: Box::pin(writer),
+                hash: blake3::Hasher::new(),
+                digest: None,
+                size: 0,
+                target,
+            })),
+        }
+    }
+
+    /// Wrap an async writer with compression enabled
+    pub fn with_compression(
+        target: String,
+        writer: impl AsyncWrite + Send + Sync + 'static,
+        compression: &Compression,
+    ) -> Self {
+        Self {
+            inner: Rc::new(Mutex::new(Inner {
+                writer: match compression {
+                    Compression::Bzip2 => Box::pin(BzEncoder::new(writer)),
+                    Compression::Gzip => Box::pin(GzipEncoder::new(writer)),
+                    Compression::Lz => Box::pin(LzmaEncoder::new(writer)),
+                    Compression::Xz => Box::pin(XzEncoder::new(writer)),
+                    Compression::Zstd => Box::pin(ZstdEncoder::new(writer)),
+                    Compression::None => Box::pin(writer),
+                },
+                hash: blake3::Hasher::new(),
+                digest: None,
+                size: 0,
+                target,
+            })),
+        }
+    }
+
+    /// Wrap an async writer with compression enabled
+    pub fn with_decompression(
+        target: String,
+        writer: impl AsyncWrite + Send + Sync + 'static,
+        compression: &Compression,
+    ) -> Self {
+        Self {
+            inner: Rc::new(Mutex::new(Inner {
+                writer: match compression {
+                    Compression::Bzip2 => Box::pin(BzDecoder::new(writer)),
+                    Compression::Gzip => Box::pin(GzipDecoder::new(writer)),
+                    Compression::Lz => Box::pin(LzmaDecoder::new(writer)),
+                    Compression::Xz => Box::pin(XzDecoder::new(writer)),
+                    Compression::Zstd => Box::pin(ZstdDecoder::new(writer)),
+                    Compression::None => Box::pin(writer),
+                },
                 hash: blake3::Hasher::new(),
                 digest: None,
                 size: 0,

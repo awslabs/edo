@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use snafu::ResultExt;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 const ARTIFACT_SCHEMA_VERSION: &str = "v1";
@@ -93,6 +94,22 @@ pub enum MediaType {
 }
 
 impl MediaType {
+    pub fn detect(input: &str) -> StorageResult<MediaType> {
+        let (stripped, compression) = Compression::detect(input)?;
+        if stripped.contains(".tar") {
+            Ok(MediaType::Tar(compression))
+        } else if stripped.contains(".zip") {
+            Ok(MediaType::Zip(compression))
+        } else {
+            Ok(MediaType::File(compression))
+        }
+    }
+
+    /// Returns `true` if the media type is an archive (tar or zip)
+    pub fn is_archive(&self) -> bool {
+        matches!(self, Self::Tar(..) | Self::Zip(..))
+    }
+
     /// Returns `true` if the media type carries a non-`None` compression.
     pub fn is_compressed(&self) -> bool {
         match self {
@@ -103,6 +120,19 @@ impl MediaType {
             | Self::Image(comp)
             | Self::Zip(comp)
             | Self::Custom(_, comp) => !matches!(comp, Compression::None),
+        }
+    }
+
+    /// Returns the compression setting
+    pub fn compression(&self) -> Compression {
+        match self {
+            Self::Manifest => Compression::None,
+            Self::File(comp)
+            | Self::Tar(comp)
+            | Self::Oci(comp)
+            | Self::Image(comp)
+            | Self::Zip(comp)
+            | Self::Custom(_, comp) => comp.clone(),
         }
     }
 
@@ -300,6 +330,34 @@ pub struct Layer {
     size: usize,
     #[builder(into)]
     platform: Option<Platform>,
+    #[builder(into)]
+    path_hint: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Builder)]
+pub struct LayerOptions {
+    #[builder(into)]
+    media_type: MediaType,
+    #[builder(into)]
+    path_hint: Option<PathBuf>,
+    #[builder(into)]
+    platform: Option<Platform>,
+}
+
+impl LayerOptions {
+    handle!(media_type, media_type_mut, media_type, MediaType);
+    handle!(path_hint, path_hint_mut, path_hint, Option<PathBuf>);
+    handle!(platform, platform_mut, platform, Option<Platform>);
+
+    pub fn create<L: Into<LayerDigest>>(&self, digest: L, size: usize) -> Layer {
+        Layer::builder()
+            .media_type(self.media_type.clone())
+            .digest(digest.into())
+            .size(size)
+            .maybe_platform(self.platform.clone())
+            .maybe_path_hint(self.path_hint.clone())
+            .build()
+    }
 }
 
 impl Layer {
@@ -307,6 +365,7 @@ impl Layer {
     handle!(digest, digest_mut, digest, LayerDigest);
     handle!(size, size_mut, size, usize);
     handle!(platform, platform_mut, platform, Option<Platform>);
+    handle!(path_hint, path_hint_mut, path_hint, Option<PathBuf>);
 }
 
 /// An artifact is used to store any data in-flight or final. All artifacts are stored and represented
@@ -328,4 +387,38 @@ impl Artifact {
     handle!(config, config_mut, config, Config);
     handle!(media_type, media_type_mut, media_type, MediaType);
     handle!(layers, layers_mut, layers, Vec<Layer>);
+}
+
+#[derive(Debug, Clone, Builder)]
+pub struct ArtifactStageOptions {
+    // Id to stage
+    #[builder(into)]
+    id: Id,
+    // Path to stage the artifact
+    #[builder(into)]
+    path: PathBuf,
+    // If this artifact layer is compressed, decompress it
+    #[builder(into, default = true)]
+    decompress: bool,
+    // If this is an archive extract it when staging
+    #[builder(into, default = true)]
+    extract: bool,
+}
+
+impl ArtifactStageOptions {
+    pub fn id(&self) -> &Id {
+        &self.id
+    }
+
+    pub fn path(&self) -> &Path {
+        self.path.as_path()
+    }
+
+    pub fn decompress(&self) -> bool {
+        self.decompress
+    }
+
+    pub fn extract(&self) -> bool {
+        self.extract
+    }
 }

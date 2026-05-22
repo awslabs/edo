@@ -2,7 +2,9 @@ use async_trait::async_trait;
 use edo::context::{Addr, Context, FromNode, Handle, Log, Node, non_configurable};
 use edo::environment::Environment;
 use edo::source::Source;
-use edo::storage::{Artifact, Compression, Config, Id, MediaType};
+use edo::storage::{
+    Artifact, ArtifactStageOptions, Compression, Config, Id, LayerOptions, MediaType,
+};
 use edo::transform::{TransformImpl, TransformResult, TransformStatus};
 use indexmap::IndexMap;
 use std::path::Path;
@@ -71,16 +73,20 @@ impl TransformImpl for ImportTransform {
         Ok(())
     }
 
-    async fn stage(&self, log: &Log, ctx: &Handle, env: &Environment) -> TransformResult<()> {
+    async fn stage(&self, _log: &Log, ctx: &Handle, env: &Environment) -> TransformResult<()> {
         // Create the output directory
-        env.create_dir(Path::new("output")).await?;
+        let output = Path::new("output");
+        env.create_dir(output).await?;
 
         // Stage all the sources in the output directory
         for (addr, source) in self.sources.iter() {
             trace!(component = "transform", type = "import", "staging source {addr}");
-            source
-                .stage(log, ctx.storage(), env, Path::new("output"))
-                .await?;
+            let id = source.get_unique_id().await?;
+            env.stage(
+                ctx,
+                ArtifactStageOptions::builder().id(id).path(output).build(),
+            )
+            .await?;
         }
 
         Ok(())
@@ -98,7 +104,12 @@ impl TransformImpl for ImportTransform {
             env.read_stream(Path::new("output"), writer.clone()).await?;
             artifact.layers_mut().push(
                 ctx.storage()
-                    .safe_finish_layer(&MediaType::Tar(Compression::None), None, &writer)
+                    .safe_finish_layer(
+                        &writer,
+                        &LayerOptions::builder()
+                            .media_type(MediaType::Tar(Compression::None))
+                            .build(),
+                    )
                     .await?,
             );
             ctx.storage().safe_save(&artifact).await?;

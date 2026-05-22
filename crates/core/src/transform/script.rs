@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 use edo::context::{Addr, Context, FromNode, Handle, Log, Node, non_configurable};
 use edo::environment::{Environment, Vfs};
 use edo::source::Source;
-use edo::storage::{Artifact, Compression, Config, Id, MediaType};
+use edo::storage::{
+    Artifact, ArtifactStageOptions, Compression, Config, Id, LayerOptions, MediaType,
+};
 use edo::transform::{TransformError, TransformImpl, TransformResult, TransformStatus};
 
 use async_trait::async_trait;
@@ -154,7 +156,7 @@ impl TransformImpl for ScriptTransform {
         Ok(())
     }
 
-    async fn stage(&self, log: &Log, ctx: &Handle, env: &Environment) -> TransformResult<()> {
+    async fn stage(&self, _log: &Log, ctx: &Handle, env: &Environment) -> TransformResult<()> {
         // First we want to create our build-root and install-roots
         let build_root = Path::new("build-root");
         env.create_dir(build_root).await?;
@@ -186,7 +188,14 @@ impl TransformImpl for ScriptTransform {
         // Stage all sources in our build-root
         for (addr, source) in self.sources.iter() {
             trace!(component = "transform", type = "script", "staging source {addr}");
-            source.stage(log, ctx.storage(), env, build_root).await?;
+            env.stage(
+                ctx,
+                ArtifactStageOptions::builder()
+                    .id(source.get_unique_id().await?)
+                    .path(build_root)
+                    .build(),
+            )
+            .await?;
         }
         Ok(())
     }
@@ -254,18 +263,20 @@ impl TransformImpl for ScriptTransform {
             artifact.layers_mut().push(
                 ctx.storage()
                     .safe_finish_layer(
-                        &MediaType::Tar(Compression::None),
-                        Some(
-                            Platform::builder()
-                                .os(std::env::consts::OS)
-                                .architecture(
-                                    self.arch
-                                        .clone()
-                                        .unwrap_or(std::env::consts::OS.to_string()),
-                                )
-                                .build(),
-                        ),
                         &writer,
+                        &LayerOptions::builder()
+                            .media_type(MediaType::Tar(Compression::None))
+                            .platform(
+                                Platform::builder()
+                                    .os(std::env::consts::OS)
+                                    .architecture(
+                                        self.arch
+                                            .clone()
+                                            .unwrap_or(std::env::consts::ARCH.to_string()),
+                                    )
+                                    .build(),
+                            )
+                            .build(),
                     )
                     .await?,
             );

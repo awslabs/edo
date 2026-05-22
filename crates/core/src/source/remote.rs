@@ -1,25 +1,23 @@
 use async_trait::async_trait;
 use edo::record;
+use edo::storage::LayerOptions;
 use futures::TryStreamExt;
 use serde_json::json;
 use snafu::{OptionExt, ResultExt, ensure};
-use std::path::Path;
 use std::path::PathBuf;
 use tokio_util::io::StreamReader;
 use tracing::Instrument;
 use url::Url;
 
 use edo::context::{Addr, Context, FromNode, Log, Node, non_configurable};
-use edo::environment::Environment;
 use edo::source::{SourceImpl, SourceResult};
-use edo::storage::{Artifact, Compression, Config, Id, MediaType, Storage};
+use edo::storage::{Artifact, Config, Id, MediaType, Storage};
 
 /// A source that fetches a file from a remote URL and stores it as an artifact.
 pub struct RemoteSource {
     url: Url,
     digest: String,
-    out: PathBuf,
-    is_archive: bool,
+    out: Option<PathBuf>,
 }
 
 #[async_trait]
@@ -42,16 +40,8 @@ impl FromNode for RemoteSource {
             })?;
         let out = node
             .get("out")
-            .unwrap()
-            .as_string()
-            .context(error::FieldSnafu {
-                field: "out",
-                type_: "string",
-            })?;
-        let is_archive = node
-            .get("is_archive")
-            .and_then(|x| x.as_bool())
-            .unwrap_or_default();
+            .and_then(|x| x.as_string())
+            .map(PathBuf::from);
         let digest = node
             .get("ref")
             .unwrap()
@@ -62,8 +52,7 @@ impl FromNode for RemoteSource {
             })?;
         Ok(Self {
             url: Url::parse(&url).context(error::UrlSnafu)?,
-            out: PathBuf::from(out),
-            is_archive,
+            out,
             digest,
         })
     }
@@ -128,8 +117,16 @@ impl SourceImpl for RemoteSource {
             tokio::io::copy(&mut reader, &mut writer)
                 .await
                 .context(error::IoSnafu)?;
+            // Determine the mediatype from the url
+            let media_type = MediaType::detect(url.as_str())?;
             let layer = storage
-                .safe_finish_layer(&MediaType::File(Compression::None), None, &writer)
+                .safe_finish_layer(
+                    &writer,
+                    &LayerOptions::builder()
+                        .media_type(media_type)
+                        .maybe_path_hint(self.out.clone())
+                        .build(),
+                )
                 .await?;
             artifact.layers_mut().push(layer.clone());
 
@@ -149,31 +146,6 @@ impl SourceImpl for RemoteSource {
             url = self.url.clone().to_string(),
         ))
         .await
-    }
-
-    async fn stage(
-        &self,
-        log: &Log,
-        storage: &Storage,
-        env: &Environment,
-        path: &Path,
-    ) -> SourceResult<()> {
-        // Staging is rather simple as we just want to move the remote file to the expected location
-        let id = self.get_unique_id().await?;
-        let out = path.join(self.out.clone());
-        let artifact = storage.safe_open(&id).await?;
-        let layer = artifact.layers().first().unwrap();
-        let reader = storage.safe_read(layer).await?;
-        if self.is_archive {
-            trace!(component = "source", type = "remote", "staging contents of archive into {}", out.display());
-            record!(log, "unpack", "extracting archive into {out:?}");
-            env.unpack_stream(&out, reader).await?;
-        } else {
-            trace!(component = "source", type = "remote", "staging file to {}", out.display());
-            record!(log, "copy", "copying file to {out:?}");
-            env.write_stream(&out, reader).await?;
-        }
-        Ok(())
     }
 }
 

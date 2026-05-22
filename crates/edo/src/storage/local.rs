@@ -3,10 +3,9 @@ use std::path::{Path, PathBuf};
 
 use crate::context::{Addr, Config, FromNodeNoContext, Node};
 use crate::non_configurable_no_context;
-use crate::storage::{Artifact, BackendImpl, Id, Layer, MediaType, StorageResult};
+use crate::storage::{Artifact, BackendImpl, Id, Layer, LayerOptions, StorageResult};
 use crate::util::{Reader, Writer};
 use async_trait::async_trait;
-use ocilot::models::Platform;
 use parking_lot::RwLock;
 use snafu::{OptionExt, ResultExt, ensure};
 use tokio::fs::{File, OpenOptions};
@@ -250,23 +249,13 @@ impl BackendImpl for LocalBackend {
         ))
     }
 
-    async fn finish_layer(
-        &self,
-        media_type: &MediaType,
-        platform: Option<Platform>,
-        writer: &Writer,
-    ) -> StorageResult<Layer> {
+    async fn finish_layer(&self, writer: &Writer, options: &LayerOptions) -> StorageResult<Layer> {
         // The writer will contain the temporary file name to use
         let tmp_path = self.layer_dir.join(writer.target());
         // Now we want to calculate the digest
         let digest = writer.finish().await;
         let target_path = self.layer_dir.join(digest.clone());
-        let layer = Layer::builder()
-            .digest(digest.clone())
-            .media_type(media_type.clone())
-            .size(writer.size())
-            .maybe_platform(platform)
-            .build();
+        let layer = options.create(digest, writer.size());
 
         // Copy the layer to the appropriate place
         if tmp_path != target_path {

@@ -27,7 +27,7 @@ use edo::{
     environment::{Environment, Vfs},
     non_configurable,
     source::Source,
-    storage::{Artifact, Compression, Config, Id, MediaType},
+    storage::{Artifact, ArtifactStageOptions, Compression, Config, Id, LayerOptions, MediaType},
     transform::{TransformError, TransformImpl, TransformResult, TransformStatus},
 };
 use snafu::OptionExt;
@@ -141,16 +141,21 @@ impl TransformImpl for GoVendorTransform {
     /// Stages the source flat under `build-root/` in the environment. Go
     /// vendoring is path-centric, so module paths from
     /// [`modules`](Self::modules) are interpreted relative to this directory.
-    async fn stage(&self, log: &Log, ctx: &Handle, env: &Environment) -> TransformResult<()> {
+    async fn stage(&self, _log: &Log, ctx: &Handle, env: &Environment) -> TransformResult<()> {
         // Due to go vendoring being very path centric we expect that if we are given multiple sources
         // they will be used staged flattened out
         let build_root = Path::new("build-root");
         env.create_dir(build_root).await?;
 
-        // For each source we are going to stage things into addr centered directories
-        self.source
-            .stage(log, ctx.storage(), env, build_root)
-            .await?;
+        let source_id = self.source.get_unique_id().await?;
+        env.stage(
+            ctx,
+            ArtifactStageOptions::builder()
+                .id(source_id)
+                .path(build_root)
+                .build(),
+        )
+        .await?;
         Ok(())
     }
 
@@ -201,7 +206,10 @@ impl TransformImpl for GoVendorTransform {
             // that can overlay with the source
             let writer = ctx.storage().safe_start_layer().await?;
             env.read_stream(install_root.path(), writer.clone()).await?;
-            let layer = ctx.storage().safe_finish_layer(&MediaType::Tar(Compression::None), None, &writer).await?;
+            let layer = ctx.storage().safe_finish_layer(&writer, &LayerOptions::builder()
+                .media_type(MediaType::Tar(Compression::None))
+                .build()
+            ).await?;
 
             let artifact = Artifact::builder()
                 .config(Config::builder()

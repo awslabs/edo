@@ -4,12 +4,10 @@ use ocilot::{index::Index, models::Platform, uri::Uri};
 use snafu::ensure;
 use snafu::{OptionExt, ResultExt};
 use std::collections::BTreeSet;
-use std::path::Path;
 
 use edo::context::{Addr, Context, FromNode, Log, Node, non_configurable};
-use edo::environment::Environment;
 use edo::source::{SourceImpl, SourceResult};
-use edo::storage::{Artifact, Compression, Config, Id, MediaType, Storage};
+use edo::storage::{Artifact, Compression, Config, Id, LayerOptions, MediaType, Storage};
 
 /// A OCI Image source is used to fetch
 /// an oci image to use as a container image
@@ -121,26 +119,16 @@ impl SourceImpl for ImageSource {
             .context(error::OciSnafu)?;
         let layer = storage
             .safe_finish_layer(
-                &MediaType::Oci(Compression::None),
-                Some(self.platform.clone()),
                 &writer,
+                &LayerOptions::builder()
+                    .media_type(MediaType::Oci(Compression::None))
+                    .platform(self.platform.clone())
+                    .build(),
             )
             .await?;
         artifact.layers_mut().push(layer);
         storage.safe_save(&artifact).await?;
         Ok(artifact.clone())
-    }
-
-    async fn stage(
-        &self,
-        _log: &Log,
-        _storage: &Storage,
-        _env: &Environment,
-        _path: &Path,
-    ) -> SourceResult<()> {
-        // An oci image does not get staged at all
-        // TODO: Implement the parallel extract here
-        Ok(())
     }
 }
 

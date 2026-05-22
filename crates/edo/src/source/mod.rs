@@ -9,9 +9,10 @@
 //! All fallible operations return [`SourceResult`], with failures modelled by
 //! [`SourceError`].
 
-use crate::context::Log;
+use crate::context::{Handle, Log};
 use crate::environment::Environment;
 use crate::storage::{Artifact, Id, Storage};
+use crate::util::Reader;
 use arc_handle::arc_handle;
 use async_trait::async_trait;
 #[cfg(test)]
@@ -45,14 +46,6 @@ pub trait Source {
     async fn get_unique_id(&self) -> SourceResult<Id>;
     /// Fetch the given source to storage
     async fn fetch(&self, log: &Log, storage: &Storage) -> SourceResult<Artifact>;
-    /// Stage the source into the given environment and path
-    async fn stage(
-        &self,
-        log: &Log,
-        storage: &Storage,
-        env: &Environment,
-        path: &Path,
-    ) -> SourceResult<()>;
 }
 
 impl Source {
@@ -70,5 +63,30 @@ impl Source {
         }
         // Otherwise perform the fetch
         self.fetch(log, storage).await
+    }
+
+    /// Helper for staging sources off their layer media_types instead of deferring
+    /// to an individual's source stage logic. Transforms may just want flat extracts.
+    /// this will also ignore the source specific out transforms
+    pub async fn stage_by_mediatype(
+        &self,
+        ctx: &Handle,
+        env: &Environment,
+        path: &Path,
+    ) -> SourceResult<()> {
+        let id = self.get_unique_id().await?;
+        let artifact = ctx.storage().safe_open(&id).await?;
+        for layer in artifact.layers() {
+            let mut reader = ctx.storage().safe_read(layer).await?;
+            if layer.media_type().is_compressed() {
+                reader = Reader::with_decompression(reader, &layer.media_type().compression());
+            }
+            if layer.media_type().is_archive() {
+                env.unpack_stream(path, reader).await?;
+            } else {
+                env.write_stream(path, reader).await?;
+            }
+        }
+        Ok(())
     }
 }

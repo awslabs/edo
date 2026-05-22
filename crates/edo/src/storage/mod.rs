@@ -24,7 +24,6 @@ pub use error::StorageResult;
 use futures::future::try_join_all;
 pub use id::*;
 pub use local::*;
-use ocilot::models::Platform;
 use tokio::task::JoinError;
 
 use crate::util::{Reader, Writer};
@@ -143,11 +142,10 @@ impl Inner {
     // Finish writing a new layer
     async fn safe_finish_layer(
         &self,
-        media_type: &MediaType,
-        platform: Option<Platform>,
         writer: &Writer,
+        options: &LayerOptions,
     ) -> StorageResult<Layer> {
-        self.local.finish_layer(media_type, platform, writer).await
+        self.local.finish_layer(writer, options).await
     }
 
     // Save the artifact in the local cache
@@ -173,7 +171,12 @@ impl Inner {
                 let mut reader = backend.read(&layer).await?;
                 let mut writer = local.start_layer().await?;
                 tokio::io::copy(&mut reader, &mut writer).await.context(error::IoSnafu)?;
-                local.finish_layer(layer.media_type(), layer.platform().clone(), &writer).await?;
+                local.finish_layer(
+                    &writer, &LayerOptions::builder()
+                        .media_type(layer.media_type().clone())
+                        .maybe_platform(layer.platform().clone())
+                        .maybe_path_hint(layer.path_hint().clone())
+                        .build()).await?;
                 Ok(())
             }.instrument(info_span!(target: "storage", "downloading", id = artifact.config().id().to_string(), digest = digest))));
         }
@@ -195,7 +198,12 @@ impl Inner {
                 let mut reader = local.read(&layer).await?;
                 let mut writer = backend.start_layer().await?;
                 tokio::io::copy(&mut reader, &mut writer).await.context(error::IoSnafu)?;
-                backend.finish_layer(layer.media_type(), layer.platform().clone(), &writer).await?;
+                backend.finish_layer(&writer, &LayerOptions::builder()
+                    .media_type(layer.media_type().clone())
+                    .maybe_path_hint(layer.path_hint().clone())
+                    .maybe_platform(layer.platform().clone())
+                    .build()
+                ).await?;
                 Ok(())
             }.instrument(info_span!(target: "storage", "uploading", id = artifact.config().id().to_string(), digest = digest))));
         }
@@ -356,14 +364,13 @@ impl Storage {
     /// Finish writing of a local layer
     pub async fn safe_finish_layer(
         &self,
-        media_type: &MediaType,
-        platform: Option<Platform>,
         writer: &Writer,
+        options: &LayerOptions,
     ) -> StorageResult<Layer> {
         self.inner
             .write()
             .await
-            .safe_finish_layer(media_type, platform, writer)
+            .safe_finish_layer(writer, options)
             .await
     }
 

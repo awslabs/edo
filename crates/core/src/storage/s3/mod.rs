@@ -8,10 +8,9 @@ use aws_sdk_s3::{
 use edo::{
     context::{Addr, Config, FromNodeNoContext, Node},
     non_configurable_no_context,
-    storage::{Artifact, BackendImpl, Id, Layer, MediaType, StorageResult},
+    storage::{Artifact, BackendImpl, Id, Layer, LayerOptions, StorageResult},
     util::{Reader, Writer},
 };
-use ocilot::models::Platform;
 use snafu::{OptionExt, ResultExt};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -329,23 +328,13 @@ impl BackendImpl for S3Backend {
         ))
     }
 
-    async fn finish_layer(
-        &self,
-        media_type: &MediaType,
-        platform: Option<Platform>,
-        writer: &Writer,
-    ) -> StorageResult<Layer> {
+    async fn finish_layer(&self, writer: &Writer, options: &LayerOptions) -> StorageResult<Layer> {
         // The writer will contain the temporary file name to use
         let tmp_path = std::env::temp_dir().join(writer.target());
         // Now we want to calculate the digest
         let digest = writer.finish().await;
         let target_path = self.blob_key().join(digest.clone());
-        let layer = Layer::builder()
-            .digest(digest.clone())
-            .media_type(media_type.clone())
-            .size(writer.size())
-            .maybe_platform(platform)
-            .build();
+        let layer = options.create(digest, writer.size());
 
         let mut file = tokio::fs::File::open(&tmp_path)
             .await
