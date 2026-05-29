@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use edo::context::{Addr, Context, FromNode, Handle, Log, Node, non_configurable};
+use edo::context::{Addr, Context, Element, FromElement, Handle, Log};
 use edo::environment::Environment;
 use edo::source::Source;
 use edo::storage::{
@@ -7,31 +7,41 @@ use edo::storage::{
 };
 use edo::transform::{TransformImpl, TransformResult, TransformStatus};
 use indexmap::IndexMap;
+use snafu::OptionExt;
 use std::path::Path;
 
 /// A transform that imports sources directly into the build environment as an artifact.
 pub struct ImportTransform {
     pub addr: Addr,
-    pub sources: IndexMap<String, Source>,
+    pub sources: IndexMap<String, Vec<Source>>,
 }
 
 #[async_trait]
-impl FromNode for ImportTransform {
+impl FromElement for ImportTransform {
     type Error = error::Error;
 
-    async fn from_node(addr: &Addr, node: &Node, ctx: &Context) -> Result<Self, error::Error> {
+    async fn new(element: &Element, ctx: &Context) -> Result<Self, error::Error> {
+        let mut sources = IndexMap::new();
+        for (scope, source_list) in element
+            .source
+            .as_ref()
+            .and_then(|x| x.get_resolved())
+            .context(error::NoSourceSnafu {
+                addr: element.addr.clone(),
+            })?
+        {
+            let mut entries = Vec::new();
+            for element in source_list.iter() {
+                entries.push(ctx.add_source(element).await?);
+            }
+            sources.insert(scope.clone(), entries);
+        }
         Ok(Self {
-            addr: addr.clone(),
-            sources: super::parse_sources(addr, node, ctx, |field, type_| error::Error::Field {
-                field: field.to_string(),
-                type_: type_.to_string(),
-            })
-            .await?,
+            addr: element.addr.clone(),
+            sources,
         })
     }
 }
-
-non_configurable!(ImportTransform, error::Error);
 
 #[async_trait]
 impl TransformImpl for ImportTransform {
@@ -42,8 +52,10 @@ impl TransformImpl for ImportTransform {
 
     async fn get_unique_id(&self, _ctx: &Handle) -> TransformResult<Id> {
         let mut hash = blake3::Hasher::new();
-        for source in self.sources.values() {
-            hash.update(source.get_unique_id().await?.digest().as_bytes());
+        for source_list in self.sources.values() {
+            for source in source_list {
+                hash.update(source.get_unique_id().await?.digest().as_bytes());
+            }
         }
         let hash_bytes = hash.finalize();
         let digest = base16::encode_lower(hash_bytes.as_bytes());
@@ -66,9 +78,11 @@ impl TransformImpl for ImportTransform {
     }
 
     async fn prepare(&self, log: &Log, ctx: &Handle) -> TransformResult<()> {
-        for (addr, source) in self.sources.iter() {
+        for (addr, source_list) in self.sources.iter() {
             trace!(component = "transform", type = "import", "fetching source {addr}");
-            source.fetch(log, ctx.storage()).await?;
+            for source in source_list {
+                source.cache(log, ctx.storage()).await?;
+            }
         }
         Ok(())
     }
@@ -79,14 +93,16 @@ impl TransformImpl for ImportTransform {
         env.create_dir(output).await?;
 
         // Stage all the sources in the output directory
-        for (addr, source) in self.sources.iter() {
+        for (addr, source_list) in self.sources.iter() {
             trace!(component = "transform", type = "import", "staging source {addr}");
-            let id = source.get_unique_id().await?;
-            env.stage(
-                ctx,
-                ArtifactStageOptions::builder().id(id).path(output).build(),
-            )
-            .await?;
+            for source in source_list {
+                let id = source.get_unique_id().await?;
+                env.stage(
+                    ctx,
+                    ArtifactStageOptions::builder().id(id).path(output).build(),
+                )
+                .await?;
+            }
         }
 
         Ok(())
@@ -132,6 +148,7 @@ impl TransformImpl for ImportTransform {
 }
 
 pub mod error {
+    use edo::context::Addr;
     use edo::storage::StorageError;
     use edo::{context::ContextError, transform::TransformError};
     use snafu::Snafu;
@@ -144,10 +161,8 @@ pub mod error {
             #[snafu(source(from(ContextError, Box::new)))]
             source: Box<ContextError>,
         },
-        #[snafu(display(
-            "import transform definitions require a field '{field}' with type '{type_}'"
-        ))]
-        Field { field: String, type_: String },
+        #[snafu(display("no source provided to import transform at {addr}"))]
+        NoSource { addr: Addr },
         #[snafu(transparent)]
         Storage {
             #[snafu(source(from(StorageError, Box::new)))]

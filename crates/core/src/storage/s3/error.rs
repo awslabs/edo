@@ -1,5 +1,5 @@
 use aws_sdk_s3::error::SdkError;
-use edo::storage::StorageError;
+use edo::{context::Addr, storage::StorageError};
 use snafu::Snafu;
 
 /// Errors that can occur when interacting with the S3 storage backend.
@@ -31,6 +31,11 @@ pub enum Error {
     #[snafu(display("failed to get segment of an object in s3 cache: {source}"))]
     Get {
         source: SdkError<aws_sdk_s3::operation::get_object::GetObjectError>,
+    },
+    #[snafu(display("invalid s3 backend definition at {addr}: {source}"))]
+    Invalid {
+        addr: Addr,
+        source: serde_json::Error,
     },
     #[snafu(display("cannot save an artifact that is missing a layer with digest '{digest}'"))]
     LayerMissing { digest: String },

@@ -1,354 +1,474 @@
-//! TOML schema deserialization for `edo.toml` project files.
+//! Typed TOML schema for `edo.toml` project files.
 //!
-//! [`Schema`] is the top-level enum dispatching on `schema-version`.
-//! [`SchemaV1`] holds the v1 layout: config, cache, plugins, environments,
-//! sources, transforms, vendors, and requires sections. [`Cache`] groups the
-//! three cache categories (source, build, output). The [`toml_def_item`]
-//! helper converts a raw TOML table entry into a [`Node`] definition.
+//! [`Schema`] is the top-level structure parsed directly from a project's
+//! `edo.toml`: it holds free-form `config` keys plus typed sections for
+//! caches, environments, sources, transforms, vendors, and dependency
+//! requirements. [`Element`] is the shared shape for every plugin
+//! definition (a `kind` string, an optional [`SourceMap`], and an
+//! arbitrary key/value config table). [`Cache`] groups the three cache
+//! categories (source, build, output). [`Requirement`] models a single
+//! `[requires.<addr>]` entry. [`SourceDefinition`]/[`SourceMap`] cover
+//! the three TOML shapes accepted for an element's `source` field:
+//! a single address, a list of addresses, or a map from scope to address
+//! list.
 
-use crate::context::{ContextResult, Node, error};
+use crate::context::{Addr, ContextResult, Element};
+use semver::VersionReq;
 use serde::{Deserialize, Serialize};
-use snafu::OptionExt;
 use std::collections::BTreeMap;
-use toml::map::Map;
 
-/// Top-level schema envelope, dispatching on the `schema-version` field.
+/// A single `[requires.<addr>]` entry: a kind plus a semver constraint.
 #[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(tag = "schema-version")]
-pub enum Schema {
-    /// Version 1 of the edo project schema.
-    #[serde(rename = "1")]
-    V1(SchemaV1),
+pub struct Requirement {
+    /// Source kind that satisfies this requirement (e.g. `"image"`).
+    pub kind: String,
+    /// Semver constraint the resolved version must satisfy.
+    pub at: VersionReq,
 }
 
-/// Groups the three cache categories in a v1 schema.
+/// Groups the three cache categories — source, build, output — under the
+/// `[cache]` table in `edo.toml`.
+///
+/// Internal-only: callers go through [`Schema`] accessors
+/// (`get_source_caches`, `get_build_cache`, `get_output_cache`).
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
-pub struct Cache {
+pub(crate) struct Cache {
     #[serde(default)]
-    source: BTreeMap<String, toml::Value>,
+    source: BTreeMap<String, Element>,
     #[serde(default)]
-    build: Option<toml::Value>,
+    build: Option<Element>,
     #[serde(default)]
-    output: Option<toml::Value>,
+    output: Option<Element>,
 }
 
-/// Version 1 of the edo project schema, holding all configuration sections.
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct SchemaV1 {
+/// Top-level deserialized form of an `edo.toml` project file.
+///
+/// Holds the union of every section understood by edo. Each section maps
+/// addresses to [`Element`]s of the appropriate plugin category. Use
+/// [`Schema::with_namespace`] when stitching multiple `edo.toml` files
+/// together (one per directory) and [`Schema::resolve_sources`] before
+/// handing elements to the plugin layer.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct Schema {
     #[serde(default)]
-    config: Map<String, toml::Value>,
+    config: BTreeMap<String, serde_json::Value>,
     #[serde(default)]
     cache: Cache,
     #[serde(default)]
-    environment: BTreeMap<String, toml::Value>,
+    environment: BTreeMap<Addr, Element>,
     #[serde(default)]
-    source: BTreeMap<String, toml::Value>,
+    source: BTreeMap<Addr, Element>,
     #[serde(default)]
-    transform: BTreeMap<String, toml::Value>,
+    transform: BTreeMap<Addr, Element>,
     #[serde(default)]
-    vendor: BTreeMap<String, toml::Value>,
+    vendor: BTreeMap<Addr, Element>,
     #[serde(default)]
-    requires: BTreeMap<String, toml::Value>,
+    requires: BTreeMap<Addr, Requirement>,
 }
 
-fn toml_map(table: &toml::map::Map<String, toml::Value>) -> ContextResult<BTreeMap<String, Node>> {
-    let mut tree = BTreeMap::new();
-    for (key, value) in table.iter() {
-        tree.insert(key.clone(), Node::try_from(value)?);
-    }
-    Ok(tree)
-}
-
-/// Converts a single TOML table entry into a [`Node`] definition, extracting
-/// the `kind` field and wrapping the remainder as the node's table.
-fn toml_def_item(id: &str, name: &str, inner: &Map<String, toml::Value>) -> ContextResult<Node> {
-    let mut shape = inner.clone();
-    let kind = shape
-        .remove("kind")
-        .and_then(|x| x.as_str().map(|x| x.to_string()))
-        .context(error::FieldSnafu {
-            field: "kind",
-            type_: "string",
-        })?;
-    let node_table = toml_map(&shape)?;
-    Ok(Node::new_definition(id, &kind, name, node_table))
-}
-
-fn toml_def(
-    table: &BTreeMap<String, toml::Value>,
-    id: &str,
-) -> ContextResult<BTreeMap<String, Node>> {
-    let mut tree = BTreeMap::new();
-    for (name, config) in table.iter() {
-        if let Some(inner) = config.as_table() {
-            tree.insert(name.clone(), toml_def_item(id, name, inner)?);
+impl Schema {
+    /// Propagate will ensure the address keys for all elements get set properly downwards
+    pub fn propagate(&mut self) {
+        for (name, cache) in self.cache.source.iter_mut() {
+            // Source caches are always rooted under `//edo-source-cache/<name>`
+            // to match the convention used by `Project::build` /
+            // `Context::add_cache`.
+            cache.addr = Addr::parse(&format!("//edo-source-cache/{name}")).unwrap();
         }
-    }
-    Ok(tree)
-}
-
-impl SchemaV1 {
-    /// Returns the source cache definitions as nodes.
-    pub fn get_source_caches(&self) -> ContextResult<BTreeMap<String, Node>> {
-        toml_def(&self.cache.source, "backend")
-    }
-
-    /// Returns the build cache definition, if configured.
-    pub fn get_build_cache(&self) -> ContextResult<Option<Node>> {
-        if let Some(data) = self.cache.build.as_ref() {
-            let table = data.as_table().context(error::FieldSnafu {
-                field: "build_cache",
-                type_: "table",
-            })?;
-            Ok(Some(toml_def_item("backend", "build_cache", table)?))
-        } else {
-            Ok(None)
+        if let Some(cache) = self.cache.build.as_mut() {
+            // The build cache is always //edo-build-cache
+            cache.addr = Addr::parse("//edo-build-cache").unwrap();
+        }
+        if let Some(cache) = self.cache.output.as_mut() {
+            // The output cache is always //edo-output-cache
+            cache.addr = Addr::parse("//edo-output-cache").unwrap();
+        }
+        // Now for all our main elements we propage the key down
+        for (addr, element) in self
+            .environment
+            .iter_mut()
+            .chain(self.source.iter_mut())
+            .chain(self.transform.iter_mut())
+            .chain(self.vendor.iter_mut())
+        {
+            element.addr = addr.clone();
         }
     }
 
-    /// Returns the output cache definition, if configured.
-    pub fn get_output_cache(&self) -> ContextResult<Option<Node>> {
-        if let Some(data) = self.cache.output.as_ref() {
-            let table = data.as_table().context(error::FieldSnafu {
-                field: "output_cache",
-                type_: "table",
-            })?;
-            Ok(Some(toml_def_item("backend", "output_cache", table)?))
-        } else {
-            Ok(None)
+    /// Re-roots every address in this schema under `namespace`.
+    ///
+    /// Used by the project loader to hoist a child directory's `edo.toml`
+    /// into the parent project's address space before merging.
+    pub fn with_namespace(&mut self, namespace: &Addr) {
+        fn reroot<T>(
+            map: &mut BTreeMap<Addr, T>,
+            namespace: &Addr,
+            mut on_value: impl FnMut(&mut T, &Addr),
+        ) {
+            let taken = std::mem::take(map);
+            *map = taken
+                .into_iter()
+                .map(|(addr, mut value)| {
+                    on_value(&mut value, namespace);
+                    (namespace.join(&addr), value)
+                })
+                .collect();
+        }
+        reroot(&mut self.environment, namespace, Element::with_namespace);
+        reroot(&mut self.source, namespace, Element::with_namespace);
+        reroot(&mut self.transform, namespace, Element::with_namespace);
+        reroot(&mut self.vendor, namespace, Element::with_namespace);
+        reroot(&mut self.requires, namespace, |_, _| {});
+    }
+
+    /// Merges `right` into `self`. Entries in `right` overwrite entries in
+    /// `self` for the same address or key (last-writer-wins).
+    pub fn merge(&mut self, right: &Schema) {
+        for (key, value) in right.config.iter() {
+            self.config.insert(key.clone(), value.clone());
+        }
+        for (key, value) in right.get_source_caches() {
+            self.cache.source.insert(key.clone(), value.clone());
+        }
+        if let Some(element) = right.get_build_cache() {
+            self.cache.build = Some(element.clone());
+        }
+        if let Some(element) = right.get_output_cache() {
+            self.cache.output = Some(element.clone());
+        }
+        for (key, value) in right.environments() {
+            self.environment.insert(key.clone(), value.clone());
+        }
+        for (key, value) in right.sources() {
+            self.source.insert(key.clone(), value.clone());
+        }
+        for (key, value) in right.transforms() {
+            self.transform.insert(key.clone(), value.clone());
+        }
+        for (key, value) in right.vendors() {
+            self.vendor.insert(key.clone(), value.clone());
+        }
+        for (key, value) in right.requires() {
+            self.requires.insert(key.clone(), value.clone());
         }
     }
 
-    /// Returns the user-level config entries as nodes.
+    /// Resolves every embedded [`SourceMap`] into concrete [`Element`]
+    /// references by looking up each address in the schema's `source`
+    /// table.
+    ///
+    /// Iterates environments and transforms (the two element categories
+    /// that take inputs); already-resolved maps and elements without a
+    /// `source` field are skipped. Returns the first error encountered.
+    pub fn resolve_sources(&mut self) -> ContextResult<()> {
+        // Snapshot `source` before mutating other categories so resolution
+        // is deterministic and not influenced by iteration order.
+        let elements = self.source.clone();
+        for element in self
+            .environment
+            .values_mut()
+            .chain(self.transform.values_mut())
+        {
+            if let Some(sourcemap) = element.source.as_mut() {
+                sourcemap.resolve(&elements)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Source cache backends, keyed by the user-provided cache name.
+    pub fn get_source_caches(&self) -> &BTreeMap<String, Element> {
+        &self.cache.source
+    }
+
+    /// Build cache backend, if `[cache.build]` is set.
+    pub fn get_build_cache(&self) -> Option<&Element> {
+        self.cache.build.as_ref()
+    }
+
+    /// Output cache backend, if `[cache.output]` is set.
+    pub fn get_output_cache(&self) -> Option<&Element> {
+        self.cache.output.as_ref()
+    }
+
+    /// Free-form `[config]` entries forwarded to plugins.
     #[allow(dead_code)]
-    pub fn get_config(&self) -> ContextResult<BTreeMap<String, Node>> {
-        toml_map(&self.config)
+    pub fn get_config(&self) -> &BTreeMap<String, serde_json::Value> {
+        &self.config
     }
 
-    /// Returns the environment definitions as nodes.
-    pub fn get_environments(&self) -> ContextResult<BTreeMap<String, Node>> {
-        toml_def(&self.environment, "environment")
+    /// Environment farm definitions keyed by address.
+    pub fn environments(&self) -> &BTreeMap<Addr, Element> {
+        &self.environment
     }
 
-    /// Returns the source definitions as nodes.
-    pub fn get_sources(&self) -> ContextResult<BTreeMap<String, Node>> {
-        toml_def(&self.source, "source")
+    /// Source definitions keyed by address.
+    pub fn sources(&self) -> &BTreeMap<Addr, Element> {
+        &self.source
     }
 
-    /// Returns the transform definitions as nodes.
-    pub fn get_transforms(&self) -> ContextResult<BTreeMap<String, Node>> {
-        toml_def(&self.transform, "transform")
+    /// Inserts a resolved source element. Used by the lockfile / resolver
+    /// path to fold vendor-provided sources back into the schema before
+    /// [`Schema::resolve_sources`] runs.
+    ///
+    /// Normalizes the inserted element's `addr` to match the schema-map
+    /// key — vendor-resolved elements come in with their original
+    /// vendor-internal address, which must be rewritten so downstream
+    /// consumers (notably `cargo_vendor`'s `BTreeMap<Addr, Source>`) key
+    /// off the project address rather than the vendor address.
+    pub fn add_source(&mut self, addr: &Addr, element: &Element) {
+        let mut element = element.clone();
+        element.addr = addr.clone();
+        self.source.insert(addr.clone(), element);
     }
 
-    /// Returns the vendor definitions as nodes.
-    pub fn get_vendors(&self) -> ContextResult<BTreeMap<String, Node>> {
-        toml_def(&self.vendor, "vendor")
+    /// Transform definitions keyed by address.
+    pub fn transforms(&self) -> &BTreeMap<Addr, Element> {
+        &self.transform
     }
 
-    /// Returns the dependency requirement definitions as nodes.
-    pub fn get_requires(&self) -> ContextResult<BTreeMap<String, Node>> {
-        toml_def(&self.requires, "requires")
+    /// Vendor definitions keyed by address.
+    pub fn vendors(&self) -> &BTreeMap<Addr, Element> {
+        &self.vendor
+    }
+
+    /// Dependency requirements keyed by address.
+    pub fn requires(&self) -> &BTreeMap<Addr, Requirement> {
+        &self.requires
     }
 }
 
 #[cfg(test)]
-mod test {
-    use crate::context::ContextError;
-    use crate::context::schema::Schema;
+mod tests {
+    //! Unit tests for the typed schema. Each test feeds a small `edo.toml`
+    //! fragment to `toml::from_str` and asserts on the resulting [`Schema`]
+    //! to lock down the deserialization shape.
+    use super::*;
+    use crate::context::{SourceMap, error};
+
+    fn addr(s: &str) -> Addr {
+        Addr::parse(s).unwrap()
+    }
 
     #[test]
-    fn test_deserialize() {
+    fn deserialize_minimal_schema_is_empty() {
+        let s: Schema = toml::from_str("").unwrap();
+        assert!(s.environments().is_empty());
+        assert!(s.sources().is_empty());
+        assert!(s.transforms().is_empty());
+        assert!(s.vendors().is_empty());
+        assert!(s.requires().is_empty());
+        assert!(s.get_source_caches().is_empty());
+        assert!(s.get_build_cache().is_none());
+        assert!(s.get_output_cache().is_none());
+    }
+
+    #[test]
+    fn deserialize_populates_all_sections() {
         let toml_str = r#"
-schema-version = "1"
-[vendor.public-ecr]
-kind = "image"
-uri  = "public.ecr.aws/docker/library"
-
-[want.gcc]
-kind = "image"
-at   = "=14.3.0"
-
-[environment.gcc]
-kind   = "container"
-source = "//hello_oci/gcc"
-
-[source.code]
-kind       = "local"
-path       = "hello_oci"
-out        = "."
-is_archive = false
-
-[transform.build]
-kind        = "script"
-environment = "//hello_oci/gcc"
-source      = "//hello_oci/code"
-commands    = [
-    "mkdir -p {{install-root}}/bin",
-    "gcc -o hello_oci hello.c",
-    "cp hello_oci {{install-root}}/bin/hello_oci"
-]"#;
-        let _: Schema = toml::from_str(toml_str).expect("failed to parse");
-    }
-
-    #[test]
-    fn deserialize_empty_v1_defaults_all_fields() {
-        let s: Schema = toml::from_str("schema-version = \"1\"").expect("parse");
-        let Schema::V1(v1) = s;
-        assert!(v1.get_source_caches().unwrap().is_empty());
-        assert!(v1.get_build_cache().unwrap().is_none());
-        assert!(v1.get_output_cache().unwrap().is_none());
-        assert!(v1.get_environments().unwrap().is_empty());
-        assert!(v1.get_sources().unwrap().is_empty());
-        assert!(v1.get_transforms().unwrap().is_empty());
-        assert!(v1.get_vendors().unwrap().is_empty());
-        assert!(v1.get_requires().unwrap().is_empty());
-    }
-
-    #[test]
-    fn unknown_schema_version_fails() {
-        let r: Result<Schema, _> = toml::from_str("schema-version = \"99\"");
-        assert!(r.is_err());
-    }
-
-    #[test]
-    fn get_sources_produces_definition_with_id_source_and_kind() {
-        let toml_str = r#"schema-version = "1"
-[source.foo]
+[source."//foo"]
 kind = "local"
 path = "x"
-"#;
-        let Schema::V1(v1) = toml::from_str(toml_str).unwrap();
-        let sources = v1.get_sources().unwrap();
-        let node = sources.get("foo").expect("foo exists");
-        assert_eq!(node.get_id().as_deref(), Some("source"));
-        assert_eq!(node.get_kind().as_deref(), Some("local"));
-        assert_eq!(node.get_name().as_deref(), Some("foo"));
-        // the `kind` key is stripped from the table; `path` remains
-        let table = node.get_table().unwrap();
-        assert!(table.contains_key("path"));
-        assert!(!table.contains_key("kind"));
-    }
 
-    #[test]
-    fn category_ids_match_section_names() {
-        let toml_str = r#"schema-version = "1"
-[environment.e]
-kind = "container"
-[transform.t]
+[transform."//t"]
 kind = "script"
-[vendor.v]
+source = "//foo"
+
+[vendor."//v"]
 kind = "image"
-[requires.r]
-kind = "image"
-at = "=1.0.0"
+
+[environment."//env"]
+kind = "local"
+
 [cache.source.c]
 kind = "local"
 path = "/tmp"
-"#;
-        let Schema::V1(v1) = toml::from_str(toml_str).unwrap();
-        assert_eq!(
-            v1.get_environments()
-                .unwrap()
-                .get("e")
-                .unwrap()
-                .get_id()
-                .as_deref(),
-            Some("environment")
-        );
-        assert_eq!(
-            v1.get_transforms()
-                .unwrap()
-                .get("t")
-                .unwrap()
-                .get_id()
-                .as_deref(),
-            Some("transform")
-        );
-        assert_eq!(
-            v1.get_vendors()
-                .unwrap()
-                .get("v")
-                .unwrap()
-                .get_id()
-                .as_deref(),
-            Some("vendor")
-        );
-        assert_eq!(
-            v1.get_requires()
-                .unwrap()
-                .get("r")
-                .unwrap()
-                .get_id()
-                .as_deref(),
-            Some("requires")
-        );
-        assert_eq!(
-            v1.get_source_caches()
-                .unwrap()
-                .get("c")
-                .unwrap()
-                .get_id()
-                .as_deref(),
-            Some("backend")
-        );
-    }
 
-    #[test]
-    fn build_and_output_cache_present() {
-        let toml_str = r#"schema-version = "1"
 [cache.build]
 kind = "local"
 path = "/tmp/b"
+
 [cache.output]
 kind = "local"
 path = "/tmp/o"
+
+[requires."//bar"]
+kind = "image"
+at = "=1.0.0"
 "#;
-        let Schema::V1(v1) = toml::from_str(toml_str).unwrap();
-        let b = v1.get_build_cache().unwrap().expect("build");
-        assert_eq!(b.get_kind().as_deref(), Some("local"));
-        let o = v1.get_output_cache().unwrap().expect("output");
-        assert_eq!(o.get_kind().as_deref(), Some("local"));
+        let s: Schema = toml::from_str(toml_str).expect("parse schema");
+
+        assert!(s.sources().contains_key(&addr("//foo")));
+        assert!(s.transforms().contains_key(&addr("//t")));
+        assert!(s.vendors().contains_key(&addr("//v")));
+        assert!(s.environments().contains_key(&addr("//env")));
+        assert!(s.get_source_caches().contains_key("c"));
+        assert!(s.get_build_cache().is_some());
+        assert!(s.get_output_cache().is_some());
+        assert!(s.requires().contains_key(&addr("//bar")));
     }
 
     #[test]
-    fn build_cache_non_table_returns_field_error() {
-        let toml_str = r#"schema-version = "1"
-[cache]
-build = "not a table"
+    fn element_flattens_unknown_keys_into_config() {
+        let toml_str = r#"
+kind = "local"
+path = "x"
+extra = 42
 "#;
-        let Schema::V1(v1) = toml::from_str(toml_str).unwrap();
-        let err = v1.get_build_cache().expect_err("expected Field error");
+        let e: Element = toml::from_str(toml_str).unwrap();
+        assert_eq!(e.kind, "local");
+        assert_eq!(e.config.get("path").and_then(|v| v.as_str()), Some("x"));
+        assert_eq!(e.config.get("extra").and_then(|v| v.as_i64()), Some(42));
+    }
+
+    #[test]
+    fn source_definition_single_normalizes_to_default_scope() {
+        let toml_str = "kind = \"script\"\nsource = \"//foo\"\n";
+        let e: Element = toml::from_str(toml_str).unwrap();
+        let sm = e.source.expect("source set");
+        match sm {
+            SourceMap::Unresolved(table) => {
+                assert_eq!(table.len(), 1);
+                assert_eq!(table["default"], vec![addr("//foo")]);
+            }
+            SourceMap::Resolved(_) => panic!("expected unresolved"),
+        }
+    }
+
+    #[test]
+    fn source_definition_list_normalizes_to_default_scope() {
+        let toml_str = "kind = \"script\"\nsource = [\"//a\", \"//b\"]\n";
+        let e: Element = toml::from_str(toml_str).unwrap();
+        match e.source.unwrap() {
+            SourceMap::Unresolved(table) => {
+                assert_eq!(table["default"], vec![addr("//a"), addr("//b")]);
+            }
+            SourceMap::Resolved(_) => panic!("expected unresolved"),
+        }
+    }
+
+    #[test]
+    fn source_definition_table_keeps_scope_keys() {
+        let toml_str = r#"
+kind = "script"
+[source]
+build = ["//a"]
+runtime = ["//b", "//c"]
+"#;
+        let e: Element = toml::from_str(toml_str).unwrap();
+        match e.source.unwrap() {
+            SourceMap::Unresolved(table) => {
+                assert_eq!(table["build"], vec![addr("//a")]);
+                assert_eq!(table["runtime"], vec![addr("//b"), addr("//c")]);
+            }
+            SourceMap::Resolved(_) => panic!("expected unresolved"),
+        }
+    }
+
+    #[test]
+    fn with_namespace_reroots_relative_source_addresses() {
+        // A relative source address (no `//` prefix) is hoisted under the
+        // namespace; absolute ones pass through Addr::join unchanged.
+        let toml_str = r#"
+kind = "script"
+source = ["rel", "//abs"]
+"#;
+        let mut e: Element = toml::from_str(toml_str).unwrap();
+        e.with_namespace(&addr("//ns"));
+        match e.source.unwrap() {
+            SourceMap::Unresolved(table) => {
+                let v = &table["default"];
+                assert_eq!(v[0], addr("//ns/rel"));
+                assert_eq!(v[1], addr("//abs"));
+            }
+            SourceMap::Resolved(_) => panic!("expected unresolved"),
+        }
+    }
+
+    #[test]
+    fn schema_with_namespace_reroots_section_keys() {
+        let toml_str = r#"
+[source."foo"]
+kind = "local"
+path = "x"
+
+[transform."t"]
+kind = "script"
+"#;
+        let mut s: Schema = toml::from_str(toml_str).unwrap();
+        s.with_namespace(&addr("//ns"));
+        assert!(s.sources().contains_key(&addr("//ns/foo")));
+        assert!(s.transforms().contains_key(&addr("//ns/t")));
+    }
+
+    #[test]
+    fn merge_overwrites_overlapping_addresses() {
+        let mut left: Schema =
+            toml::from_str("[source.\"//a\"]\nkind = \"local\"\npath = \"old\"\n").unwrap();
+        let right: Schema = toml::from_str(
+            "[source.\"//a\"]\nkind = \"local\"\npath = \"new\"\n\n[source.\"//b\"]\nkind = \"local\"\npath = \"y\"\n",
+        )
+        .unwrap();
+        left.merge(&right);
+        let a = &left.sources()[&addr("//a")];
+        assert_eq!(a.config.get("path").and_then(|v| v.as_str()), Some("new"),);
+        assert!(left.sources().contains_key(&addr("//b")));
+    }
+
+    #[test]
+    fn resolve_sources_replaces_addresses_with_elements() {
+        let toml_str = r#"
+[source."//foo"]
+kind = "local"
+path = "x"
+
+[transform."//t"]
+kind = "script"
+source = "//foo"
+"#;
+        let mut s: Schema = toml::from_str(toml_str).unwrap();
+        s.resolve_sources().expect("resolve ok");
+        let t = &s.transforms()[&addr("//t")];
+        let resolved = t
+            .source
+            .as_ref()
+            .and_then(|sm| sm.get_resolved())
+            .expect("resolved");
+        assert_eq!(resolved["default"].len(), 1);
+        assert_eq!(resolved["default"][0].kind, "local");
+    }
+
+    #[test]
+    fn resolve_sources_missing_address_returns_missing_source() {
+        let toml_str = r#"
+[transform."//t"]
+kind = "script"
+source = "//missing"
+"#;
+        let mut s: Schema = toml::from_str(toml_str).unwrap();
+        let err = s.resolve_sources().expect_err("should fail");
         assert!(
-            matches!(err, ContextError::Field { ref field, .. } if field == "build_cache"),
-            "got: {err:?}"
+            matches!(err, error::ContextError::MissingSource { .. }),
+            "got: {err:?}",
         );
     }
 
     #[test]
-    fn output_cache_non_table_returns_field_error() {
-        let toml_str = r#"schema-version = "1"
-[cache]
-output = "not a table"
-"#;
-        let Schema::V1(v1) = toml::from_str(toml_str).unwrap();
-        let err = v1.get_output_cache().expect_err("expected Field error");
-        assert!(
-            matches!(err, ContextError::Field { ref field, .. } if field == "output_cache"),
-            "got: {err:?}"
-        );
-    }
+    fn resolve_sources_idempotent_on_resolved_map() {
+        let toml_str = r#"
+[source."//foo"]
+kind = "local"
+path = "x"
 
-    #[test]
-    fn missing_kind_in_transform_returns_field_error() {
-        let toml_str = r#"schema-version = "1"
-[transform.build]
-source = "x"
+[transform."//t"]
+kind = "script"
+source = "//foo"
 "#;
-        let Schema::V1(v1) = toml::from_str(toml_str).unwrap();
-        let err = v1.get_transforms().expect_err("expected Field error");
-        assert!(
-            matches!(err, ContextError::Field { ref field, .. } if field == "kind"),
-            "got: {err:?}"
-        );
+        let mut s: Schema = toml::from_str(toml_str).unwrap();
+        s.resolve_sources().unwrap();
+        // Second call must succeed and leave the map resolved.
+        s.resolve_sources().unwrap();
+        let t = &s.transforms()[&addr("//t")];
+        assert!(t.source.as_ref().and_then(|sm| sm.get_resolved()).is_some());
     }
 }
