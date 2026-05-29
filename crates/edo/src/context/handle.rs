@@ -109,7 +109,7 @@ impl Handle {
 mod tests {
     use super::Handle;
     use crate::context::logmgr::test_support::shared_log_manager;
-    use crate::context::{Addr, Config, Node, error::ContextError};
+    use crate::context::{Addr, Config, Element, FromElementNoContext, error::ContextError};
     use crate::storage::{Backend, LocalBackend, Storage};
     use std::collections::{BTreeMap, HashMap};
     use tempfile::TempDir;
@@ -117,19 +117,18 @@ mod tests {
     /// Build a minimal `Storage` backed by a temporary local directory.
     async fn tmp_storage(dir: &std::path::Path) -> Storage {
         let addr = Addr::parse("//edo-test-cache").unwrap();
-        let mut table = BTreeMap::new();
-        table.insert(
+        let mut config_map = BTreeMap::new();
+        config_map.insert(
             "path".to_string(),
-            Node::new_string(dir.to_string_lossy().to_string()),
+            serde_json::Value::String(dir.to_string_lossy().to_string()),
         );
-        let node = Node::new_definition("storage", "local", "test", table);
+        let element = Element::builder()
+            .addr(addr.clone())
+            .kind("local")
+            .config(config_map)
+            .build();
         let config = Config::load::<&std::path::Path>(None).await.unwrap();
-        let local = <LocalBackend as crate::context::DefinableNoContext<
-            crate::storage::StorageError,
-            crate::context::NonConfigurable<crate::storage::StorageError>,
-        >>::new(&addr, &node, &config)
-        .await
-        .unwrap();
+        let local = LocalBackend::new(&element, &config).await.unwrap();
         Storage::init(&Backend::new(local)).await.unwrap()
     }
 

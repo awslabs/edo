@@ -1,21 +1,22 @@
 use super::error;
-use async_trait::async_trait;
 use semver::VersionReq;
-use snafu::{OptionExt, ensure};
 
-use crate::context::{Addr, Context, FromNode, Node};
+use crate::context::{Addr, Context, Requirement};
 
-/// A resolved dependency requirement parsed from an `edo.toml` `requires` node.
+/// A resolved dependency requirement parsed from an `edo.toml`
+/// `[requires.<addr>]` block.
 ///
-/// Contains the package name, its semver version requirement, the optional
-/// vendor hint, and the originating address in the project graph.
+/// Holds enough information for the [`super::Resolver`] to feed the
+/// dependency into resolvo: the package name (taken from the address),
+/// the kind of source (used to pick a vendor when none is named),
+/// the semver constraint, and the originating address.
 #[derive(Clone, Hash, PartialEq, Eq)]
 pub struct Dependency {
-    /// The address of the node that declared this dependency.
+    /// The address of the requires block.
     pub addr: Addr,
     /// The source kind (e.g. `"image"`, `"git"`).
     pub kind: String,
-    /// The package name being depended upon.
+    /// The package name being depended upon (the address's leaf segment).
     pub name: String,
     /// The semver requirement that must be satisfied.
     pub version: VersionReq,
@@ -23,47 +24,38 @@ pub struct Dependency {
     pub vendor: Option<String>,
 }
 
-#[async_trait]
-impl FromNode for Dependency {
-    type Error = super::error::SourceError;
-
-    async fn from_node(
+impl Dependency {
+    /// Builds a [`Dependency`] from the address of a requires block and its
+    /// typed [`Requirement`].
+    ///
+    /// `_ctx` is currently unused but kept in the signature so callers can
+    /// pass the build context they hold; future versions may consult it
+    /// for default-vendor lookup.
+    pub async fn new(
         addr: &Addr,
-        node: &Node,
+        requirement: &Requirement,
         _ctx: &Context,
-    ) -> std::result::Result<Self, Self::Error> {
-        let id = node.get_id().context(error::UndefinedSnafu)?;
-        ensure!(id == "requires", error::UndefinedSnafu {});
-        node.validate_keys(&["at"])?;
-        let kind = node.get_kind().context(error::UndefinedSnafu)?;
-        let name = node.get_name().context(error::UndefinedSnafu)?;
-        let version = node
-            .get("at")
-            .context(error::NoRequireSnafu)?
-            .as_require()
-            .context(error::FieldSnafu {
-                field: "at",
-                type_: "version requirement",
-            })?;
-        let vendor = if let Some(value) = node.get("vendor") {
-            Some(
-                value
-                    .as_string()
-                    .context(error::FieldSnafu {
-                        field: "vendor",
-                        type_: "string",
-                    })?
-                    .clone(),
-            )
-        } else {
-            None
-        };
+    ) -> std::result::Result<Self, super::error::SourceError> {
+        // The dependency's package name comes from the address's leaf
+        // segment. If the address ends with a trailing empty segment we
+        // fall back to the full id, which keeps the error path producing
+        // a usable string for `Resolver::build_db`.
+        let name = addr
+            .to_id()
+            .rsplit('/')
+            .next()
+            .map(str::to_string)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| addr.to_id());
+        if name.is_empty() {
+            return error::UndefinedSnafu {}.fail();
+        }
         Ok(Self {
             addr: addr.clone(),
-            kind: kind.clone(),
-            name: name.clone(),
-            version: version.clone(),
-            vendor,
+            kind: requirement.kind.clone(),
+            name,
+            version: requirement.at.clone(),
+            vendor: None,
         })
     }
 }

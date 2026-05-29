@@ -6,8 +6,7 @@ use aws_sdk_s3::{
     types::{CompletedMultipartUpload, CompletedPart},
 };
 use edo::{
-    context::{Addr, Config, FromNodeNoContext, Node},
-    non_configurable_no_context,
+    context::{Config, Element, FromElementNoContext},
     storage::{Artifact, BackendImpl, Id, Layer, LayerOptions, StorageResult},
     util::{Reader, Writer},
 };
@@ -27,6 +26,14 @@ mod reader;
 type Result<T> = std::result::Result<T, error::Error>;
 const CHUNK_SIZE: usize = 10 * 1024 * 1024; // 10mb
 
+/// The user configurable options for the s3 backend
+#[derive(serde::Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
+struct S3BackendOptions {
+    bucket: String,
+    prefix: Option<PathBuf>,
+}
+
 /// An S3-backed storage backend for artifact caching and retrieval.
 pub struct S3Backend {
     client: Arc<Client>,
@@ -39,30 +46,19 @@ unsafe impl Send for S3Backend {}
 unsafe impl Sync for S3Backend {}
 
 #[async_trait]
-impl FromNodeNoContext for S3Backend {
+impl FromElementNoContext for S3Backend {
     type Error = edo::storage::StorageError;
 
-    async fn from_node(
-        _addr: &Addr,
-        node: &Node,
-        _config: &Config,
-    ) -> std::result::Result<Self, Self::Error> {
-        node.validate_keys(&["bucket"])?;
-        let bucket = node
-            .get("bucket")
-            .and_then(|x| x.as_string())
-            .context(error::BucketNotSpecifiedSnafu)?;
-        let prefix = node.get("prefix").and_then(|x| x.as_string());
+    async fn new(element: &Element, _config: &Config) -> std::result::Result<Self, Self::Error> {
+        let options: S3BackendOptions = element.get()?;
         Self::new_(
             &aws_config::load_defaults(BehaviorVersion::latest()).await,
-            bucket.as_str(),
-            prefix.map(PathBuf::from),
+            &options.bucket,
+            options.prefix,
         )
         .await
     }
 }
-
-non_configurable_no_context!(S3Backend, edo::storage::StorageError);
 
 impl S3Backend {
     /// Creates a new S3 backend with the given SDK configuration, bucket, and optional key prefix.

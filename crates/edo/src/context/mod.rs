@@ -7,13 +7,15 @@
 //!
 //! Sub-modules provide supporting types:
 //! - Addressing — hierarchical [`Addr`] identifiers
-//! - Configuration — user-level [`Config`] and the [`Definable`] traits
+//! - Configuration — user-level [`Config`] loaded from `~/.config/edo.toml`
 //! - Errors — [`ContextError`] and the [`ContextResult`] alias
 //! - Handle — read-only [`Handle`] passed to transforms
 //! - Lock — dependency lock file ([`Lock`])
 //! - Logging — per-task [`Log`] files and [`LogManager`] tracing setup
-//! - Node — generic data tree ([`Node`], [`Data`], [`Component`])
-//! - Schema — TOML schema deserialization
+//! - Element — [`Element`] plus the [`FromElement`] / [`FromElementNoContext`]
+//!   conversion traits
+//! - Schema — typed `edo.toml` deserialization ([`Schema`], [`Element`])
+//! - Registry — plugin handler registry ([`Registry`], [`Handler`])
 //! - Builder — project loading and dependency resolution ([`Project`])
 
 use super::{
@@ -22,9 +24,9 @@ use super::{
     source::{Source, Vendor},
     transform::Transform,
 };
-use crate::context::registry::Registry;
 use crate::storage::{Backend, LocalBackend, Storage};
 use dashmap::DashMap;
+use serde_json::json;
 use snafu::ResultExt;
 use std::collections::{BTreeMap, HashMap};
 use std::env::current_dir;
@@ -36,21 +38,24 @@ use tracing::Instrument;
 mod address;
 mod builder;
 mod config;
+mod element;
 pub mod error;
 mod handle;
 mod lock;
 mod log;
 mod logmgr;
-mod node;
 mod registry;
 mod schema;
 
 /// Re-exports [`Addr`] and [`Addressable`].
 pub use address::*;
-/// Re-exports [`Project`] and the `non_configurable` macros.
+/// Re-exports [`Project`].
 pub use builder::*;
-/// Re-exports [`Config`], [`Definable`], [`DefinableNoContext`], and [`NonConfigurable`].
+/// Re-exports [`Config`].
 pub use config::*;
+/// Re-exports [`Element`], [`FromElement`], [`FromElementNoContext`],
+/// [`SourceDefinition`], and [`SourceMap`].
+pub use element::*;
 /// Re-exports [`ContextError`] at the module level.
 pub use error::ContextError;
 /// Re-exports [`Handle`].
@@ -61,8 +66,10 @@ pub use lock::*;
 pub use log::*;
 /// Re-exports [`LogManager`], [`LogVerbosity`], and logging helpers.
 pub use logmgr::*;
-/// Re-exports [`Node`], [`Data`], [`Component`], [`FromNode`], and [`FromNodeNoContext`].
-pub use node::*;
+/// Re-exports [`Registry`] and the [`Handler`] trait.
+pub use registry::*;
+/// Re-exports the typed-schema types ([`Schema`], [`Requirement`]).
+pub use schema::*;
 
 /// Convenience alias for `Result<T, ContextError>`.
 pub type ContextResult<T> = std::result::Result<T, error::ContextError>;
@@ -131,18 +138,17 @@ impl Context {
         // Load the configuration
         let config = Config::load(config).await?;
         // Initialize the storage with the default local cache
+        let local_backend_addr = Addr::parse("//edo-local-cache")?;
         let storage = Storage::init(&Backend::new(
             LocalBackend::new(
-                &Addr::parse("//edo-local-cache")?,
-                &Node::new_definition(
-                    "storage",
-                    "local",
-                    "edo-local-cache",
-                    BTreeMap::from([(
+                &Element::builder()
+                    .addr(local_backend_addr.clone())
+                    .kind("local")
+                    .config([(
                         "path".to_string(),
-                        Node::new_string(path.join("storage").to_string_lossy().to_string()),
-                    )]),
-                ),
+                        json!(&path.join("storage").to_string_lossy().to_string()),
+                    )])
+                    .build(),
                 &config,
             )
             .await?,
@@ -165,7 +171,7 @@ impl Context {
     }
 
     /// Adds any project found config nodes to the config
-    pub fn add_config(&self, config: &BTreeMap<String, Node>) {
+    pub fn add_config(&self, config: &BTreeMap<String, serde_json::Value>) {
         self.config.merge(config);
     }
 
@@ -233,17 +239,16 @@ impl Context {
 
     /// Registers a storage cache backend, routing it to build, output, or source cache
     /// based on the address.
-    pub async fn add_cache(&self, addr: &Addr, node: &Node) -> ContextResult<()> {
+    pub async fn add_cache(&self, addr: &Addr, element: &Element) -> ContextResult<()> {
         debug!(
             section = "context",
             component = "context",
             "adding a storage backend {addr}"
         );
-        let kind = node.get_kind().unwrap();
-        let backend = if kind == "local" || kind == "edo:local" {
-            Backend::new(LocalBackend::new(addr, node, self.config()).await?)
+        let backend = if element.kind == "local" || element.kind == "edo:local" {
+            Backend::new(LocalBackend::new(element, self.config()).await?)
         } else {
-            self.registry().backend(addr, node, self).await?
+            self.registry().backend(element, self).await?
         };
         let addr_s = addr.to_string();
         if addr_s == "//edo-build-cache" {
@@ -262,15 +267,16 @@ impl Context {
     }
 
     /// Creates and registers a transform from the given node using the appropriate plugin.
-    pub async fn add_transform(&self, addr: &Addr, node: &Node) -> ContextResult<()> {
+    pub async fn add_transform(&self, element: &Element) -> ContextResult<()> {
         debug!(
             section = "context",
             component = "context",
-            "adding a transform {addr}"
+            "adding a transform {}",
+            element.addr,
         );
         self.transforms.insert(
-            addr.clone(),
-            self.registry().transform(addr, node, self).await?,
+            element.addr.clone(),
+            self.registry().transform(element, self).await?,
         );
         Ok(())
     }
@@ -291,32 +297,36 @@ impl Context {
     }
 
     /// Creates and registers an environment farm from the given node using the appropriate plugin.
-    pub async fn add_farm(&self, addr: &Addr, node: &Node) -> ContextResult<()> {
+    pub async fn add_farm(&self, element: &Element) -> ContextResult<()> {
         debug!(
             section = "context",
             component = "context",
-            "adding a farm {addr}"
+            "adding a farm {}",
+            element.addr,
         );
         // If we get here use the core plugin
-        self.farms
-            .insert(addr.clone(), self.registry().farm(addr, node, self).await?);
+        self.farms.insert(
+            element.addr.clone(),
+            self.registry().farm(element, self).await?,
+        );
         Ok(())
     }
 
     /// Creates a source fetcher from the given node using the appropriate plugin.
-    pub async fn add_source(&self, addr: &Addr, node: &Node) -> ContextResult<Source> {
+    pub async fn add_source(&self, element: &Element) -> ContextResult<Source> {
         debug!(
             section = "context",
             component = "context",
-            "adding a source {addr}"
+            "adding a source {}",
+            element.addr,
         );
-        let result = self.registry().source(addr, node, self).await?;
+        let result = self.registry().source(element, self).await?;
         Ok(result)
     }
 
     /// Creates a dependency vendor from the given node using the appropriate plugin.
-    pub async fn add_vendor(&self, addr: &Addr, node: &Node) -> ContextResult<Vendor> {
-        let result = self.registry().vendor(addr, node, self).await?;
+    pub async fn add_vendor(&self, element: &Element) -> ContextResult<Vendor> {
+        let result = self.registry().vendor(element, self).await?;
         Ok(result)
     }
 
@@ -481,13 +491,15 @@ mod tests {
         // handled directly (not via the plugin registry).
         for addr_str in ["//edo-build-cache", "//edo-output-cache", "//some-src"] {
             let tmp = TempDir::new().unwrap();
-            let mut table = BTreeMap::new();
-            table.insert(
-                "path".to_string(),
-                Node::new_string(tmp.path().to_string_lossy().to_string()),
-            );
-            let node = Node::new_definition("storage", "local", "c", table);
-            ctx.add_cache(&Addr::parse(addr_str).unwrap(), &node)
+            let element = Element::builder()
+                .addr(Addr::parse(addr_str).unwrap())
+                .kind("local")
+                .config([(
+                    "path".to_string(),
+                    json!(&&tmp.path().to_string_lossy().to_string()),
+                )])
+                .build();
+            ctx.add_cache(&Addr::parse(addr_str).unwrap(), &element)
                 .await
                 .unwrap_or_else(|e| panic!("add_cache {addr_str} failed: {e}"));
         }
@@ -499,12 +511,18 @@ mod tests {
     #[serial_test::serial(log_manager)]
     async fn context_add_transform_no_provider_errors() {
         let ctx = ctx_or_skip!();
-        let mut table = BTreeMap::new();
-        table.insert("foo".to_string(), Node::new_string("x".to_string()));
-        // `script` has no plugin-registered provider in a fresh registry.
-        let node = Node::new_definition("transform", "script", "t", table);
+        // `script` has no plugin-registered provider in a fresh registry,
+        // so the registry surfaces a `NoProvider` error before any plugin
+        // is invoked.
+        let element = Element {
+            addr: Addr::parse("//no-provider").unwrap(),
+            kind: "script".into(),
+            environment: None,
+            source: None,
+            config: BTreeMap::from([("foo".to_string(), serde_json::Value::String("x".into()))]),
+        };
         let err = ctx
-            .add_transform(&Addr::parse("//t").unwrap(), &node)
+            .add_transform(&element)
             .await
             .expect_err("expected NoProvider error");
         assert!(
@@ -521,23 +539,45 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(log_manager)]
-    async fn context_add_farm_missing_kind_field_error() {
+    async fn context_add_farm_unknown_kind_errors() {
         let ctx = ctx_or_skip!();
-        // A plain Table (not a Definition) — `get_kind()` returns None, so
-        // the registry surfaces a `Field { field: "kind", .. }` error.
-        let node = Node::new_table(BTreeMap::new());
+        // An element with an unrecognised kind surfaces a `NoProvider`
+        // error from the registry. (Under the old `Node`-based API a
+        // missing `kind` field could not be expressed at all; with the
+        // typed schema `kind` is mandatory and serde rejects elements
+        // missing it at deserialisation time.)
+        let element = Element::builder()
+            .addr(Addr::parse("//bad-farm").unwrap())
+            .kind("definitely-not-a-real-kind")
+            .config(BTreeMap::default())
+            .build();
         let err = ctx
-            .add_farm(&Addr::parse("//f").unwrap(), &node)
+            .add_farm(&element)
             .await
-            .expect_err("expected Field error");
+            .expect_err("expected NoProvider error");
         assert!(
             matches!(
                 err,
-                error::ContextError::Field { ref field, .. } if field == "kind"
+                error::ContextError::NoProvider { ref component, .. } if component == "environment"
             ),
             "unexpected error: {err:?}",
         );
         assert!(ctx.get_farm(&Addr::parse("//f").unwrap()).is_none());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(log_manager)]
+    async fn context_missing_kind_in_toml_fails_to_deserialize() {
+        // The typed schema requires every element to carry a `kind`. A
+        // TOML block without one is a deserialisation error — the
+        // strongest replacement for the old runtime `Field { field: "kind" }`
+        // check.
+        let toml_str = "path = \"x\"\n";
+        let result: std::result::Result<Element, _> = toml::from_str(toml_str);
+        assert!(
+            result.is_err(),
+            "element without `kind` must fail to deserialise: {result:?}",
+        );
     }
 
     #[tokio::test]

@@ -1,12 +1,12 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use crate::context::{Addr, Config, FromNodeNoContext, Node};
-use crate::non_configurable_no_context;
+use crate::context::{Config, Element, FromElementNoContext};
 use crate::storage::{Artifact, BackendImpl, Id, Layer, LayerOptions, StorageResult};
 use crate::util::{Reader, Writer};
 use async_trait::async_trait;
-use snafu::{IntoError, OptionExt, ResultExt, ensure};
+use serde_json::json;
+use snafu::{OptionExt, ResultExt, ensure};
 use tokio::fs::{File, OpenOptions};
 use tokio::sync::RwLock;
 use uuid::Uuid;
@@ -47,25 +47,24 @@ struct CatalogSlot {
     catalog: Catalog,
 }
 
-#[async_trait]
-impl FromNodeNoContext for LocalBackend {
-    type Error = crate::storage::StorageError;
-
-    async fn from_node(
-        _addr: &Addr,
-        node: &Node,
-        _config: &Config,
-    ) -> std::result::Result<Self, Self::Error> {
-        node.validate_keys(&["path"])?;
-        let path = node
-            .get("path")
-            .and_then(|x| x.as_string())
-            .context(error::PathNotSpecifiedSnafu)?;
-        Self::new_(path).await
-    }
+#[derive(serde::Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
+struct LocalBackendOptions {
+    path: PathBuf,
 }
 
-non_configurable_no_context!(LocalBackend, crate::storage::StorageError);
+#[async_trait]
+impl FromElementNoContext for LocalBackend {
+    type Error = crate::storage::StorageError;
+
+    async fn new(element: &Element, _config: &Config) -> std::result::Result<Self, Self::Error> {
+        let options: LocalBackendOptions =
+            serde_json::from_value(json!(&element.config)).context(error::ConfigSnafu {
+                addr: element.addr.clone(),
+            })?;
+        Self::new_(&options.path).await
+    }
+}
 
 unsafe impl Send for LocalBackend {}
 unsafe impl Sync for LocalBackend {}
@@ -362,7 +361,7 @@ impl BackendImpl for LocalBackend {
         match tokio::fs::metadata(&path).await {
             Ok(meta) => Ok(Some(meta.len())),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(error::ReadSnafu.into_error(e).into()),
+            Err(e) => Err(error::Error::Read { source: e }.into()),
         }
     }
 }
@@ -370,13 +369,18 @@ impl BackendImpl for LocalBackend {
 pub(crate) mod error {
     use snafu::Snafu;
 
-    use crate::storage::StorageError;
+    use crate::{context::Addr, storage::StorageError};
 
     #[derive(Snafu, Debug)]
     #[snafu(visibility(pub(crate)))]
     pub(crate) enum Error {
         #[snafu(display("failed to deserialize manifest: {source}"))]
         Deserialize { source: serde_json::Error },
+        #[snafu(display("element {addr} has invalid configuration: {source}"))]
+        Config {
+            addr: Addr,
+            source: serde_json::Error,
+        },
         #[snafu(display("failed to copy blob: {source}"))]
         Copy { source: std::io::Error },
         #[snafu(display("failed to create temporary file for new layer: {source}"))]
