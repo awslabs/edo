@@ -16,6 +16,7 @@ clap              = { workspace = true }
 edo               = { path = "../edo" }
 edo-core          = { path = "../core" }
 mockall = "0.14.0"
+schemars = "1.2.1"
 snafu             = { workspace = true }
 tokio             = { workspace = true }
 tracing           = { workspace = true }

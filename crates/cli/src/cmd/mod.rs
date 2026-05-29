@@ -8,7 +8,7 @@ mod util;
 use std::collections::{BTreeMap, HashMap};
 
 pub use checkout::*;
-use edo::context::Node;
+use edo::context::Element;
 use edo::context::{Addr, Context, LogVerbosity};
 use edo_core::register_core;
 pub use list::*;
@@ -41,9 +41,13 @@ pub async fn create_context(
     // Register all core component handlers
     register_core(&ctx);
     // Register a local farm in the project directory
+    let local_farm_addr = Addr::parse("//default").unwrap();
     ctx.add_farm(
-        &Addr::parse("//default").unwrap(),
-        &Node::new_definition("environment", "local", "default", BTreeMap::new()),
+        &Element::builder()
+            .kind("local")
+            .addr(local_farm_addr)
+            .config(BTreeMap::default())
+            .build(),
     )
     .await?;
     // Now load the current project

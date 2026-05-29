@@ -97,7 +97,7 @@ impl Scheduler {
         // Pull `[scheduler] workers` if present; non-int values fall
         // through to the default below rather than failing the build.
         let workers = if let Some(node) = config.get("scheduler") {
-            node.get("workers").and_then(|x| x.as_int())
+            node.get("workers").and_then(|x| x.as_i64())
         } else {
             None
         };

@@ -2,7 +2,7 @@
 extern crate tracing;
 
 use edo::{
-    context::{Context, Definable, DefinableNoContext},
+    context::{Context, FromElement, FromElementNoContext},
     environment::Farm,
     source::{Source, Vendor},
     storage::Backend,
@@ -32,91 +32,71 @@ pub fn register_core(ctx: &Context) {
     let registry = ctx.registry();
     registry.register_backend(
         "s3",
-        Arc::new(async |addr, node, ctx: Context| {
-            Ok(Backend::new(
-                S3Backend::new(&addr, &node, ctx.config()).await?,
-            ))
+        Arc::new(async |element, ctx: Context| {
+            Ok(Backend::new(S3Backend::new(&element, ctx.config()).await?))
         }),
     );
     registry.register_farm(
         "local",
-        Arc::new(async |addr, node, ctx| Ok(Farm::new(LocalFarm::new(&addr, &node, &ctx).await?))),
+        Arc::new(async |element, ctx| Ok(Farm::new(LocalFarm::new(&element, &ctx).await?))),
     );
     registry.register_farm(
         "container",
-        Arc::new(async |addr, node, ctx| {
-            Ok(Farm::new(ContainerFarm::new(&addr, &node, &ctx).await?))
-        }),
+        Arc::new(async |element, ctx| Ok(Farm::new(ContainerFarm::new(&element, &ctx).await?))),
     );
     registry.register_source(
         "git",
-        Arc::new(async |addr, node, ctx| {
-            Ok(Source::new(GitSource::new(&addr, &node, &ctx).await?))
-        }),
+        Arc::new(async |element, ctx| Ok(Source::new(GitSource::new(&element, &ctx).await?))),
     );
     registry.register_source(
         "local",
-        Arc::new(async |addr, node, ctx| {
-            Ok(Source::new(LocalSource::new(&addr, &node, &ctx).await?))
-        }),
+        Arc::new(async |element, ctx| Ok(Source::new(LocalSource::new(&element, &ctx).await?))),
     );
     registry.register_source(
         "image",
-        Arc::new(async |addr, node, ctx| {
-            Ok(Source::new(ImageSource::new(&addr, &node, &ctx).await?))
-        }),
+        Arc::new(async |element, ctx| Ok(Source::new(ImageSource::new(&element, &ctx).await?))),
     );
     registry.register_source(
         "remote",
-        Arc::new(async |addr, node, ctx| {
-            Ok(Source::new(RemoteSource::new(&addr, &node, &ctx).await?))
-        }),
+        Arc::new(async |element, ctx| Ok(Source::new(RemoteSource::new(&element, &ctx).await?))),
     );
     registry.register_transform(
         "compose",
-        Arc::new(async |addr, node, ctx| {
-            Ok(Transform::new(
-                ComposeTransform::new(&addr, &node, &ctx).await?,
-            ))
+        Arc::new(async |element, ctx| {
+            Ok(Transform::new(ComposeTransform::new(&element, &ctx).await?))
         }),
     );
     registry.register_transform(
         "import",
-        Arc::new(async |addr, node, ctx| {
-            Ok(Transform::new(
-                ImportTransform::new(&addr, &node, &ctx).await?,
-            ))
+        Arc::new(async |element, ctx| {
+            Ok(Transform::new(ImportTransform::new(&element, &ctx).await?))
         }),
     );
     registry.register_transform(
         "script",
-        Arc::new(async |addr, node, ctx| {
-            Ok(Transform::new(
-                ScriptTransform::new(&addr, &node, &ctx).await?,
-            ))
+        Arc::new(async |element, ctx| {
+            Ok(Transform::new(ScriptTransform::new(&element, &ctx).await?))
         }),
     );
     registry.register_transform(
         "cargo-vendor",
-        Arc::new(async |addr, node, ctx| {
+        Arc::new(async |element, ctx| {
             Ok(Transform::new(
-                CargoVendorTransform::new(&addr, &node, &ctx).await?,
+                CargoVendorTransform::new(&element, &ctx).await?,
             ))
         }),
     );
     registry.register_transform(
         "go-vendor",
-        Arc::new(async |addr, node, ctx| {
+        Arc::new(async |element, ctx| {
             Ok(Transform::new(
-                GoVendorTransform::new(&addr, &node, &ctx).await?,
+                GoVendorTransform::new(&element, &ctx).await?,
             ))
         }),
     );
     registry.register_vendor(
         "image",
-        Arc::new(async |addr, node, ctx| {
-            Ok(Vendor::new(ImageVendor::new(&addr, &node, &ctx).await?))
-        }),
+        Arc::new(async |element, ctx| Ok(Vendor::new(ImageVendor::new(&element, &ctx).await?))),
     );
 }
 /// Error types for the core plugin.

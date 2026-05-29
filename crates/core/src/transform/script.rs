@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use edo::context::{Addr, Context, FromNode, Handle, Log, Node, non_configurable};
+use edo::context::{Addr, Context, Element, FromElement, Handle, Log};
 use edo::environment::{Environment, Vfs};
 use edo::source::Source;
 use edo::storage::{
@@ -15,93 +15,69 @@ use indexmap::IndexMap;
 use ocilot::models::Platform;
 use snafu::{OptionExt, ResultExt};
 
+#[derive(serde::Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct ScriptOptions {
+    arch: Option<String>,
+    #[serde(default)]
+    depends: Vec<Addr>,
+    commands: Vec<String>,
+    #[serde(default = "default_interpreter")]
+    interpreter: String,
+    artifact: Option<PathBuf>,
+}
+
+fn default_interpreter() -> String {
+    "bash".to_string()
+}
+
 /// A transform that executes shell commands in a build environment to produce an artifact.
 pub struct ScriptTransform {
     pub addr: Addr,
-    pub arch: Option<String>,
     pub environment: Addr,
-    pub depends: Vec<Addr>,
-    pub commands: Vec<String>,
-    pub interpreter: String,
-    pub artifact: Option<PathBuf>,
-    pub sources: IndexMap<String, Source>,
+    pub sources: IndexMap<String, Vec<Source>>,
+    pub options: ScriptOptions,
 }
 
 #[async_trait]
-impl FromNode for ScriptTransform {
+impl FromElement for ScriptTransform {
     type Error = error::Error;
 
-    async fn from_node(addr: &Addr, node: &Node, ctx: &Context) -> Result<Self, error::Error> {
-        node.validate_keys(&["commands"])?;
-        let environment = if let Some(n) = node.get("environment") {
-            Addr::parse(&n.as_string().context(error::FieldSnafu {
-                field: "environment",
-                type_: "string",
-            })?)?
-        } else {
-            Addr::parse("//default")?
-        };
-        let interpreter = if let Some(n) = node.get("interpreter") {
-            n.as_string()
-                .context(error::FieldSnafu {
-                    field: "interpreter",
-                    type_: "string",
-                })?
-                .clone()
-        } else {
-            "bash".to_string()
-        };
-        let mut commands: Vec<String> = Vec::new();
-        for line in node
-            .get("commands")
-            .unwrap()
-            .as_list()
-            .context(error::FieldSnafu {
-                field: "commands",
-                type_: "list of strings",
-            })?
+    async fn new(element: &Element, ctx: &Context) -> Result<Self, error::Error> {
+        let mut options: ScriptOptions = element.get()?;
+        options.arch = if options.arch.is_none()
+            && let Some(arch) = ctx.args().get("arch")
         {
-            commands.push(
-                line.as_string()
-                    .context(error::FieldSnafu {
-                        field: "commands",
-                        type_: "list of strings",
-                    })?
-                    .clone(),
-            );
-        }
-        let artifact = if let Some(n) = node.get("artifact") {
-            Some(PathBuf::from(n.as_string().context(error::FieldSnafu {
-                field: "artifact",
-                type_: "string",
-            })?))
+            Some(arch.clone())
         } else {
-            None
+            options.arch
         };
-        let field_error = |field: &str, type_: &str| error::Error::Field {
-            field: field.to_string(),
-            type_: type_.to_string(),
-        };
-        let depends = super::parse_depends(node, "depends", field_error).await?;
-        let sources = super::parse_sources(addr, node, ctx, field_error).await?;
+        let environment = element
+            .environment
+            .clone()
+            .unwrap_or(Addr::parse("//default").unwrap());
+        let mut sources = IndexMap::new();
+        for (scope, source_list) in element
+            .source
+            .as_ref()
+            .and_then(|x| x.get_resolved())
+            .cloned()
+            .unwrap_or_default()
+        {
+            let mut entries = Vec::new();
+            for source in source_list.iter() {
+                entries.push(ctx.add_source(source).await?);
+            }
+            sources.insert(scope.clone(), entries);
+        }
         Ok(Self {
-            addr: addr.clone(),
-            arch: if let Some(arch) = ctx.args().get("arch") {
-                Some(arch.clone())
-            } else {
-                node.get("arch").and_then(|x| x.as_string())
-            },
+            addr: element.addr.clone(),
             environment,
-            depends,
-            interpreter,
-            commands,
             sources,
-            artifact,
+            options,
         })
     }
 }
-
-non_configurable!(ScriptTransform, error::Error);
 
 #[async_trait]
 impl TransformImpl for ScriptTransform {
@@ -113,7 +89,7 @@ impl TransformImpl for ScriptTransform {
         // Digest will be a merkle hash of:
         // all sources digest + script contents
         let mut hash = blake3::Hasher::new();
-        let mut depends = self.depends.clone();
+        let mut depends = self.options.depends.clone();
         depends.sort();
         for depend in depends.iter() {
             // We should use the resolved id for the dependency
@@ -123,35 +99,35 @@ impl TransformImpl for ScriptTransform {
             let id = t.get_unique_id(ctx).await?;
             hash.update(id.digest().as_bytes());
         }
-        for source in self.sources.values() {
-            let source_id = source.get_unique_id().await?;
-            hash.update(source_id.digest().as_bytes());
+        for source_list in self.sources.values() {
+            for source in source_list {
+                let source_id = source.get_unique_id().await?;
+                hash.update(source_id.digest().as_bytes());
+            }
         }
-        let script = self.commands.join("\n");
+        let script = self.options.commands.join("\n");
         hash.update(script.as_bytes());
         let hash_bytes = hash.finalize();
         let digest = base16::encode_lower(hash_bytes.as_bytes());
-        let arch = self
-            .arch
-            .as_ref()
-            .map(|arch| ctx.args().get("arch").cloned().unwrap_or(arch.clone()));
         let id = Id::builder()
             .name(self.addr.to_id())
             .digest(digest)
-            .maybe_arch(arch)
+            .maybe_arch(self.options.arch.clone())
             .build();
         trace!(component = "transform", type = "script", "id is calculated to be {id}");
         Ok(id.clone())
     }
 
     async fn depends(&self) -> TransformResult<Vec<Addr>> {
-        Ok(self.depends.clone())
+        Ok(self.options.depends.clone())
     }
 
     async fn prepare(&self, log: &Log, ctx: &Handle) -> TransformResult<()> {
         // We should fetch all our sources
-        for source in self.sources.values() {
-            source.cache(log, ctx.storage()).await?;
+        for source_list in self.sources.values() {
+            for source in source_list {
+                source.cache(log, ctx.storage()).await?;
+            }
         }
         Ok(())
     }
@@ -186,16 +162,19 @@ impl TransformImpl for ScriptTransform {
         }
 
         // Stage all sources in our build-root
-        for (addr, source) in self.sources.iter() {
-            trace!(component = "transform", type = "script", "staging source {addr}");
-            env.stage(
-                ctx,
-                ArtifactStageOptions::builder()
-                    .id(source.get_unique_id().await?)
-                    .path(build_root)
-                    .build(),
-            )
-            .await?;
+        for source_list in self.sources.values() {
+            for source in source_list {
+                let id = source.get_unique_id().await?;
+                trace!(component = "transform", type = "script", "staging source {id}");
+                env.stage(
+                    ctx,
+                    ArtifactStageOptions::builder()
+                        .id(id)
+                        .path(build_root)
+                        .build(),
+                )
+                .await?;
+            }
         }
         Ok(())
     }
@@ -207,14 +186,14 @@ impl TransformImpl for ScriptTransform {
             let handlebars = Handlebars::new();
             let vfs = Vfs::new(&id, env, log).await?;
 
-            let mut script = vec![format!("#!/usr/bin/env {}", self.interpreter)];
+            let mut script = vec![format!("#!/usr/bin/env {}", self.options.interpreter)];
             let build_root = vfs.create_dir("build-root").await?;
             let install_root = vfs.create_dir("install-root").await?;
-            let mut commands = self.commands.clone();
+            let mut commands = self.options.commands.clone();
 
             script.append(&mut commands);
 
-            let arch = if let Some(arch) = self.arch.as_ref() {
+            let arch = if let Some(arch) = self.options.arch.as_ref() {
                 arch.as_str()
             } else {
                 std::env::consts::ARCH
@@ -237,15 +216,20 @@ impl TransformImpl for ScriptTransform {
                 .render_template(&script_string, &args)
                 .context(error::RenderSnafu)?;
 
-            // Write the scripot into the vfs
+            // Write the script into the vfs
             let script = vfs.entry("script.sh").await;
             vfs.write(script.path(), resolved_script.as_bytes()).await?;
             // Make it executable
-            vfs.command("chmod", "chmod", &["+x", script.as_ref()])
+            vfs.command("chmod", "chmod", &["+x", AsRef::<str>::as_ref(&script)])
                 .await?;
-            // Run the script
-            vfs.command("script", script.clone(), &Vec::<&str>::new())
-                .await?;
+            // Run the script via the configured interpreter so the script
+            // path resolves regardless of whether `.` is in PATH.
+            vfs.command(
+                "script",
+                &self.options.interpreter,
+                &[AsRef::<str>::as_ref(&script)],
+            )
+            .await?;
 
             // The result of a script transform is everything put in the install-root
             let mut artifact = Artifact::builder()
@@ -256,7 +240,7 @@ impl TransformImpl for ScriptTransform {
             // Open a layer to store the result in
             let writer = ctx.storage().safe_start_layer().await?;
             let mut apath = PathBuf::from("install-root");
-            if let Some(path) = self.artifact.as_ref() {
+            if let Some(path) = self.options.artifact.as_ref() {
                 apath = apath.join(path);
             }
             env.read_stream(apath.as_path(), writer.clone()).await?;
@@ -270,7 +254,8 @@ impl TransformImpl for ScriptTransform {
                                 Platform::builder()
                                     .os(std::env::consts::OS)
                                     .architecture(
-                                        self.arch
+                                        self.options
+                                            .arch
                                             .clone()
                                             .unwrap_or(std::env::consts::ARCH.to_string()),
                                     )
@@ -284,17 +269,12 @@ impl TransformImpl for ScriptTransform {
             Ok::<Artifact, TransformError>(artifact)
         }
         .await
-        .as_ref()
         {
-            Ok(artifact) => TransformStatus::Success(artifact.clone()),
-            // We always assume a script transform is retryable
-            Err(e) => TransformStatus::Retryable(
-                Some(log.path()),
-                error::Error::Failed {
-                    message: e.to_string(),
-                }
-                .into(),
-            ),
+            Ok(artifact) => TransformStatus::Success(artifact),
+            // We always assume a script transform is retryable. Move the
+            // owned `TransformError` into the status so the snafu source
+            // chain is preserved (don't stringify via `e.to_string()`).
+            Err(e) => TransformStatus::Retryable(Some(log.path()), e),
         }
     }
 
@@ -324,12 +304,11 @@ pub mod error {
             #[snafu(source(from(ContextError, Box::new)))]
             source: Box<ContextError>,
         },
-        #[snafu(display("{message}"))]
-        Failed { message: String },
-        #[snafu(display(
-            "script transform definitions require a field '{field}' with type_ '{type_}'"
-        ))]
-        Field { field: String, type_: String },
+        #[snafu(display("invalid script transform definition at {addr}: {source}"))]
+        Invalid {
+            addr: Addr,
+            source: serde_json::Error,
+        },
         #[snafu(display("could not find dependent transform with address {addr}"))]
         NotFound { addr: Addr },
         #[snafu(display("failed to render handlebars template for script: {source}"))]

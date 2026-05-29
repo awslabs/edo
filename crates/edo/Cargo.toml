@@ -39,6 +39,7 @@ rand               = { workspace = true }
 regex              = { workspace = true }
 reqwest            = { workspace = true }
 resolvo            = { workspace = true }
+schemars           = { workspace = true, features = ["semver1"] }
 semver             = { workspace = true }
 serde              = { workspace = true }
 serde_json         = { workspace = true }

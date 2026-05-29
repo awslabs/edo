@@ -1,46 +1,30 @@
 use async_trait::async_trait;
-use edo::context::{Addr, Context, FromNode, Log, Node, non_configurable};
+use edo::context::{Context, Element, FromElement, Log};
 use edo::record;
 use edo::source::{SourceImpl, SourceResult};
 use edo::storage::{Artifact, Compression, Config, Id, LayerOptions, MediaType, Storage};
 use merkle_hash::MerkleTree;
-use snafu::{OptionExt, ResultExt};
+use snafu::ResultExt;
 use std::path::{PathBuf, absolute};
 use tokio::{fs::File, io::AsyncWriteExt};
 use tokio_tar::Builder;
 
 /// A source backed by a local filesystem path.
+#[derive(serde::Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct LocalSource {
     path: PathBuf,
     out: Option<PathBuf>,
 }
 
 #[async_trait]
-impl FromNode for LocalSource {
+impl FromElement for LocalSource {
     type Error = error::Error;
 
-    async fn from_node(_: &Addr, node: &Node, _: &Context) -> Result<Self, error::Error> {
-        node.validate_keys(&["path"])?;
-        let path = node
-            .get("path")
-            .unwrap()
-            .as_string()
-            .context(error::FieldSnafu {
-                field: "path",
-                type_: "string",
-            })?;
-        let out = node
-            .get("out")
-            .and_then(|x| x.as_string())
-            .map(PathBuf::from);
-        Ok(Self {
-            path: PathBuf::from(path),
-            out,
-        })
+    async fn new(element: &Element, _: &Context) -> Result<Self, error::Error> {
+        element.get().map_err(|e| e.into())
     }
 }
-
-non_configurable!(LocalSource, error::Error);
 
 #[async_trait]
 impl SourceImpl for LocalSource {
@@ -136,7 +120,10 @@ impl SourceImpl for LocalSource {
 }
 
 pub mod error {
-    use edo::{context::error::ContextError, source::SourceError};
+    use edo::{
+        context::{Addr, error::ContextError},
+        source::SourceError,
+    };
     use snafu::Snafu;
 
     #[derive(Snafu, Debug)]
@@ -146,8 +133,11 @@ pub mod error {
         Absolute { source: std::io::Error },
         #[snafu(display("failed to archive git repository: {source}"))]
         Archive { source: std::io::Error },
-        #[snafu(display("local source definition field '{field}' should be a '{type_}'"))]
-        Field { field: String, type_: String },
+        #[snafu(display("invalid local source definition {addr}: {source}"))]
+        Invalid {
+            addr: Addr,
+            source: serde_json::Error,
+        },
         #[snafu(display("failed to calculate merkle hash of directory: {source}"))]
         Merkle {
             source: merkle_hash::error::IndexingError,

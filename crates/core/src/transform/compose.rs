@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use edo::{
-    context::{Addr, Context, FromNode, Handle, Log, Node, non_configurable},
+    context::{Addr, Context, Element, FromElement, Handle, Log},
     environment::Environment,
     storage::{Artifact, ArtifactStageOptions, Compression, Config, Id, LayerOptions, MediaType},
     transform::{TransformImpl, TransformResult, TransformStatus},
@@ -8,37 +8,30 @@ use edo::{
 use snafu::OptionExt;
 use std::path::Path;
 
+#[derive(serde::Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
+struct ComposeOptions {
+    depends: Vec<Addr>,
+}
+
 /// A transform that composes multiple dependency artifacts into a single output artifact.
 pub struct ComposeTransform {
     pub addr: Addr,
-    pub arch: Option<String>,
     pub depends: Vec<Addr>,
 }
 
 #[async_trait]
-impl FromNode for ComposeTransform {
+impl FromElement for ComposeTransform {
     type Error = error::Error;
 
-    async fn from_node(addr: &Addr, node: &Node, ctx: &Context) -> Result<Self, error::Error> {
-        let depends = super::parse_depends(node, "depends", |field, type_| error::Error::Field {
-            field: field.to_string(),
-            type_: type_.to_string(),
-        })
-        .await?;
-        let arch = if let Some(arch) = ctx.args().get("arch") {
-            Some(arch.clone())
-        } else {
-            node.get("arch").and_then(|x| x.as_string())
-        };
+    async fn new(element: &Element, _ctx: &Context) -> Result<Self, error::Error> {
+        let options: ComposeOptions = element.get()?;
         Ok(Self {
-            addr: addr.clone(),
-            arch,
-            depends,
+            addr: element.addr.clone(),
+            depends: options.depends,
         })
     }
 }
-
-non_configurable!(ComposeTransform, error::Error);
 
 #[async_trait]
 impl TransformImpl for ComposeTransform {
@@ -60,16 +53,8 @@ impl TransformImpl for ComposeTransform {
         }
         let hash_bytes = hash.finalize();
         let digest = base16::encode_lower(hash_bytes.as_bytes());
-        let arch = self
-            .arch
-            .as_ref()
-            .map(|arch| ctx.args().get("arch").cloned().unwrap_or(arch.clone()));
 
-        let id = Id::builder()
-            .name(self.addr.to_id())
-            .digest(digest)
-            .maybe_arch(arch)
-            .build();
+        let id = Id::builder().name(self.addr.to_id()).digest(digest).build();
         trace!(component = "transform", type = "compose", "id is calculated to be {id}");
         Ok(id.clone())
     }
@@ -166,10 +151,13 @@ pub mod error {
             #[snafu(source(from(ContextError, Box::new)))]
             source: Box<ContextError>,
         },
+        #[snafu(display("invalid compose transform at {addr}: {source}"))]
+        Invalid {
+            addr: Addr,
+            source: serde_json::Error,
+        },
         #[snafu(display("could not find dependent transform with address {addr}"))]
         NotFound { addr: Addr },
-        #[snafu(display("compose transform requires a field '{field}' with type '{type_}"))]
-        Field { field: String, type_: String },
     }
 
     impl From<Error> for TransformError {

@@ -4,7 +4,6 @@ schema-version = "1"
 kind       = "local"
 path       = "rust_src"
 out        = "."
-is_archive = false
 
 [transform.vendor]
 kind   = "cargo-vendor"

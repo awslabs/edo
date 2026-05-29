@@ -1,129 +1,22 @@
-//! Configuration traits and user-level config loading.
+//! User-level config loading.
 //!
-//! Provides the [`Definable`] and [`DefinableNoContext`] traits that allow
-//! plugins and components to declare a configuration key and accept
-//! configuration from either the node definition or the user's global
-//! `~/.config/edo.toml`. [`NonConfigurable`] is a zero-cost marker for
-//! components that need no configuration. [`Config`] loads and queries the
-//! user-level configuration file.
+//! [`Config`] loads and queries the user-level configuration file at
+//! `~/.config/edo.toml` (or a custom path). It is passed to component
+//! constructors (`FromElement::new` / `FromElementNoContext::new`) so they
+//! can read user-scoped settings keyed by component kind.
 
 use crate::context::ArcMap;
 
-use super::{Addr, Context, ContextResult as Result, FromNode, FromNodeNoContext, Node, error};
-use async_trait::async_trait;
+use super::{ContextResult as Result, error};
 use dashmap::DashMap;
 use home::home_dir;
 use snafu::{OptionExt, ResultExt};
-use std::{collections::BTreeMap, marker::PhantomData, path::Path, sync::Arc};
-
-/// A component that can be configured from a [`Node`] with access to the
-/// build [`Context`].
-///
-/// Implementors declare a [`key`](Definable::key) used to look up
-/// configuration in the user's global config file when no inline `config`
-/// block is present.
-#[async_trait]
-pub trait Definable<E, C: FromNode<Error = E> + Send + Default>: FromNode<Error = E> {
-    /// Constructs the component from a node, resolving configuration from the
-    /// inline `config` block, the global config file, or the default.
-    async fn new(addr: &Addr, node: &Node, ctx: &Context) -> std::result::Result<Self, E> {
-        let config_key = Self::key();
-        let config_node =
-            if let Some(cnode) = node.get_table().as_ref().and_then(|x| x.get("config")) {
-                Some(C::from_node(addr, cnode, ctx).await?)
-            } else if let Some(cnode) = ctx.config().get(config_key) {
-                Some(C::from_node(addr, &cnode, ctx).await?)
-            } else {
-                None
-            };
-        let mut me = Self::from_node(addr, node, ctx).await?;
-        if let Some(config) = config_node.as_ref() {
-            me.set_config(config)?;
-        } else {
-            me.set_config(&C::default())?;
-        }
-        Ok(me)
-    }
-
-    /// Returns the configuration key used to look up settings in the global config.
-    fn key() -> &'static str;
-    /// Applies the resolved configuration to this component.
-    fn set_config(&mut self, config: &C) -> std::result::Result<(), E>;
-}
-
-/// Like [`Definable`], but for components that do not need a [`Context`]
-/// reference during construction.
-#[async_trait]
-pub trait DefinableNoContext<E, C: FromNodeNoContext<Error = E> + Send + Default>:
-    FromNodeNoContext<Error = E>
-{
-    /// Constructs the component from a node without a [`Context`], resolving
-    /// configuration from the inline block, the global config, or the default.
-    async fn new(addr: &Addr, node: &Node, config: &Config) -> std::result::Result<Self, E> {
-        let config_key = Self::key();
-        let config_node =
-            if let Some(cnode) = node.get_table().as_ref().and_then(|x| x.get("config")) {
-                Some(C::from_node(addr, cnode, config).await?)
-            } else if let Some(cnode) = config.get(config_key) {
-                Some(C::from_node(addr, &cnode, config).await?)
-            } else {
-                None
-            };
-        let mut me = Self::from_node(addr, node, config).await?;
-        if let Some(config) = config_node.as_ref() {
-            me.set_config(config)?;
-        } else {
-            me.set_config(&C::default())?;
-        }
-        Ok(me)
-    }
-
-    /// Returns the configuration key used to look up settings in the global config.
-    fn key() -> &'static str;
-    /// Applies the resolved configuration to this component.
-    fn set_config(&mut self, config: &C) -> std::result::Result<(), E>;
-}
-
-/// A zero-size marker type implementing [`FromNode`] and [`FromNodeNoContext`]
-/// for components that require no configuration.
-pub struct NonConfigurable<E> {
-    _data: PhantomData<E>,
-}
-
-impl<E> Default for NonConfigurable<E> {
-    fn default() -> Self {
-        Self { _data: PhantomData }
-    }
-}
-
-unsafe impl<E> Send for NonConfigurable<E> {}
-
-#[async_trait]
-impl<E> FromNode for NonConfigurable<E> {
-    type Error = E;
-
-    async fn from_node(
-        _addr: &Addr,
-        _node: &Node,
-        _: &super::Context,
-    ) -> std::result::Result<Self, E> {
-        Ok(Self { _data: PhantomData })
-    }
-}
-
-#[async_trait]
-impl<E> FromNodeNoContext for NonConfigurable<E> {
-    type Error = E;
-
-    async fn from_node(_addr: &Addr, _node: &Node, _: &Config) -> std::result::Result<Self, E> {
-        Ok(Self { _data: PhantomData })
-    }
-}
+use std::{collections::BTreeMap, path::Path, sync::Arc};
 
 /// User-level configuration loaded from `~/.config/edo.toml` (or a custom path).
 #[derive(Clone, Default)]
 pub struct Config {
-    configs: ArcMap<String, Node>,
+    configs: ArcMap<String, serde_json::Value>,
 }
 
 impl Config {
@@ -143,7 +36,7 @@ impl Config {
             });
         }
         let bytes = tokio::fs::read(path).await.context(error::IoSnafu)?;
-        let configs: BTreeMap<String, Node> =
+        let configs: BTreeMap<String, serde_json::Value> =
             toml::from_slice(&bytes).context(error::DeserializeSnafu)?;
 
         Ok(Self {
@@ -152,12 +45,12 @@ impl Config {
     }
 
     /// Returns the configuration node for the given key, if present.
-    pub fn get(&self, name: &str) -> Option<Node> {
+    pub fn get(&self, name: &str) -> Option<serde_json::Value> {
         self.configs.get(name).map(|x| x.value().clone())
     }
 
     /// Merges in another set of nodes
-    pub fn merge(&self, right: &BTreeMap<String, Node>) {
+    pub fn merge(&self, right: &BTreeMap<String, serde_json::Value>) {
         for (key, value) in right {
             self.configs.insert(key.clone(), value.clone());
         }
@@ -184,7 +77,7 @@ mod tests {
         tokio::fs::write(&path, b"foo = \"bar\"\n").await.unwrap();
         let cfg = Config::load(Some(&path)).await.expect("ok");
         let node = cfg.get("foo").expect("foo exists");
-        assert_eq!(node.as_string(), Some("bar".to_string()));
+        assert_eq!(node.as_str(), Some("bar"));
     }
 
     #[tokio::test]
@@ -207,17 +100,5 @@ mod tests {
         // No assertion on contents — this depends on user's environment.
         // The function falls back to ~/.config/edo.toml; if that does not exist, returns empty.
         let _cfg = Config::load::<&std::path::Path>(None).await.expect("ok");
-    }
-
-    #[tokio::test]
-    async fn non_configurable_default_and_from_node() {
-        // NonConfigurable<E> must be constructible with Default.
-        // FromNodeNoContext::from_node always returns Ok for arbitrary input.
-        let _n: NonConfigurable<()> = NonConfigurable::default();
-        let addr = Addr::parse("//x").unwrap();
-        let node = Node::new_bool(true);
-        let cfg = Config::load::<&std::path::Path>(None).await.unwrap();
-        let res = <NonConfigurable<()> as FromNodeNoContext>::from_node(&addr, &node, &cfg).await;
-        assert!(res.is_ok());
     }
 }

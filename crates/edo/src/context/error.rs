@@ -24,6 +24,12 @@ pub enum ContextError {
     /// The user's home directory could not be determined.
     #[snafu(display("failed to find home directory"))]
     Home,
+    #[snafu(display("invalid element for {kind} at {addr}: {source}"))]
+    Invalid {
+        kind: String,
+        addr: Addr,
+        source: serde_json::Error,
+    },
     /// An I/O operation failed.
     #[snafu(display("io error occured: {source}"))]
     Io {
@@ -104,6 +110,15 @@ pub enum ContextError {
         /// The invalid source id.
         id: String,
     },
+    /// A `source = "..."` reference points to an address that has no
+    /// matching `[source.<addr>]` entry in the merged schema.
+    #[snafu(display(
+        "source reference '{id}' is not defined; add a [source.\"{id}\"] entry or fix the reference"
+    ))]
+    MissingSource {
+        /// The unresolved source address.
+        id: String,
+    },
     /// The block is not a vendor definition.
     #[snafu(display("block is not a vendor definition"))]
     NotVendor,
@@ -132,6 +147,10 @@ pub enum ContextError {
         /// The underlying JSON serialization error.
         source: serde_json::Error,
     },
+    #[snafu(display(
+        "invalid `source` attribute to element, it must be a single string, list of strings or a map of string to string[]"
+    ))]
+    SourceMap,
     /// A storage subsystem error.
     #[snafu(transparent)]
     Storage {

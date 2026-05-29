@@ -16,17 +16,23 @@
 
 use async_trait::async_trait;
 use edo::{
-    context::{Addr, Context, FromNode, Handle, Log, Node},
+    context::{Addr, Context, Element, FromElement, Handle, Log},
     environment::{Environment, Vfs},
-    non_configurable,
     source::Source,
     storage::{Artifact, ArtifactStageOptions, Compression, Config, Id, LayerOptions, MediaType},
     transform::{TransformError, TransformImpl, TransformResult, TransformStatus},
 };
-use indexmap::IndexMap;
 use snafu::OptionExt;
-use std::collections::VecDeque;
-use std::path::Path;
+use std::{collections::BTreeMap, path::Path};
+use std::{collections::VecDeque, path::PathBuf};
+
+/// User configurable options for the CargoVendorTransform
+#[derive(serde::Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
+struct CargoVendorOptions {
+    #[serde(rename = "cargo-tomls", default)]
+    cargo_tomls: BTreeMap<String, Vec<PathBuf>>,
+}
 
 /// A transform that runs `cargo vendor` over one or more sources and packages
 /// the result (vendored crates + generated `.cargo/config.toml`) as an artifact.
@@ -42,62 +48,52 @@ pub struct CargoVendorTransform {
     /// Address of the [`Environment`] in which `cargo vendor` is executed.
     /// Defaults to `//default` when not specified in the node.
     pub environment: Addr,
-    /// Named sources to vendor, keyed by the name used in the TOML config.
+    /// Named sources to vendor.
     /// Each source is staged into a directory named after its unique id.
-    pub sources: IndexMap<String, Source>,
+    pub sources: BTreeMap<Addr, Source>,
     /// Optional override of which `Cargo.toml` files to feed cargo, keyed by
     /// the source name. Paths are relative to the source's staged directory.
     /// When omitted for a source, the source's root `Cargo.toml` is used (if
     /// present).
-    pub cargo_tomls: IndexMap<String, Vec<String>>,
+    pub cargo_tomls: BTreeMap<String, Vec<PathBuf>>,
 }
 
 #[async_trait]
-impl FromNode for CargoVendorTransform {
+impl FromElement for CargoVendorTransform {
     type Error = error::Error;
 
-    async fn from_node(addr: &Addr, node: &Node, ctx: &Context) -> Result<Self, error::Error> {
-        let environment = if let Some(n) = node.get("environment") {
-            Addr::parse(&n.as_string().context(error::FieldSnafu {
-                field: "environment",
-                type_: "string",
-            })?)?
-        } else {
-            Addr::parse("//default")?
-        };
-        let mut cargo_tomls = IndexMap::new();
-        if let Some(table) = node.get("cargo_tomls").and_then(|x| x.as_table()) {
-            for (key, value) in table.iter() {
-                let mut configs = Vec::new();
-                for entry in value.as_list().context(error::FieldSnafu {
-                    field: "cargo_tomls",
-                    type_: "table(list[string])",
-                })? {
-                    configs.push(entry.as_string().context(error::FieldSnafu {
-                        field: "cargo_tomls",
-                        type_: "table(list[string])",
-                    })?);
-                }
-                configs.sort();
-                cargo_tomls.insert(key.clone(), configs);
-            }
-            cargo_tomls.sort_keys();
+    async fn new(element: &Element, ctx: &Context) -> Result<Self, error::Error> {
+        let mut options: CargoVendorOptions = element.get()?;
+        let environment = element
+            .environment
+            .clone()
+            .unwrap_or(Addr::parse("//default")?);
+        let mut cargo_tomls = BTreeMap::new();
+        for (key, value) in options.cargo_tomls.iter_mut() {
+            value.sort();
+            cargo_tomls.insert(key.clone(), value.clone());
         }
-        let field_error = |field: &str, type_: &str| error::Error::Field {
-            field: field.to_string(),
-            type_: type_.to_string(),
-        };
+        let mut resolved = BTreeMap::new();
+        let sources = element
+            .source
+            .as_ref()
+            .and_then(|x| x.get_resolved())
+            .and_then(|x| x.get("default"))
+            .context(error::NoSourcesSnafu {
+                addr: element.addr.clone(),
+            })?;
+        for src in sources {
+            resolved.insert(src.addr.clone(), ctx.add_source(src).await?);
+        }
 
         Ok(Self {
-            addr: addr.clone(),
+            addr: element.addr.clone(),
             environment,
-            sources: super::parse_sources(addr, node, ctx, field_error).await?,
+            sources: resolved,
             cargo_tomls,
         })
     }
 }
-
-non_configurable!(CargoVendorTransform, error::Error);
 
 #[async_trait]
 impl TransformImpl for CargoVendorTransform {
@@ -120,7 +116,7 @@ impl TransformImpl for CargoVendorTransform {
         // would require a rebuild
         for (key, value) in self.cargo_tomls.iter() {
             for entry in value {
-                let unique = format!("{key}-{entry}");
+                let unique = format!("{key}-{entry:?}");
                 hash.update(unique.as_bytes());
             }
         }
@@ -156,9 +152,9 @@ impl TransformImpl for CargoVendorTransform {
     /// from colliding and makes the staged paths content-addressed.
     async fn stage(&self, _log: &Log, ctx: &Handle, env: &Environment) -> TransformResult<()> {
         // For each source we are going to stage things into addr centered directories
-        for (addr, source) in self.sources.iter() {
-            trace!(component = "transform", type = "cargo-vendor", "staging source {addr}");
+        for (_, source) in self.sources.iter() {
             let id = source.get_unique_id().await?;
+            trace!(component = "transform", type = "cargo-vendor", "staging source {id}");
             let string = id.to_string();
             let dir = Path::new(&string);
             env.create_dir(dir).await?;
@@ -197,9 +193,10 @@ impl TransformImpl for CargoVendorTransform {
 
             // Now we want to gather our directory paths
             let mut cargo_tomls = VecDeque::new();
-            for (name, source) in self.sources.iter() {
+            for (addr, source) in self.sources.iter() {
                 let src_id = source.get_unique_id().await?;
                 let src_dir = vfs.entry(src_id.to_string()).await;
+                let name = addr.last().unwrap();
                 // If we have an override use those paths for the cargo tomls and assume their presence
                 if let Some(list) = self.cargo_tomls.get(name) {
                     for item in list {
@@ -289,7 +286,11 @@ directory = ".cargo/vendor"
 pub mod error {
     use snafu::Snafu;
 
-    use edo::{context::ContextError, source::SourceError, transform::TransformError};
+    use edo::{
+        context::{Addr, ContextError},
+        source::SourceError,
+        transform::TransformError,
+    };
 
     /// Errors raised by the `cargo-vendor` transform.
     #[derive(Snafu, Debug)]
@@ -302,19 +303,17 @@ pub mod error {
             #[snafu(source(from(ContextError, Box::new)))]
             source: Box<ContextError>,
         },
-        /// A required TOML field was missing or had the wrong shape.
-        #[snafu(display(
-            "cargo-vendor transform definitions require a field '{field}' with type_ '{type_}'"
-        ))]
-        Field {
-            /// Name of the missing or ill-typed field.
-            field: String,
-            /// Human-readable description of the expected type.
-            type_: String,
+        #[snafu(display("invalid cargo vendor transform at {addr}: {source}"))]
+        Invalid {
+            addr: Addr,
+            source: serde_json::Error,
         },
         /// Error if there are no cargo.tomls found
         #[snafu(display("no Cargo.toml files were found to vendor"))]
         NoCargo,
+        /// No sources were provided
+        #[snafu(display("no sources were provided to cargo vendor transform at {addr}"))]
+        NoSources { addr: Addr },
         /// Bubbled up from the [`Source`](edo::source::Source) subsystem
         /// (fetch / stage / id computation).
         #[snafu(transparent)]

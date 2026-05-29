@@ -4,7 +4,6 @@ schema-version = "1"
 kind       = "local"
 path       = "hello_script/files"
 out        = "."
-is_archive = false
 
 [transform.build]
 kind        = "script"

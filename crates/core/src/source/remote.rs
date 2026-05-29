@@ -3,62 +3,34 @@ use edo::record;
 use edo::storage::LayerOptions;
 use futures::TryStreamExt;
 use serde_json::json;
-use snafu::{OptionExt, ResultExt, ensure};
+use snafu::{ResultExt, ensure};
 use std::path::PathBuf;
 use tokio_util::io::StreamReader;
 use tracing::Instrument;
 use url::Url;
 
-use edo::context::{Addr, Context, FromNode, Log, Node, non_configurable};
+use edo::context::{Context, Element, FromElement, Log};
 use edo::source::{SourceImpl, SourceResult};
 use edo::storage::{Artifact, Config, Id, MediaType, Storage};
 
 /// A source that fetches a file from a remote URL and stores it as an artifact.
+#[derive(serde::Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct RemoteSource {
     url: Url,
+    #[serde(rename = "ref")]
     digest: String,
     out: Option<PathBuf>,
 }
 
 #[async_trait]
-impl FromNode for RemoteSource {
+impl FromElement for RemoteSource {
     type Error = error::RemoteSourceError;
 
-    async fn from_node(
-        _: &Addr,
-        node: &Node,
-        _: &Context,
-    ) -> Result<Self, error::RemoteSourceError> {
-        node.validate_keys(&["url", "out", "ref"])?;
-        let url = node
-            .get("url")
-            .unwrap()
-            .as_string()
-            .context(error::FieldSnafu {
-                field: "url",
-                type_: "string",
-            })?;
-        let out = node
-            .get("out")
-            .and_then(|x| x.as_string())
-            .map(PathBuf::from);
-        let digest = node
-            .get("ref")
-            .unwrap()
-            .as_string()
-            .context(error::FieldSnafu {
-                field: "ref",
-                type_: "string",
-            })?;
-        Ok(Self {
-            url: Url::parse(&url).context(error::UrlSnafu)?,
-            out,
-            digest,
-        })
+    async fn new(element: &Element, _: &Context) -> Result<Self, error::RemoteSourceError> {
+        element.get().map_err(|e| e.into())
     }
 }
-
-non_configurable!(RemoteSource, error::RemoteSourceError);
 
 #[async_trait]
 impl SourceImpl for RemoteSource {
@@ -152,7 +124,10 @@ impl SourceImpl for RemoteSource {
 pub mod error {
     use snafu::Snafu;
 
-    use edo::{context::error::ContextError, source::SourceError};
+    use edo::{
+        context::{Addr, error::ContextError},
+        source::SourceError,
+    };
 
     #[derive(Snafu, Debug)]
     #[snafu(visibility(pub))]
@@ -166,8 +141,11 @@ pub mod error {
         Failed { url: url::Url, message: String },
         #[snafu(display("remote source has hash '{actual}' instead of expected '{expected}'"))]
         Digest { actual: String, expected: String },
-        #[snafu(display("remote source definition requires a field '{field}' with type '{type_}"))]
-        Field { field: String, type_: String },
+        #[snafu(display("invalid remote source definition at {addr}: {source}"))]
+        Invalid {
+            addr: Addr,
+            source: serde_json::Error,
+        },
         #[snafu(display("io error occured during remote source fetch: {source}"))]
         Io { source: std::io::Error },
         #[snafu(display("failed to make request to remote: {source}"))]

@@ -1,71 +1,42 @@
 use async_trait::async_trait;
 use edo::record;
 use ocilot::{index::Index, models::Platform, uri::Uri};
+use snafu::ResultExt;
 use snafu::ensure;
-use snafu::{OptionExt, ResultExt};
 use std::collections::BTreeSet;
 
-use edo::context::{Addr, Context, FromNode, Log, Node, non_configurable};
+use edo::context::{Context, Element, FromElement, Log};
 use edo::source::{SourceImpl, SourceResult};
 use edo::storage::{Artifact, Compression, Config, Id, LayerOptions, MediaType, Storage};
 
 /// A OCI Image source is used to fetch
 /// an oci image to use as a container image
+#[derive(serde::Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct ImageSource {
-    uri: Uri,
+    uri: String,
+    #[serde(rename = "ref")]
     digest: String,
-    platform: Platform,
+    platform: Option<Platform>,
 }
 
 #[async_trait]
-impl FromNode for ImageSource {
+impl FromElement for ImageSource {
     type Error = error::ImageSourceError;
 
-    async fn from_node(
-        _: &Addr,
-        node: &Node,
+    async fn new(
+        element: &Element,
         _: &Context,
     ) -> std::result::Result<Self, error::ImageSourceError> {
-        node.validate_keys(&["url", "ref"])?;
-        let url = node
-            .get("url")
-            .unwrap()
-            .as_string()
-            .context(error::FieldSnafu {
-                field: "url",
-                type_: "string",
-            })?;
-        let platform = node
-            .get("platform")
-            .and_then(|x| x.as_string())
-            .map(|x| Platform::from(x.clone()))
-            .unwrap_or_default();
-        let digest = node
-            .get("ref")
-            .unwrap()
-            .as_string()
-            .context(error::FieldSnafu {
-                field: "ref",
-                type_: "string",
-            })?;
-        Ok(Self {
-            uri: Uri::new(&url).await.context(error::OciSnafu)?,
-            platform,
-            digest,
-        })
+        element.get().map_err(|e| e.into())
     }
 }
-
-non_configurable!(ImageSource, error::ImageSourceError);
-
-/// A OCI Filesystem source is used to fetch
-/// an oci artifact or image using ocilot as a filesystem archive
 
 #[async_trait]
 impl SourceImpl for ImageSource {
     async fn get_unique_id(&self) -> SourceResult<Id> {
         let id = Id::builder()
-            .name(self.uri.to_string())
+            .name(self.uri.clone())
             .digest(self.digest.clone())
             .build();
         trace!(component = "source", type = "oci", "calculated id to be {id}");
@@ -74,11 +45,12 @@ impl SourceImpl for ImageSource {
 
     async fn fetch(&self, log: &Log, storage: &Storage) -> SourceResult<Artifact> {
         let id = self.get_unique_id().await?;
+        let uri = Uri::new(&self.uri).await.context(error::OciSnafu)?;
         trace!(component = "source", type = "oci", "pulling oci image from {}", self.uri);
 
         // We do something rather clever for oci images, as we are going to one to one map the layers
         // and then handle staging as a filesystem ourself
-        let index = Index::fetch(&self.uri).await.context(error::OciSnafu)?;
+        let index = Index::fetch(&uri).await.context(error::OciSnafu)?;
         // The actual digest that should be used, should be a merkle digest of the manifests
         let mut hasher = blake3::Hasher::new();
         for manifest in index.manifests().iter() {
@@ -106,15 +78,16 @@ impl SourceImpl for ImageSource {
             .build();
 
         let writer = storage.safe_start_layer().await?;
+        let platform = self.platform.clone().unwrap_or_default();
         record!(
             log,
             "pull",
             "fetching oci archive for image at {} for platform {}",
-            self.uri,
-            self.platform
+            uri,
+            platform
         );
         index
-            .to_oci(&self.uri, Some(self.platform.clone()), writer.clone())
+            .to_oci(&uri, Some(platform.clone()), writer.clone())
             .await
             .context(error::OciSnafu)?;
         let layer = storage
@@ -122,7 +95,7 @@ impl SourceImpl for ImageSource {
                 &writer,
                 &LayerOptions::builder()
                     .media_type(MediaType::Oci(Compression::None))
-                    .platform(self.platform.clone())
+                    .platform(platform.clone())
                     .build(),
             )
             .await?;
@@ -135,7 +108,10 @@ impl SourceImpl for ImageSource {
 pub mod error {
     use snafu::Snafu;
 
-    use edo::{context::error::ContextError, source::SourceError};
+    use edo::{
+        context::{Addr, error::ContextError},
+        source::SourceError,
+    };
 
     #[derive(Snafu, Debug)]
     #[snafu(visibility(pub))]
@@ -149,8 +125,11 @@ pub mod error {
         Digest { actual: String, expected: String },
         #[snafu(display("image source oci error: {source}"))]
         Oci { source: ocilot::error::Error },
-        #[snafu(display("image source definition requires a field '{field}' with type '{type_}"))]
-        Field { field: String, type_: String },
+        #[snafu(display("invalid image source at {addr}: {source}"))]
+        Invalid {
+            addr: Addr,
+            source: serde_json::Error,
+        },
         #[snafu(display("io error occured in image source: {source}"))]
         Io { source: std::io::Error },
         #[snafu(display("failed to serialize image configuration: {source}"))]

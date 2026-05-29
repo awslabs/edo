@@ -1,10 +1,10 @@
 use async_trait::async_trait;
 use dashmap::DashMap;
-use edo::context::{Addr, Context, FromNode, Log, Node};
+use edo::context::{Context, Element, FromElement, Log};
 use edo::environment::{EnvResult, Environment, EnvironmentImpl, FarmImpl};
+use edo::record;
 use edo::storage::{Id, Storage};
 use edo::util::{Reader, Writer, cmd_noinput, cmd_noredirect, from_dash};
-use edo::{non_configurable, record};
 use snafu::{ResultExt, ensure};
 use std::path::absolute;
 use std::path::{Path, PathBuf};
@@ -35,15 +35,13 @@ impl FarmImpl for LocalFarm {
 }
 
 #[async_trait]
-impl FromNode for LocalFarm {
+impl FromElement for LocalFarm {
     type Error = error::Error;
 
-    async fn from_node(_addr: &Addr, _node: &Node, _ctx: &Context) -> Result<Self, Self::Error> {
+    async fn new(_element: &Element, _ctx: &Context) -> Result<Self, Self::Error> {
         Ok(Self::default())
     }
 }
-
-non_configurable!(LocalFarm, error::Error);
 
 /// A local build environment rooted at a filesystem path.
 pub struct LocalEnv {

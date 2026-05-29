@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use dashmap::DashMap;
-use edo::context::{Addr, Context, Definable, FromNode, Log, Node};
+use edo::context::{Addr, Context, Element, FromElement, Log};
 use edo::environment::{EnvResult, Environment, EnvironmentImpl, FarmImpl};
 use edo::record;
 use edo::source::Source;
@@ -20,89 +20,81 @@ use tracing::Instrument;
 use uuid::Uuid;
 use which::which;
 
-/// Container environment farm creates environments that run inside of a container
-/// on a container engine like: finch, podman or docker
-pub struct ContainerFarm {
-    config: ContainerConfig,
-    addr: Addr,
-    user: String,
-    source: Source,
-}
-
 /// Configuration for the container runtime (e.g. which CLI binary to use).
-#[derive(Default, Clone)]
+#[derive(serde::Deserialize, Debug, Clone)]
 pub struct ContainerConfig {
-    runtime: Option<String>,
-    cli: PathBuf,
+    runtime: String,
+    cli: Option<PathBuf>,
+    #[serde(default)]
     network: bool,
 }
 
-#[async_trait]
-impl FromNode for ContainerConfig {
-    type Error = edo::environment::error::EnvironmentError;
+/// Options for a Container environment
+#[derive(serde::Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
+struct ContainerOptions {
+    user: String,
+    #[serde(flatten)]
+    config: Option<ContainerConfig>,
+}
 
-    async fn from_node(_addr: &Addr, node: &Node, _: &Context) -> EnvResult<Self> {
-        let runtime = node.get("runtime").and_then(|x| x.as_string());
-        let network = node
-            .get("network")
-            .and_then(|x| x.as_bool())
-            .unwrap_or(false);
-        Ok(Self {
-            runtime,
-            network,
-            ..Default::default()
-        })
-    }
+/// Container environment farm creates environments that run inside of a container
+/// on a container engine like: finch, podman or docker
+pub struct ContainerFarm {
+    addr: Addr,
+    config: ContainerConfig,
+    options: ContainerOptions,
+    source: Source,
 }
 
 #[async_trait]
-impl FromNode for ContainerFarm {
+impl FromElement for ContainerFarm {
     type Error = edo::environment::error::EnvironmentError;
 
-    async fn from_node(addr: &Addr, node: &Node, ctx: &Context) -> EnvResult<Self> {
-        let user = node
-            .get("user")
-            .and_then(|x| x.as_string())
-            .unwrap_or("root".into());
-        let source_node = node.get("source").context(error::NoSourceSnafu)?;
-        let source = source_node
-            .as_list()
-            .and_then(|x| x.first().cloned())
-            .unwrap();
-        let source = ctx.add_source(addr, &source).await?;
+    async fn new(element: &Element, ctx: &Context) -> EnvResult<Self> {
+        let options: ContainerOptions = element.get()?;
+        let mut config = if let Some(config) = options.config.as_ref() {
+            config.clone()
+        } else if let Some(config) = ctx.config().get("container") {
+            serde_json::from_value(config).context(error::ConfigSnafu {
+                addr: element.addr.clone(),
+            })?
+        } else {
+            let (runtime, cli) = if let Ok(finch) = which("finch") {
+                ("finch", finch)
+            } else if let Ok(podman) = which("podman") {
+                ("podman", podman)
+            } else if let Ok(docker) = which("docker") {
+                ("docker", docker)
+            } else {
+                return error::NoRuntimeSnafu {}.fail().map_err(|e| e.into());
+            };
+            info!("found container runtime at: {cli:?}");
+            ContainerConfig {
+                runtime: runtime.to_string(),
+                cli: Some(cli),
+                network: false,
+            }
+        };
+        if config.cli.is_none() {
+            config.cli = Some(which(&config.runtime).ok().context(error::NoRuntimeSnafu)?);
+        }
+        let src_element = element
+            .source
+            .as_ref()
+            .and_then(|x| x.get_resolved())
+            .and_then(|map| map.get("default"))
+            .and_then(|list| list.first())
+            .context(error::NoSourceSnafu)?;
+        let source = ctx.add_source(src_element).await?;
         Ok(Self {
-            addr: addr.clone(),
-            config: ContainerConfig::default(),
-            user,
+            addr: element.addr.clone(),
+            config,
+            options,
             source,
         })
     }
 }
-
-#[async_trait]
-impl Definable<edo::environment::error::EnvironmentError, ContainerConfig> for ContainerFarm {
-    fn key() -> &'static str {
-        "container"
-    }
-
-    fn set_config(&mut self, config: &ContainerConfig) -> EnvResult<()> {
-        self.config = config.clone();
-        self.config.cli = if let Some(runtime) = self.config.runtime.as_ref() {
-            which(runtime).ok().context(error::NoRuntimeSnafu)?
-        } else {
-            which("podman")
-                .or(which("finch"))
-                .or(which("docker"))
-                .ok()
-                .context(error::NoRuntimeSnafu)?
-        };
-        info!("found container runtime at: {}", self.config.cli.display());
-        Ok(())
-    }
-}
-
-unsafe impl Send for ContainerFarm {}
-unsafe impl Sync for ContainerFarm {}
 
 #[async_trait]
 impl FarmImpl for ContainerFarm {
@@ -126,9 +118,10 @@ impl FarmImpl for ContainerFarm {
         );
         // First we want to check if the image already exists, if so skip the next step
         trace!(component = "environment", type = "container", "check if the image is already loaded into the container runtime");
+        let cli = self.config.cli.as_ref().unwrap();
         if cmd_nulled(
             ".",
-            &self.config.cli,
+            cli,
             ["image", "inspect", name.as_str()],
             &HashMap::new(),
         )
@@ -150,11 +143,11 @@ impl FarmImpl for ContainerFarm {
 
         async move {
             // Now we can load the image into the runtime using docker load then tag it accordingly
-            record!(log, "load_image", "{:?} load -i {path:?}", &self.config.cli);
+            record!(log, "load_image", "{:?} load -i {path:?}", cli);
             let output = cmd_collect_out(
                 ".",
                 log,
-                &self.config.cli,
+                cli,
                 ["load", "-i", path.to_str().unwrap()],
                 &HashMap::new(),
             )
@@ -164,17 +157,11 @@ impl FarmImpl for ContainerFarm {
             let string = string
                 .strip_prefix("Loaded image: sha256:")
                 .unwrap_or(string.as_ref());
-            record!(
-                log,
-                "tag_image",
-                "{:?} tag {} {name}",
-                self.config.cli,
-                string.trim()
-            );
+            record!(log, "tag_image", "{:?} tag {} {name}", cli, string.trim());
             cmd_noinput(
                 ".",
                 log,
-                &self.config.cli,
+                cli,
                 ["tag", string.trim(), name.as_str()],
                 &HashMap::new(),
             )
@@ -208,7 +195,7 @@ impl FarmImpl for ContainerFarm {
         Ok(Environment::new(Container {
             name,
             config: self.config.clone(),
-            user: self.user.clone(),
+            user: self.options.user.clone(),
             path: path.to_path_buf(),
             running: AtomicBool::new(false),
             tag: image_tag,
@@ -270,6 +257,7 @@ impl EnvironmentImpl for Container {
             return Ok(());
         }
         async move {
+            let cli = self.config.cli.as_ref().unwrap();
             let mut args = vec![
                 "run".to_string(),
                 "-it".to_string(),
@@ -312,8 +300,8 @@ impl EnvironmentImpl for Container {
             args.push(self.name.clone());
             args.push(self.tag.clone());
             args.push("sh".into());
-            record!(log, "launch", "{:?} {}", self.config.cli, args.join(" "));
-            edo::util::cmd_noinput(".", log, &self.config.cli, args, &from_dash(&self.env))
+            record!(log, "launch", "{:?} {}", cli, args.join(" "));
+            edo::util::cmd_noinput(".", log, cli, args, &from_dash(&self.env))
                 .context(error::RuntimeSnafu)?;
             self.running.store(true, Ordering::SeqCst);
             Ok::<(), error::Error>(())
@@ -327,20 +315,21 @@ impl EnvironmentImpl for Container {
         if !self.running.load(Ordering::SeqCst) {
             return Ok(());
         }
-        record!(log, "stop", "{:?} kill {}", self.config.cli, self.name);
+        let cli = self.config.cli.as_ref().unwrap();
+        record!(log, "stop", "{:?} kill {}", cli, self.name);
         edo::util::cmd_noinput(
             ".",
             log,
-            &self.config.cli,
+            cli,
             vec!["kill".into(), self.name.clone()],
             &from_dash(&self.env),
         )
         .context(error::RuntimeSnafu)?;
-        record!(log, "clean", "{:?} rm {}", self.config.cli, self.name);
+        record!(log, "clean", "{:?} rm {}", cli, self.name);
         edo::util::cmd_noinput(
             ".",
             log,
-            &self.config.cli,
+            cli,
             vec!["rm".into(), self.name.clone()],
             &from_dash(&self.env),
         )
@@ -461,6 +450,7 @@ impl EnvironmentImpl for Container {
 
     fn shell(&self, path: &Path) -> EnvResult<()> {
         let work_dir = Path::new("/root").join(path);
+        let cli = self.config.cli.as_ref().unwrap();
         let mut args = vec![
             "exec".to_string(),
             "-it".to_string(),
@@ -484,8 +474,7 @@ impl EnvironmentImpl for Container {
         args.push(self.name.clone());
         let mut run_args = args.clone();
         run_args.push("sh".into());
-        cmd_noredirect(".", &self.config.cli, run_args, &from_dash(&self.env))
-            .context(error::RuntimeSnafu)?;
+        cmd_noredirect(".", cli, run_args, &from_dash(&self.env)).context(error::RuntimeSnafu)?;
         Ok(())
     }
 
@@ -493,6 +482,7 @@ impl EnvironmentImpl for Container {
         let work_dir = Path::new("/root").join(path);
         trace!(component = "environment", type = "container", "running command in {}", work_dir.display());
         async move {
+            let cli = self.config.cli.as_ref().unwrap();
             let mut args = vec![
                 "exec".to_string(),
                 "-i".to_string(),
@@ -518,8 +508,8 @@ impl EnvironmentImpl for Container {
             run_args.push("sh".into());
             run_args.push("-c".into());
             run_args.push(cmd.into());
-            record!(log, "exec", "{:?} {}", self.config.cli, run_args.join(" "));
-            edo::util::cmd_noinput(".", log, &self.config.cli, run_args, &from_dash(&self.env))
+            record!(log, "exec", "{:?} {}", cli, run_args.join(" "));
+            edo::util::cmd_noinput(".", log, cli, run_args, &from_dash(&self.env))
                 .context(error::RuntimeSnafu)
         }
         .instrument(info_span!(
@@ -537,13 +527,21 @@ pub mod error {
     use snafu::Snafu;
     use std::path::PathBuf;
 
-    use edo::{context::error::ContextError, environment::error::EnvironmentError};
+    use edo::{
+        context::{Addr, error::ContextError},
+        environment::error::EnvironmentError,
+    };
 
     #[derive(Snafu, Debug)]
     #[snafu(visibility(pub))]
     pub enum Error {
         #[snafu(display("failed to archive directory: {source}"))]
         Archive { source: std::io::Error },
+        #[snafu(display("element {addr} has invalid configuration: {source}"))]
+        Config {
+            addr: Addr,
+            source: serde_json::Error,
+        },
         #[snafu(transparent)]
         Context { source: ContextError },
         #[snafu(display("failed to create directory: {source}"))]

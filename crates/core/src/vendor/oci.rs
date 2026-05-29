@@ -2,8 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::str::FromStr;
 
 use async_trait::async_trait;
-use edo::context::{Addr, Context, FromNode, Node};
-use edo::non_configurable;
+use edo::context::{Addr, Context, Element, FromElement};
 use edo::source::{SourceResult, VendorImpl};
 use edo::storage::Artifact;
 use ocilot::index::Index;
@@ -11,8 +10,15 @@ use ocilot::registry::Registry;
 use ocilot::repository::Repository;
 use ocilot::uri::{Reference, RegistryUri, Uri};
 use semver::{Version, VersionReq};
-use snafu::{OptionExt, ResultExt, ensure};
+use serde_json::json;
+use snafu::{ResultExt, ensure};
 use tokio::io::AsyncReadExt;
+
+#[derive(serde::Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
+struct ImageVendorOptions {
+    uri: String,
+}
 
 /// An Image vendor is a provider of oci images via some oci compliant registry
 pub struct ImageVendor {
@@ -41,7 +47,7 @@ impl VendorImpl for ImageVendor {
         Ok(versions)
     }
 
-    async fn resolve(&self, name: &str, version: &Version) -> SourceResult<Node> {
+    async fn resolve(&self, name: &str, version: &Version) -> SourceResult<Element> {
         let mut uri = Uri::builder()
             .registry(self.registry.clone())
             .repository(name)
@@ -73,15 +79,14 @@ impl VendorImpl for ImageVendor {
         }
         let hash_bytes = hasher.finalize();
         let digest = base16::encode_lower(hash_bytes.as_bytes());
-        Ok(Node::new_definition(
-            "source",
-            "image",
-            name,
-            BTreeMap::from([
-                ("url".to_string(), Node::new_string(uri.to_string())),
-                ("ref".to_string(), Node::new_string(digest)),
-            ]),
-        ))
+        Ok(Element::builder()
+            .addr(Addr::parse(name)?)
+            .kind("image")
+            .config([
+                ("uri".to_string(), json!(&uri.to_string())),
+                ("ref".to_string(), json!(digest)),
+            ])
+            .build())
     }
 
     async fn get_dependencies(
@@ -113,19 +118,12 @@ impl VendorImpl for ImageVendor {
 }
 
 #[async_trait]
-impl FromNode for ImageVendor {
+impl FromElement for ImageVendor {
     type Error = error::Error;
 
-    async fn from_node(_addr: &Addr, node: &Node, _ctx: &Context) -> Result<Self, error::Error> {
-        node.validate_keys(&["uri"])?;
-        let uri = node
-            .get("uri")
-            .and_then(|x| x.as_string())
-            .context(error::FieldSnafu {
-                field: "uri",
-                type_: "string",
-            })?;
-        let registry_uri = RegistryUri::from_str(uri.as_str()).context(error::OciSnafu)?;
+    async fn new(element: &Element, _ctx: &Context) -> Result<Self, error::Error> {
+        let options: ImageVendorOptions = element.get()?;
+        let registry_uri = RegistryUri::from_str(&options.uri).context(error::OciSnafu)?;
         Ok(Self {
             registry: Registry::new(&registry_uri)
                 .await
@@ -133,8 +131,6 @@ impl FromNode for ImageVendor {
         })
     }
 }
-
-non_configurable!(ImageVendor, error::Error);
 
 impl ImageVendor {
     async fn get_artifact_config(
@@ -187,7 +183,10 @@ pub mod error {
     use semver::Version;
     use snafu::Snafu;
 
-    use edo::{context::ContextError, source::SourceError};
+    use edo::{
+        context::{Addr, ContextError},
+        source::SourceError,
+    };
 
     #[derive(Debug, Snafu)]
     #[snafu(visibility(pub))]
@@ -197,8 +196,11 @@ pub mod error {
             #[snafu(source(from(ContextError, Box::new)))]
             source: Box<ContextError>,
         },
-        #[snafu(display("oci vendor definition requires a field '{field}' with type '{type_}"))]
-        Field { field: String, type_: String },
+        #[snafu(display("invalid oci image vendor at {addr}: {source}"))]
+        Invalid {
+            addr: Addr,
+            source: serde_json::Error,
+        },
         #[snafu(display("io error occured interacting with oci registry: {source}"))]
         Io { source: std::io::Error },
         #[snafu(display("failed to interact with oci registry: {source}"))]

@@ -23,15 +23,21 @@
 
 use async_trait::async_trait;
 use edo::{
-    context::{Addr, Context, FromNode, Handle, Log, Node},
+    context::{Addr, Context, Element, FromElement, Handle, Log},
     environment::{Environment, Vfs},
-    non_configurable,
     source::Source,
     storage::{Artifact, ArtifactStageOptions, Compression, Config, Id, LayerOptions, MediaType},
     transform::{TransformError, TransformImpl, TransformResult, TransformStatus},
 };
 use snafu::OptionExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+#[derive(serde::Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
+struct GoVendorOptions {
+    #[serde(default)]
+    modules: Vec<PathBuf>,
+}
 
 /// A transform that runs `go mod vendor` over one or more modules of a single
 /// source and packages the resulting `vendor/` directories as an artifact.
@@ -50,52 +56,40 @@ pub struct GoVendorTransform {
     pub source: Source,
     /// Module sub-paths within [`source`](Self::source) to vendor, relative
     /// to the source root. Empty means "vendor the root module only".
-    pub modules: Vec<String>,
+    pub modules: Vec<PathBuf>,
 }
 
 #[async_trait]
-impl FromNode for GoVendorTransform {
+impl FromElement for GoVendorTransform {
     type Error = error::Error;
 
-    async fn from_node(addr: &Addr, node: &Node, ctx: &Context) -> Result<Self, error::Error> {
-        let environment = if let Some(n) = node.get("environment") {
-            Addr::parse(&n.as_string().context(error::FieldSnafu {
-                field: "environment",
-                type_: "string",
-            })?)?
-        } else {
-            Addr::parse("//default")?
-        };
-        // Go Vendor only supports a single source due to go vendoring being module path specific
-        let src = node.get("source").context(error::FieldSnafu {
-            field: "source",
-            type_: "node",
-        })?;
-        let source = ctx.add_source(addr, &src).await?;
+    async fn new(element: &Element, ctx: &Context) -> Result<Self, error::Error> {
+        let addr = element.addr.clone();
+        let environment = element
+            .environment
+            .clone()
+            .unwrap_or(Addr::parse("//default").unwrap());
+        let source = ctx
+            .add_source(
+                element
+                    .source
+                    .as_ref()
+                    .and_then(|x| x.get_resolved())
+                    .and_then(|x| x.get("default"))
+                    .and_then(|x| x.first())
+                    .context(error::NoSourceSnafu { addr: addr.clone() })?,
+            )
+            .await?;
+        let options: GoVendorOptions = element.get()?;
 
-        // We do though support multiple paths, if this list is empty we assume just root path module
-        let modules = if let Some(list) = node.get("modules").and_then(|x| x.as_list()) {
-            let mut array = Vec::new();
-            for item in list.iter() {
-                array.push(item.as_string().context(error::FieldSnafu {
-                    field: "modules",
-                    type_: "list[string]",
-                })?);
-            }
-            array
-        } else {
-            Vec::new()
-        };
         Ok(Self {
             addr: addr.clone(),
             environment,
             source,
-            modules,
+            modules: options.modules,
         })
     }
 }
-
-non_configurable!(GoVendorTransform, error::Error);
 
 #[async_trait]
 impl TransformImpl for GoVendorTransform {
@@ -111,7 +105,7 @@ impl TransformImpl for GoVendorTransform {
         let source_id = self.source.get_unique_id().await?;
         hash.update(source_id.digest().as_bytes());
         for module in self.modules.iter() {
-            hash.update(module.as_bytes());
+            hash.update(module.to_string_lossy().as_bytes());
         }
         let digest = hash.finalize();
         let id = Id::builder()
@@ -249,7 +243,11 @@ impl TransformImpl for GoVendorTransform {
 pub mod error {
     use snafu::Snafu;
 
-    use edo::{context::ContextError, source::SourceError, transform::TransformError};
+    use edo::{
+        context::{Addr, ContextError},
+        source::SourceError,
+        transform::TransformError,
+    };
 
     /// Errors raised by the `go-vendor` transform.
     #[derive(Snafu, Debug)]
@@ -262,16 +260,14 @@ pub mod error {
             #[snafu(source(from(ContextError, Box::new)))]
             source: Box<ContextError>,
         },
-        /// A required TOML field was missing or had the wrong shape.
-        #[snafu(display(
-            "go-vendor transform definitions require a field '{field}' with type_ '{type_}'"
-        ))]
-        Field {
-            /// Name of the missing or ill-typed field.
-            field: String,
-            /// Human-readable description of the expected type.
-            type_: String,
+        #[snafu(display("invalid go vendor transform definition at {addr}: {source}"))]
+        Invalid {
+            addr: Addr,
+            source: serde_json::Error,
         },
+        /// No source provided
+        #[snafu(display("no source provided for go vendor transform at {addr}"))]
+        NoSource { addr: Addr },
         /// Bubbled up from the [`Source`](edo::source::Source) subsystem
         /// (fetch / stage / id computation).
         #[snafu(transparent)]
