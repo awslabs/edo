@@ -291,7 +291,13 @@ Dispatched by `CorePlugin::supports` in `crates/plugins/edo-core-plugin/src/lib.
 - `depends` (list of `Addr`s) — upstream transforms; their artifacts are unpacked into `build-root` during `stage`.
 - `source` / `sources` — `[source.*]` entries staged into `build-root`.
 - `artifact` (optional path) — subdirectory of `install-root` to capture as the output layer (defaults to the whole `install-root`).
-- `arch` (optional, or via CLI `--arch`) — forwarded into the artifact `Id` and into the `arch` template variable.
+- `arch` (optional, or via CLI `--arg arch=VALUE`) — forwarded into the artifact `Id` and into the `arch` template variable. The CLI value takes precedence over the element field for both script and compose transforms.
+
+Scripts execute with `build-root` as their working directory. Relative
+`environment`, `source`, and script/compose `depends` addresses are rooted at
+the directory containing the declaring `edo.toml`, including when the transform
+name contains multiple path segments. Addresses beginning with `//` remain
+absolute; an omitted environment uses `//default`.
 
 Handlebars variables available to every command string:
 
@@ -309,6 +315,13 @@ Failure mode: script transforms always return `TransformStatus::Retryable(Some(l
 #### 4.3.2 `import`
 
 `ImportTransform` has only `sources` (map of name → `Source`). `environment()` returns `//default`, `depends()` is empty, `get_unique_id` is a Blake3 hash of the source IDs, and `transform` stages each source into a layer and wraps it as an artifact. Use it as a leaf that turns `[source.*]` entries into addressable artifacts for downstream `script` / `compose` transforms.
+
+Import preparation intentionally uses `Source::cache()`, matching script
+transforms, instead of always re-fetching with `Source::fetch()`. An existing
+artifact for the source's unique ID is reused; a cache miss fetches and caches
+the source. Source implementations must change their unique IDs when their
+inputs change, because import does not refresh upstream content for an unchanged
+ID.
 
 #### 4.3.3 `compose`
 

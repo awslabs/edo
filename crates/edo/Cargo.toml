@@ -1,5 +1,4 @@
 [package]
-authors    = ["Jarrett Tierney <jmt@amazon.com>"]
 edition    = "2024"
 keywords   = ["edo"]
 license    = "MIT OR Apache-2.0"
@@ -19,7 +18,6 @@ base16             = { workspace = true }
 bimap              = { workspace = true }
 blake3             = { workspace = true }
 bon                = { workspace = true }
-chrono             = { workspace = true }
 daggy              = { workspace = true }
 dashmap            = { workspace = true }
 dialoguer          = { workspace = true }
@@ -29,6 +27,7 @@ handlebars         = { workspace = true }
 home               = { workspace = true }
 indexmap           = { workspace = true }
 indicatif          = { workspace = true }
+jiff               = { workspace = true }
 merkle_hash        = { workspace = true }
 names              = { workspace = true }
 ocilot             = { workspace = true }

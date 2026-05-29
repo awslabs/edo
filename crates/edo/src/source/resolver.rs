@@ -211,6 +211,9 @@ impl Resolver {
 }
 
 impl Interner for Resolver {
+    type NameId = NameId;
+    type SolvableId = SolvableId;
+
     fn display_solvable(&self, solvable: SolvableId) -> impl fmt::Display + '_ {
         let solvable = self.pool.resolve_solvable(solvable);
         format!(
@@ -372,5 +375,51 @@ impl DependencyProvider for Resolver {
         }
 
         dependencies
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vendor_hint_filters_single_and_union_candidates() {
+        for union in [false, true] {
+            let resolver = Resolver::default();
+            let name = resolver.pool.intern_package_name("gcc");
+            let private = resolver.pool.intern_version_set(
+                name,
+                EdoVersionSet::new(&[EdoVersion::new("//private", &Version::new(1, 0, 0))]),
+            );
+            let candidates = if union {
+                let public = resolver.pool.intern_version_set(
+                    name,
+                    EdoVersionSet::new(&[EdoVersion::new("//public", &Version::new(2, 0, 0))]),
+                );
+                Set::Union(
+                    resolver
+                        .pool
+                        .intern_version_set_union(private, [public].into_iter()),
+                )
+            } else {
+                Set::Single(private)
+            };
+            resolver.name_to_vs.insert(name, candidates);
+            let mut dependency = Dependency {
+                addr: Addr::parse("//gcc").unwrap(),
+                name: "gcc".into(),
+                kind: "image".into(),
+                version: "*".parse().unwrap(),
+                vendor: Some("//private".into()),
+            };
+            let Requirement::Single(id) = resolver.build_requirement(&dependency).unwrap() else {
+                panic!("single requirement expected")
+            };
+            let versions = resolver.pool.resolve_version_set(id);
+            assert_eq!(versions.get().len(), 1);
+            assert_eq!(versions.get()[0].vendor(), "//private");
+            dependency.vendor = Some("//missing".into());
+            assert!(resolver.build_requirement(&dependency).is_err());
+        }
     }
 }

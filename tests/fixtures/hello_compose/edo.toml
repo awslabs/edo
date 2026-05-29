@@ -4,13 +4,11 @@ schema-version = "1"
 kind       = "local"
 path       = "hello_compose/left"
 out        = "."
-is_archive = false
 
 [source.right_src]
 kind       = "local"
 path       = "hello_compose/right"
 out        = "."
-is_archive = false
 
 [transform.left]
 kind   = "import"

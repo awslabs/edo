@@ -38,3 +38,19 @@ fn update_without_edits_then_run_ok() {
     // Running again without edits must remain successful.
     fx.edo(&["run", "//hello_local/emit"]).success();
 }
+
+#[test]
+fn update_refreshes_mismatching_lock() {
+    let fx = copy_fixture("hello_local");
+    fx.edo(&["update"]).success();
+    let original: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(fx.lock_path()).unwrap()).unwrap();
+    let mut stale = original.clone();
+    stale["digest"] = serde_json::json!("stale");
+    std::fs::write(fx.lock_path(), serde_json::to_vec(&stale).unwrap()).unwrap();
+    fx.edo(&["update"]).success();
+    let refreshed: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(fx.lock_path()).unwrap()).unwrap();
+    assert_eq!(refreshed, original);
+    fx.edo(&["run", "//hello_local/emit"]).success();
+}

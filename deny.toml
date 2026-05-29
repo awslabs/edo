@@ -19,10 +19,9 @@ feature-depth = 1
 
 [advisories]
 ignore = [
-  # "RUSTSEC-0000-0000",
-  # { id = "RUSTSEC-0000-0000", reason = "you can specify a reason the advisory is ignored" },
-  # "a-crate-that-is-yanked@0.1.1", # you can also ignore yanked crate versions if you wish
-  # { crate = "a-crate-that-is-yanked@0.1.1", reason = "you can specify why you are ignoring the yanked crate" },
+  { id = "RUSTSEC-2026-0370", reason = "zvariant is folded into zbus but keyring hasn't migrated off it"},
+  { id = "RUSTSEC-2026-0371", reason = "zbus_names is folded into zbus but keyring hasn't migrated off it"},
+  { id = "RUSTSEC-2026-0372", reason = "zvariant_derive unmaintained but keyring hasn't migrated off it"},
 ]
 # git-fetch-with-cli = true
 
@@ -105,23 +104,30 @@ deny                       = [
 
 # Certain crates/versions that will be skipped when doing duplicate detection.
 skip      = [
-  # dashmap and petgraph have two different versions of hashbrown
-  "hashbrown@0.14.5",
-  # We bring in a duplicate of rand in order to stay up to date but names crate depends on old version
-  "rand@0.8.6",
-  # owo-colors brings in two copies of supports-color
-  "supports-color@2.1.0",
-  # "ansi_term@0.11.0",
-  # { crate = "ansi_term@0.11.0", reason = "you can specify a reason why it can't be updated/removed" },
+    { crate = "core-foundation", reason = "aws-sdk" },
+    { crate = "getrandom", reason = "rand and resolvo bring in different versions"},
+    { crate = "foldhash", reason = "petgraph vs indexmap" },
+    { crate = "hashbrown", reason = "dashmap and petgraph have two different versions"},
+    { crate = "lock_api", reason = "dashmap" },
+    { crate = "parking_lot", reason = "aws-sdk and tokio" },
+    { crate = "parking_lot_core", reason = "dashmap caused" },
+    { crate = "rand", reason = "names relies on old version but we use latest"},
+    { crate = "rand_core", reason = "product of getrandom" },
+    { crate = "redox_syscall", reason = "dashmap and aws-sdk use different parking_lot leading to this"},
+    { crate = "r-efi", reason = "product of getrandom" },
+    { crate = "supports-color", reason = "owo-colors brings in two copies"},
+    { crate = "syn", reason = "rust ecosystem and aws-sdk has not moved to 3.0 yet"}
 ]
 skip-tree = [
+  { crate = "darling", depth = 2, reason = "derive_builder vs bon" },
+  { crate = "sha1", depth = 3, reason = "sha1 collision in aws sdk" }
   # The aws-sdk will always be a painful source of duplicates
-  "aws-config",
-  "aws-sdk-ecr",
-  "aws-sdk-s3",
-  "aws-sigv4",
+  # "aws-config",
+  # "aws-sdk-ecr",
+  # "aws-sdk-s3",
+  # "aws-sigv4",
   # handlebars crate utilizing derive_builder and we use bon, causing a dup on darling
-  "darling",
+  # "darling",
 
   # "ansi_term@0.11.0", # will be skipped along with _all_ of its direct and transitive dependencies
   # { crate = "ansi_term@0.11.0", depth = 20 },
