@@ -16,7 +16,6 @@ source = ["//net_container_script/gcc"]
 kind       = "local"
 path       = "net_container_script/code"
 out        = "."
-is_archive = false
 
 [transform.build]
 kind        = "script"

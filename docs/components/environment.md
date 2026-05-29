@@ -310,13 +310,18 @@ Source: `crates/plugins/edo-core-plugin/src/environment/local.rs`.
 
 ### 5.3 `ContainerFarm` / `ContainerEnv`
 
-Source: `crates/plugins/edo-core-plugin/src/environment/container.rs`.
+Source: `crates/core/src/environment/container.rs`.
 
 - **Config** (`ContainerConfig`): `runtime: Option<String>` from TOML; the
   resolved `cli: PathBuf` is discovered via the `which` crate. If `runtime`
   is set it must resolve; otherwise the farm probes **podman → finch →
   docker** in order.
-- **Construction** (`FromNode`): reads `user` (default `"root"`) and a
+- **Overrides**: element-level `runtime`, `cli`, and `network` take precedence
+  over global `[container]` settings. Omitted fields inherit global values;
+  `network` defaults to `false`, and an explicit `false` overrides `true`.
+  Changing the runtime discards an inherited executable for a different runtime.
+  Unknown fields and invalid types are rejected.
+- **Construction** (`FromElement`): reads `user` (default `"root"`) and a
   required `source = [...]` list whose first entry is added to the context as
   a regular `Source` — this is the base image. The farm stores the
   `Addr`/`Source`/`user` for later.
@@ -329,7 +334,9 @@ Source: `crates/plugins/edo-core-plugin/src/environment/container.rs`.
   - `down`: stop the container.
   - `clean`: remove the container.
 
-Network policy, privileges, volume mounts beyond the workdir, seccomp/LSM
+The `network` boolean enables the runtime's default networking; when false,
+containers are started with `--network=none`. Fine-grained network policy,
+privileges, volume mounts beyond the workdir, seccomp/LSM
 profiles, and resource limits are **not** currently surfaced in the TOML
 schema. They would need to be added either to `ContainerConfig` or delegated
 to a third-party extension.
@@ -349,8 +356,9 @@ trait surface: isolation is whatever the chosen Farm provides.
 - `LocalFarm`: no isolation. Runs with the user's privileges. Appropriate for
   trusted local builds only.
 - `ContainerFarm`: isolation is whatever the container runtime gives you by
-  default (namespaces, cgroups). There is no TOML-level knob yet for network
-  mode, read-only mounts, seccomp, user namespaces, or resource caps. Anyone
+  default (namespaces, cgroups), with networking disabled unless enabled by
+  configuration. There is no TOML-level knob yet for read-only mounts,
+  seccomp, user namespaces, or resource caps. Anyone
   needing those today will find they are not currently available.
 
 Planned enhancements — network ACLs, resource limits, user-namespace

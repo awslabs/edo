@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use dashmap::DashMap;
-use edo::context::{Addr, Context, Definable, FromNode, Log, Node};
+use edo::context::{Addr, Context, Element, FromElement, Log};
 use edo::environment::{EnvResult, Environment, EnvironmentImpl, FarmImpl};
 use edo::record;
 use edo::source::Source;
@@ -19,89 +19,109 @@ use tracing::Instrument;
 use uuid::Uuid;
 use which::which;
 
-/// Container environment farm creates environments that run inside of a container
-/// on a container engine like: finch, podman or docker
-pub struct ContainerFarm {
-    config: ContainerConfig,
-    addr: Addr,
-    user: String,
-    source: Source,
-}
-
 /// Configuration for the container runtime (e.g. which CLI binary to use).
-#[derive(Default, Clone)]
+#[derive(serde::Deserialize, Debug, Clone, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ContainerConfig {
     runtime: Option<String>,
+    cli: Option<PathBuf>,
+    #[serde(default)]
+    network: bool,
+}
+
+/// Options for a Container environment
+#[derive(serde::Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
+struct ContainerOptions {
+    #[serde(default = "default_user")]
+    user: String,
+    runtime: Option<String>,
+    cli: Option<PathBuf>,
+    network: Option<bool>,
+}
+
+fn default_user() -> String {
+    "root".into()
+}
+
+/// Runtime settings validated once before creating a farm or environment.
+#[derive(Debug, Clone)]
+struct ResolvedContainerConfig {
     cli: PathBuf,
     network: bool,
 }
 
-#[async_trait]
-impl FromNode for ContainerConfig {
-    type Error = edo::environment::error::EnvironmentError;
-
-    async fn from_node(_addr: &Addr, node: &Node, _: &Context) -> EnvResult<Self> {
-        let runtime = node.get("runtime").and_then(|x| x.as_string());
-        let network = node
-            .get("network")
-            .and_then(|x| x.as_bool())
-            .unwrap_or(false);
-        Ok(Self {
-            runtime,
-            network,
-            ..Default::default()
+impl ContainerConfig {
+    fn resolve(
+        mut self,
+        options: &ContainerOptions,
+        mut find: impl FnMut(&str) -> Option<PathBuf>,
+    ) -> Result<ResolvedContainerConfig, error::Error> {
+        if let Some(runtime) = options.runtime.as_ref() {
+            if self.runtime.as_ref() != Some(runtime) {
+                self.cli = None;
+            }
+            self.runtime = Some(runtime.clone());
+        }
+        self.cli = options.cli.clone().or(self.cli);
+        self.network = options.network.unwrap_or(self.network);
+        if let Some(runtime) = self.runtime.as_ref() {
+            if self.cli.is_none() {
+                self.cli = Some(find(runtime).context(error::NoRuntimeSnafu)?);
+            }
+        } else {
+            let cli = ["podman", "finch", "docker"]
+                .into_iter()
+                .find_map(&mut find)
+                .context(error::NoRuntimeSnafu)?;
+            self.cli = self.cli.or(Some(cli));
+        }
+        Ok(ResolvedContainerConfig {
+            cli: self.cli.context(error::NoRuntimeSnafu)?,
+            network: self.network,
         })
     }
 }
 
+/// Container environment farm creates environments that run inside of a container
+/// on a container engine like: finch, podman or docker
+pub struct ContainerFarm {
+    addr: Addr,
+    config: ResolvedContainerConfig,
+    options: ContainerOptions,
+    source: Source,
+}
+
 #[async_trait]
-impl FromNode for ContainerFarm {
+impl FromElement for ContainerFarm {
     type Error = edo::environment::error::EnvironmentError;
 
-    async fn from_node(addr: &Addr, node: &Node, ctx: &Context) -> EnvResult<Self> {
-        let user = node
-            .get("user")
-            .and_then(|x| x.as_string())
-            .unwrap_or("root".into());
-        let source_node = node.get("source").context(error::NoSourceSnafu)?;
-        let source = source_node
-            .as_list()
-            .and_then(|x| x.first().cloned())
-            .unwrap();
-        let source = ctx.add_source(addr, &source).await?;
+    async fn new(element: &Element, ctx: &Context) -> EnvResult<Self> {
+        let options: ContainerOptions = element.get()?;
+        let config: ContainerConfig = if let Some(config) = ctx.config().get("container") {
+            serde_json::from_value(config).context(error::ConfigSnafu {
+                addr: element.addr.clone(),
+            })?
+        } else {
+            ContainerConfig::default()
+        };
+        let config = config.resolve(&options, |runtime| which(runtime).ok())?;
+        let src_element = element
+            .source
+            .as_ref()
+            .and_then(|x| x.get_resolved())
+            .and_then(|map| map.get("default"))
+            .and_then(|list| list.first())
+            .context(error::NoSourceSnafu)?;
+        let source = ctx.add_source(src_element).await?;
         Ok(Self {
-            addr: addr.clone(),
-            config: ContainerConfig::default(),
-            user,
+            addr: element.addr.clone(),
+            config,
+            options,
             source,
         })
     }
 }
-
-#[async_trait]
-impl Definable<edo::environment::error::EnvironmentError, ContainerConfig> for ContainerFarm {
-    fn key() -> &'static str {
-        "container"
-    }
-
-    fn set_config(&mut self, config: &ContainerConfig) -> EnvResult<()> {
-        self.config = config.clone();
-        self.config.cli = if let Some(runtime) = self.config.runtime.as_ref() {
-            which(runtime).ok().context(error::NoRuntimeSnafu)?
-        } else {
-            which("podman")
-                .or(which("finch"))
-                .or(which("docker"))
-                .ok()
-                .context(error::NoRuntimeSnafu)?
-        };
-        info!("found container runtime at: {}", self.config.cli.display());
-        Ok(())
-    }
-}
-
-unsafe impl Send for ContainerFarm {}
-unsafe impl Sync for ContainerFarm {}
 
 #[async_trait]
 impl FarmImpl for ContainerFarm {
@@ -125,9 +145,10 @@ impl FarmImpl for ContainerFarm {
         );
         // First we want to check if the image already exists, if so skip the next step
         trace!(component = "environment", type = "container", "check if the image is already loaded into the container runtime");
+        let cli = &self.config.cli;
         if cmd_nulled(
             ".",
-            &self.config.cli,
+            cli,
             ["image", "inspect", name.as_str()],
             &HashMap::new(),
         )
@@ -149,11 +170,11 @@ impl FarmImpl for ContainerFarm {
 
         async move {
             // Now we can load the image into the runtime using docker load then tag it accordingly
-            record!(log, "load_image", "{:?} load -i {path:?}", &self.config.cli);
+            record!(log, "load_image", "{:?} load -i {path:?}", cli);
             let output = cmd_collect_out(
                 ".",
                 log,
-                &self.config.cli,
+                cli,
                 ["load", "-i", path.to_str().unwrap()],
                 &HashMap::new(),
             )
@@ -163,17 +184,11 @@ impl FarmImpl for ContainerFarm {
             let string = string
                 .strip_prefix("Loaded image: sha256:")
                 .unwrap_or(string.as_ref());
-            record!(
-                log,
-                "tag_image",
-                "{:?} tag {} {name}",
-                self.config.cli,
-                string.trim()
-            );
+            record!(log, "tag_image", "{:?} tag {} {name}", cli, string.trim());
             cmd_noinput(
                 ".",
                 log,
-                &self.config.cli,
+                cli,
                 ["tag", string.trim(), name.as_str()],
                 &HashMap::new(),
             )
@@ -207,7 +222,7 @@ impl FarmImpl for ContainerFarm {
         Ok(Environment::new(Container {
             name,
             config: self.config.clone(),
-            user: self.user.clone(),
+            user: self.options.user.clone(),
             path: path.to_path_buf(),
             running: AtomicBool::new(false),
             tag: image_tag,
@@ -218,7 +233,7 @@ impl FarmImpl for ContainerFarm {
 
 /// A running container environment instance managed by a container runtime.
 pub struct Container {
-    config: ContainerConfig,
+    config: ResolvedContainerConfig,
     name: String,
     user: String,
     path: PathBuf,
@@ -269,6 +284,7 @@ impl EnvironmentImpl for Container {
             return Ok(());
         }
         async move {
+            let cli = &self.config.cli;
             let mut args = vec![
                 "run".to_string(),
                 "-it".to_string(),
@@ -311,8 +327,8 @@ impl EnvironmentImpl for Container {
             args.push(self.name.clone());
             args.push(self.tag.clone());
             args.push("sh".into());
-            record!(log, "launch", "{:?} {}", self.config.cli, args.join(" "));
-            edo::util::cmd_noinput(".", log, &self.config.cli, args, &from_dash(&self.env))
+            record!(log, "launch", "{:?} {}", cli, args.join(" "));
+            edo::util::cmd_noinput(".", log, cli, args, &from_dash(&self.env))
                 .context(error::RuntimeSnafu)?;
             self.running.store(true, Ordering::SeqCst);
             Ok::<(), error::Error>(())
@@ -326,20 +342,21 @@ impl EnvironmentImpl for Container {
         if !self.running.load(Ordering::SeqCst) {
             return Ok(());
         }
-        record!(log, "stop", "{:?} kill {}", self.config.cli, self.name);
+        let cli = &self.config.cli;
+        record!(log, "stop", "{:?} kill {}", cli, self.name);
         edo::util::cmd_noinput(
             ".",
             log,
-            &self.config.cli,
+            cli,
             vec!["kill".into(), self.name.clone()],
             &from_dash(&self.env),
         )
         .context(error::RuntimeSnafu)?;
-        record!(log, "clean", "{:?} rm {}", self.config.cli, self.name);
+        record!(log, "clean", "{:?} rm {}", cli, self.name);
         edo::util::cmd_noinput(
             ".",
             log,
-            &self.config.cli,
+            cli,
             vec!["rm".into(), self.name.clone()],
             &from_dash(&self.env),
         )
@@ -469,6 +486,7 @@ impl EnvironmentImpl for Container {
 
     fn shell(&self, path: &Path) -> EnvResult<()> {
         let work_dir = Path::new("/root").join(path);
+        let cli = &self.config.cli;
         let mut args = vec![
             "exec".to_string(),
             "-it".to_string(),
@@ -492,8 +510,7 @@ impl EnvironmentImpl for Container {
         args.push(self.name.clone());
         let mut run_args = args.clone();
         run_args.push("sh".into());
-        cmd_noredirect(".", &self.config.cli, run_args, &from_dash(&self.env))
-            .context(error::RuntimeSnafu)?;
+        cmd_noredirect(".", cli, run_args, &from_dash(&self.env)).context(error::RuntimeSnafu)?;
         Ok(())
     }
 
@@ -501,6 +518,7 @@ impl EnvironmentImpl for Container {
         let work_dir = Path::new("/root").join(path);
         trace!(component = "environment", type = "container", "running command in {}", work_dir.display());
         async move {
+            let cli = &self.config.cli;
             let mut args = vec![
                 "exec".to_string(),
                 "-i".to_string(),
@@ -526,8 +544,8 @@ impl EnvironmentImpl for Container {
             run_args.push("sh".into());
             run_args.push("-c".into());
             run_args.push(cmd.into());
-            record!(log, "exec", "{:?} {}", self.config.cli, run_args.join(" "));
-            edo::util::cmd_noinput(".", log, &self.config.cli, run_args, &from_dash(&self.env))
+            record!(log, "exec", "{:?} {}", cli, run_args.join(" "));
+            edo::util::cmd_noinput(".", log, cli, run_args, &from_dash(&self.env))
                 .context(error::RuntimeSnafu)
         }
         .instrument(info_span!(
@@ -545,13 +563,21 @@ pub mod error {
     use snafu::Snafu;
     use std::path::PathBuf;
 
-    use edo::{context::error::ContextError, environment::error::EnvironmentError};
+    use edo::{
+        context::{Addr, error::ContextError},
+        environment::error::EnvironmentError,
+    };
 
     #[derive(Snafu, Debug)]
     #[snafu(visibility(pub))]
     pub enum Error {
         #[snafu(display("failed to archive directory: {source}"))]
         Archive { source: std::io::Error },
+        #[snafu(display("element {addr} has invalid configuration: {source}"))]
+        Config {
+            addr: Addr,
+            source: serde_json::Error,
+        },
         #[snafu(transparent)]
         Context { source: ContextError },
         #[snafu(display("failed to create directory: {source}"))]
@@ -607,6 +633,113 @@ pub mod error {
             Self::Component {
                 source: Box::new(value),
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn options(value: serde_json::Value) -> ContainerOptions {
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn user_defaults_to_root() {
+        assert_eq!(options(json!({})).user, "root");
+        assert_eq!(options(json!({"user": "builder"})).user, "builder");
+    }
+
+    #[test]
+    fn partial_config_keeps_network_during_detection() {
+        for (global, element) in [
+            (json!({"network": true}), json!({})),
+            (json!({}), json!({"network": true})),
+        ] {
+            let config: ContainerConfig = serde_json::from_value(global).unwrap();
+            let config = config
+                .resolve(&options(element), |runtime| Some(PathBuf::from(runtime)))
+                .unwrap();
+            assert_eq!(config.cli, PathBuf::from("podman"));
+            assert!(config.network);
+        }
+    }
+
+    #[test]
+    fn element_overrides_global_settings() {
+        let global: ContainerConfig = serde_json::from_value(
+            json!({"runtime": "docker", "cli": "/custom/docker", "network": true}),
+        )
+        .unwrap();
+        let config = global
+            .clone()
+            .resolve(&options(json!({"network": false})), |_| {
+                panic!("configured executable should be retained")
+            })
+            .unwrap();
+        assert_eq!(config.cli, PathBuf::from("/custom/docker"));
+        assert!(!config.network);
+        let config = global
+            .resolve(&options(json!({"runtime": "podman"})), |runtime| {
+                Some(PathBuf::from(runtime))
+            })
+            .unwrap();
+        assert_eq!(config.cli, PathBuf::from("podman"));
+        assert!(config.network);
+    }
+
+    #[test]
+    fn explicit_cli_overrides_lookup() {
+        let config = ContainerConfig::default()
+            .resolve(
+                &options(json!({"runtime": "docker", "cli": "/custom/docker"})),
+                |_| panic!("explicit executable should not be looked up"),
+            )
+            .unwrap();
+        assert_eq!(config.cli, PathBuf::from("/custom/docker"));
+    }
+
+    #[test]
+    fn detection_checks_podman_then_finch_then_docker() {
+        let mut attempts = Vec::new();
+        let config = ContainerConfig::default()
+            .resolve(&options(json!({})), |runtime| {
+                attempts.push(runtime.to_string());
+                (runtime == "docker").then(|| PathBuf::from("docker"))
+            })
+            .unwrap();
+        assert_eq!(attempts, ["podman", "finch", "docker"]);
+        assert_eq!(config.cli, PathBuf::from("docker"));
+        assert!(
+            ContainerConfig::default()
+                .resolve(&options(json!({})), |_| None)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn configured_runtime_must_resolve_before_construction() {
+        let mut attempts = Vec::new();
+        let result =
+            ContainerConfig::default().resolve(&options(json!({"runtime": "podman"})), |runtime| {
+                attempts.push(runtime.to_string());
+                None
+            });
+        assert!(matches!(result, Err(error::Error::NoRuntime)));
+        assert_eq!(attempts, ["podman"]);
+    }
+
+    #[test]
+    fn invalid_settings_are_rejected() {
+        for value in [
+            json!({"runtime": "podman", "cli": 5}),
+            json!({"runtme": "podman"}),
+            json!({"network": "true"}),
+        ] {
+            assert!(serde_json::from_value::<ContainerOptions>(value.clone()).is_err());
+            assert!(serde_json::from_value::<ContainerConfig>(value).is_err());
         }
     }
 }

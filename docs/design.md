@@ -208,9 +208,12 @@ are:
 
 ### 3.3 Build Configuration
 
-Edo is configured through `edo.toml` files. The top-level key `schema-version`
-dispatches to a schema loader; currently only `"1"` (`Schema::V1`) is
-implemented (see `crates/edo-core/src/context/schema.rs`).
+Edo is configured through `edo.toml` files. The required top-level key
+`schema-version` must be `"1"` (see `crates/edo/src/context/schema.rs`).
+Unknown sections, cache categories, and requirement fields are rejected;
+`[config]` remains free-form. Lock digests cover the deterministically serialized
+requirement table, including vendor hints. A mismatching lock must be refreshed
+with `edo update` before a locked build can proceed.
 
 Every TOML table under `[source.*]`, `[transform.*]`, `[environment.*]`,
 `[vendor.*]`, `[requires.*]`, and `[cache.*]` becomes a `Node` registered
