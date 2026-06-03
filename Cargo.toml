@@ -32,7 +32,6 @@ blake3               = "1.8"
 bon                  = "3.9"
 bytes                = "1.11"
 cfg-if               = "1.0"
-chrono               = { version = "0.4", features = ["serde"] }
 clap                 = { version = "4.6", features = ["derive"] }
 daggy                = "0.9"
 dashmap              = { version = "6.1", features = ["serde"] }
@@ -44,6 +43,7 @@ handlebars           = "6.4"
 home                 = "0.5"
 indexmap             = "2.14"
 indicatif            = "0.18"
+jiff                 = "0.2"
 keyring              = "3.6"
 merkle_hash          = "3.8"
 mockall              = "0.14"

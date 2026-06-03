@@ -19,7 +19,6 @@ base16             = { workspace = true }
 bimap              = { workspace = true }
 blake3             = { workspace = true }
 bon                = { workspace = true }
-chrono             = { workspace = true }
 daggy              = { workspace = true }
 dashmap            = { workspace = true }
 dialoguer          = { workspace = true }
@@ -29,6 +28,7 @@ handlebars         = { workspace = true }
 home               = { workspace = true }
 indexmap           = { workspace = true }
 indicatif          = { workspace = true }
+jiff               = { workspace = true }
 merkle_hash        = { workspace = true }
 names              = { workspace = true }
 ocilot             = { workspace = true }

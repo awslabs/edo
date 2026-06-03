@@ -14,7 +14,7 @@ use std::{
     time::Duration,
 };
 
-use chrono::Local;
+use jiff::Zoned;
 use indicatif::ProgressState;
 use owo_colors::{OwoColorize, Stream};
 use parking_lot::{Mutex, MutexGuard};
@@ -267,7 +267,7 @@ where
         let indent = "  ".repeat(depth);
 
         // Format the timestamp
-        let timestamp = Local::now().format("%H:%M:%S").to_string();
+        let timestamp = Zoned::now().strftime("%H:%M:%S").to_string();
 
         // Apply indentation after timestamp
         write!(
