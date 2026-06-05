@@ -4,7 +4,7 @@ use edo::record;
 use edo::source::{SourceImpl, SourceResult};
 use edo::storage::{Artifact, Compression, Config, Id, LayerOptions, MediaType, Storage};
 use merkle_hash::MerkleTree;
-use snafu::ResultExt;
+use snafu::{ResultExt, ensure};
 use std::path::{PathBuf, absolute};
 use tokio::{fs::File, io::AsyncWriteExt};
 use tokio_tar::Builder;
@@ -73,7 +73,7 @@ impl SourceImpl for LocalSource {
         // First create the manifest
         let mut artifact = Artifact::builder()
             .media_type(MediaType::File(Compression::None))
-            .config(Config::builder().id(id).build())
+            .config(Config::builder().id(id.clone()).build())
             .build();
         // Start our layer
         let mut writer = storage.safe_start_layer().await?;
@@ -120,6 +120,15 @@ impl SourceImpl for LocalSource {
             (MediaType::Tar(Compression::None), self.out.clone())
         };
         writer.flush().await.context(error::ReadFileSnafu)?;
+        // The id was hashed before the bytes were read; re-hash so an edit
+        // made while reading is never saved under the pre-edit id.
+        let after = self.get_unique_id().await?;
+        ensure!(
+            after == id,
+            error::ChangedSnafu {
+                path: self.path.clone()
+            }
+        );
         // Save the layer
         let layer = storage
             .safe_finish_layer(
@@ -153,6 +162,8 @@ pub mod error {
         Absolute { source: std::io::Error },
         #[snafu(display("failed to archive git repository: {source}"))]
         Archive { source: std::io::Error },
+        #[snafu(display("local source at {} changed while it was being read", path.display()))]
+        Changed { path: std::path::PathBuf },
         #[snafu(display("failed to calculate merkle hash of directory: {source}"))]
         Merkle {
             source: merkle_hash::error::IndexingError,

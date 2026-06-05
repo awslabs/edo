@@ -17,6 +17,7 @@ use arc_handle::arc_handle;
 use async_trait::async_trait;
 #[cfg(test)]
 use mockall::automock;
+use snafu::ensure;
 use std::path::Path;
 
 mod error;
@@ -49,6 +50,38 @@ pub trait Source {
 }
 
 impl Source {
+    /// Memoizes this source's id for the current run, including across handle clones.
+    pub async fn cached_unique_id(&self, ctx: &Handle) -> SourceResult<Id> {
+        if let Some(cache) = ctx.id_cache() {
+            let cell = cache.source_cell(self);
+            return cell.get_or_try_init(|| self.get_unique_id()).await.cloned();
+        }
+        self.get_unique_id().await
+    }
+
+    /// Fetches a source-cache miss using the current run's source id.
+    ///
+    /// The source still owns its id: on a miss `fetch` computes the id it
+    /// stores the artifact under, and that id must match the one memoized
+    /// for this run. A mismatch means the source changed after it was
+    /// hashed (e.g. a local file edited mid-build), so staging and the
+    /// dependent transform ids would disagree with the fetched bytes.
+    pub async fn cache_in(&self, log: &Log, ctx: &Handle) -> SourceResult<Artifact> {
+        let id = self.cached_unique_id(ctx).await?;
+        if let Some(artifact) = ctx.storage().fetch_source(&id).await? {
+            return Ok(artifact);
+        }
+        let artifact = self.fetch(log, ctx.storage()).await?;
+        ensure!(
+            artifact.config().id() == &id,
+            error::ChangedSnafu {
+                expected: Box::new(id),
+                actual: Box::new(artifact.config().id().clone()),
+            }
+        );
+        Ok(artifact)
+    }
+
     /// Check the cache if this source already exists, and only if it does not
     /// call fetch to get the artifact. Use this in most cases instead of calling
     /// fetch() as fetch will ALWAYS repull the source.
@@ -65,6 +98,12 @@ impl Source {
         self.fetch(log, storage).await
     }
 
+    /// Probes only the local source cache using the current run's source id.
+    pub async fn is_cached(&self, ctx: &Handle) -> SourceResult<bool> {
+        let id = self.cached_unique_id(ctx).await?;
+        Ok(ctx.storage().has_local(&id).await?)
+    }
+
     /// Helper for staging sources off their layer media_types instead of deferring
     /// to an individual's source stage logic. Transforms may just want flat extracts.
     /// this will also ignore the source specific out transforms
@@ -74,7 +113,7 @@ impl Source {
         env: &Environment,
         path: &Path,
     ) -> SourceResult<()> {
-        let id = self.get_unique_id().await?;
+        let id = self.cached_unique_id(ctx).await?;
         let artifact = ctx.storage().safe_open(&id).await?;
         for layer in artifact.layers() {
             let mut reader = ctx.storage().safe_read(layer).await?;

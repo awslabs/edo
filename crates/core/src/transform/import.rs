@@ -54,11 +54,11 @@ impl TransformImpl for ImportTransform {
         Ok(addr)
     }
 
-    async fn get_unique_id(&self, _ctx: &Handle) -> TransformResult<Id> {
+    async fn get_unique_id(&self, ctx: &Handle) -> TransformResult<Id> {
         let mut hash = blake3::Hasher::new();
         for source_list in self.sources.values() {
             for source in source_list {
-                hash.update(source.get_unique_id().await?.digest().as_bytes());
+                hash.update(source.cached_unique_id(ctx).await?.digest().as_bytes());
             }
         }
         let hash_bytes = hash.finalize();
@@ -73,7 +73,7 @@ impl TransformImpl for ImportTransform {
             )
             .digest(digest)
             .build();
-        trace!(component = "transform", type = "import", "calculated id to be {id}");
+        trace!(subsystem = "transform", component = "import", id = %id, "calculated id");
         Ok(id)
     }
 
@@ -81,11 +81,31 @@ impl TransformImpl for ImportTransform {
         Ok(Vec::new())
     }
 
+    /// Short-circuits prepare when every input source is already cached.
+    /// Import transforms only fetch sources in `prepare`, so the call is
+    /// pure overhead when everything is already on disk.
+    async fn needs_prepare(&self, ctx: &Handle) -> TransformResult<bool> {
+        for source_list in self.sources.values() {
+            for source in source_list {
+                if !source.is_cached(ctx).await? {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
     async fn prepare(&self, log: &Log, ctx: &Handle) -> TransformResult<()> {
         for (addr, source_list) in self.sources.iter() {
-            trace!(component = "transform", type = "import", "fetching source {addr}");
+            trace!(
+                subsystem = "transform",
+                component = "import",
+                op = "fetch",
+                addr = %addr,
+                "fetching source"
+            );
             for source in source_list {
-                source.cache(log, ctx.storage()).await?;
+                source.cache_in(log, ctx).await?;
             }
         }
         Ok(())
@@ -98,9 +118,15 @@ impl TransformImpl for ImportTransform {
 
         // Stage all the sources in the output directory
         for (addr, source_list) in self.sources.iter() {
-            trace!(component = "transform", type = "import", "staging source {addr}");
+            trace!(
+                subsystem = "transform",
+                component = "import",
+                op = "stage",
+                addr = %addr,
+                "staging source"
+            );
             for source in source_list {
-                let id = source.get_unique_id().await?;
+                let id = source.cached_unique_id(ctx).await?;
                 env.stage(
                     ctx,
                     ArtifactStageOptions::builder().id(id).path(output).build(),
@@ -115,7 +141,7 @@ impl TransformImpl for ImportTransform {
     async fn transform(&self, _log: &Log, ctx: &Handle, env: &Environment) -> TransformStatus {
         // Transform is simply as we just archive the output directory
         match async move {
-            let id = self.get_unique_id(ctx).await?;
+            let id = ctx.unique_id_of(&self.addr).await?;
             let mut artifact = Artifact::builder()
                 .config(Config::builder().id(id.clone()).build())
                 .media_type(MediaType::Manifest)

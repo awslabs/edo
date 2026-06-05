@@ -277,6 +277,11 @@ for MySource` and call `Source::new(MySource { ... })`.
 - `Source::cache` is an **inherent** method on the handle, not part of the
   trait. Implementers only supply `get_unique_id` / `fetch` / `stage`;
   `cache` is always available to callers on the handle.
+- During a scheduler run, transforms use the inherent `cached_unique_id`,
+  `is_cached`, and `cache_in` helpers, which memoize the source id for the
+  run. The source still owns its id: `cache_in` calls `fetch` on a miss and
+  fails with `SourceError::Changed` if `fetch` stores the artifact under a
+  different id than the one memoized (e.g. a local path edited mid-build).
 - `Vendor` methods return `SourceResult`, not a separate `VendorResult`.
 
 ## 5. Implementation Details
