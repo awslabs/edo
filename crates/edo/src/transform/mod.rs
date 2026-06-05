@@ -37,6 +37,11 @@ pub trait Transform {
     async fn get_unique_id(&self, ctx: &Handle) -> TransformResult<Id>;
     /// Returns addresses of all transforms this one depends on.
     async fn depends(&self) -> TransformResult<Vec<Addr>>;
+    /// Reports whether this transform needs its `prepare` step to run.
+    /// Defaults to preparing after a build-cache miss.
+    async fn needs_prepare(&self, _ctx: &Handle) -> TransformResult<bool> {
+        Ok(true)
+    }
     /// Prepare the transform by fetching all sources and dependent artifacts into storage.
     async fn prepare(&self, log: &Log, ctx: &Handle) -> TransformResult<()>;
     /// Stage all required files into the given environment before execution.

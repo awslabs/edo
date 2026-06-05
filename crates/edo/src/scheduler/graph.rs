@@ -51,7 +51,7 @@ use tokio::task::{JoinError, JoinHandle};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
-use crate::context::{Addr, Context, Handle};
+use crate::context::{Addr, Context, Handle, IdCache};
 use crate::storage::{Artifact, Id};
 use crate::transform::Transform;
 
@@ -100,6 +100,12 @@ pub struct Graph {
     /// `run` clones the inner map at start and decrements it as nodes
     /// complete; that's why this is a "template" rather than mutable state.
     indegrees: HashMap<Addr, HashMap<NodeIndex, u32>>,
+    /// Per-run id memoization shared across `fetch` and `run`. Created
+    /// fresh in [`Graph::new`] so each scheduler run starts with an
+    /// empty cache; reusing the same `Graph` across runs reuses its
+    /// cache too, which is fine because the graph is itself per-run
+    /// (the scheduler recreates it on each call).
+    id_cache: IdCache,
 }
 
 impl Graph {
@@ -116,6 +122,7 @@ impl Graph {
             index: BiHashMap::new(),
             subgraphs: HashMap::new(),
             indegrees: HashMap::new(),
+            id_cache: IdCache::new(),
         }
     }
 
@@ -135,7 +142,7 @@ impl Graph {
         if let Some(index) = self.index.get_by_left(addr) {
             return Ok(*index);
         }
-        trace!(component = "execution", "adding execution node for {addr}");
+        trace!(subsystem = "scheduler", op = "add-node", addr = %addr, "adding execution node");
         let transform = ctx
             .get_transform(addr)
             .context(error::ProjectTransformSnafu { addr: addr.clone() })?;
@@ -147,7 +154,7 @@ impl Graph {
         // `add_edge` is what catches cycles — daggy returns `WouldCycle`.
         for dep in transform.depends().await? {
             let child = self.add_recursive(ctx, &dep).await?;
-            trace!(component = "execution", "adding edge for {dep} -> {addr}");
+            trace!(subsystem = "scheduler", op = "add-edge", from = %dep, to = %addr, "adding edge");
             self.graph
                 .add_edge(child, node_index, format!("{dep}->{addr}"))
                 .context(error::GraphSnafu)?;
@@ -225,7 +232,8 @@ impl Graph {
     /// pool that throttles the network.
     pub async fn fetch(&self, ctx: &Context) -> Result<()> {
         let mut tasks = Vec::new();
-        let ctx = ctx.get_handle();
+        // Share transform and source ids across hashing, preparation, and execution.
+        let ctx = ctx.get_handle().with_id_cache(self.id_cache.clone());
         let max_concurrent = self.batch_size;
 
         // Fetching is network-bound. We don't want to issue thousands of
@@ -241,8 +249,9 @@ impl Graph {
             })?;
             // Compute the content-addressed id and stash it on the node so
             // workers in `run` can index into the build cache without
-            // recomputing it.
-            let id = transform.get_unique_id(&ctx).await?;
+            // recomputing it. Use the memoized helper so a transitive id
+            // referenced by multiple parents is hashed exactly once.
+            let id = ctx.unique_id_of(&node.addr).await?;
             node.set_id(&id);
 
             // Build cache probe. `find_build(.., true)` requires a *full*
@@ -253,6 +262,13 @@ impl Graph {
             if ctx.storage().find_build(&id, true).await?.is_some() {
                 info!("skipped fetch for built entry {}", node.addr);
                 node.set_cache_hit(true);
+                continue;
+            }
+
+            // Build-cache miss — but if the transform reports that its
+            // `prepare` step has nothing to do (e.g. every input source is
+            // already in the local cache), skip the spawn entirely.
+            if !transform.needs_prepare(&ctx).await? {
                 continue;
             }
 
@@ -321,7 +337,8 @@ impl Graph {
     /// post the result. That keeps the scheduling logic single-threaded and
     /// lock-free without giving up parallelism on the actual work.
     pub async fn run(&self, path: &Path, ctx: &Context, addr: &Addr) -> Result<()> {
-        let ctx_handle = ctx.get_handle();
+        // Preserve fetch-phase ids during staging and output storage.
+        let ctx_handle = ctx.get_handle().with_id_cache(self.id_cache.clone());
         let token = ctx_handle.cancellation();
 
         // ── Step 1: resolve the target node. ──────────────────────────────
@@ -448,7 +465,7 @@ impl Graph {
                     let result = run_transform_lifecycle(
                         &ctx_clone, &path_buf, &node, &transform, &id, &token,
                     )
-                    .instrument(info_span!("transforming", addr = node.addr.to_string()))
+                    .instrument(info_span!("transform", subsystem = "scheduler", addr = %node.addr))
                     .await;
                     // If the driver has gone away (done_rx dropped) there's
                     // nobody left to report to — exit quietly.
@@ -530,7 +547,7 @@ impl Graph {
                     // failed, and clear `ready` so no further dispatch
                     // happens. We still need to drain `inflight` tasks
                     // so workers don't leak.
-                    error!("{} failed: {e}", node.addr);
+                    error!(subsystem = "scheduler", addr = %node.addr, "{} failed: {e}", node.addr);
                     node.set_failed();
                     if first_error.is_none() {
                         first_error = Some(e);
@@ -605,8 +622,9 @@ async fn run_transform_lifecycle(
     let environment = ctx
         .create_environment(&logf, &env_addr, temp.path())
         .instrument(info_span!(
-            "creating environment",
-            addr = node.addr.to_string()
+            "env-create",
+            subsystem = "environment",
+            addr = %node.addr
         ))
         .await?;
 
@@ -618,8 +636,9 @@ async fn run_transform_lifecycle(
     environment
         .setup(&logf, ctx.storage())
         .instrument(info_span!(
-            "setting up environment",
-            addr = node.addr.to_string()
+            "env-setup",
+            subsystem = "environment",
+            addr = %node.addr
         ))
         .await?;
 
@@ -642,8 +661,9 @@ async fn run_transform_lifecycle(
         transform
             .stage(&logf, ctx, &environment)
             .instrument(info_span!(
-                "staging into environment",
-                addr = node.addr.to_string()
+                "transform-stage",
+                subsystem = "transform",
+                addr = %node.addr
             ))
             .await?;
 
@@ -662,7 +682,7 @@ async fn run_transform_lifecycle(
     logf.set_subject("clean environment");
     let _ = environment
         .clean(&logf)
-        .instrument(info_span!("cleaning up", addr = node.addr.to_string()))
+        .instrument(info_span!("env-clean", subsystem = "environment", addr = %node.addr))
         .await;
 
     drop(logf);
@@ -723,6 +743,7 @@ pub(crate) mod tests {
     use crate::environment::{Environment, Farm, MockEnvironmentImpl, MockFarmImpl};
     use crate::storage::{Artifact as StorageArtifact, Config as ArtifactConfig, Id, MediaType};
     use crate::transform::{MockTransformImpl, Transform, TransformStatus};
+    use futures::FutureExt;
     use std::collections::HashMap;
     use std::path::Path;
     use std::sync::Arc;
@@ -876,6 +897,7 @@ pub(crate) mod tests {
             let deps = deps.clone();
             m.expect_depends().returning(move || Ok(deps.clone()));
         }
+        m.expect_needs_prepare().returning(|_ctx| Ok(true));
         {
             let prepare_called = prepare_called.clone();
             m.expect_prepare().returning(move |_log, _ctx| {
@@ -1153,6 +1175,110 @@ pub(crate) mod tests {
         assert_eq!(h_a.prepare_called.load(AtomicOrdering::SeqCst), 1);
         assert_eq!(h_b.prepare_called.load(AtomicOrdering::SeqCst), 1);
         assert_eq!(h_c.prepare_called.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(log_manager)]
+    async fn graph_skips_prepare_but_executes_node_with_fetch_id() {
+        let ctx = ctx_or_skip!();
+        ensure_default_farm(&ctx);
+        let addr = Addr::parse("//gskip/node").unwrap();
+        let artifact = make_artifact(&format!("{:064x}", fxhash("gskip")));
+        let id = artifact.config().id().clone();
+        let mut mock = MockTransformImpl::new();
+        mock.expect_depends().returning(|| Ok(Vec::new()));
+        mock.expect_get_unique_id().times(1).returning({
+            let id = id.clone();
+            move |_| Ok(id.clone())
+        });
+        mock.expect_needs_prepare()
+            .times(1)
+            .returning(|_| Ok(false));
+        mock.expect_prepare().never();
+        mock.expect_environment()
+            .returning(|| Ok(Addr::parse("//default").unwrap()));
+        mock.expect_stage().times(1).returning(|_, _, _| Ok(()));
+        mock.expect_transform().times(1).returning({
+            let addr = addr.clone();
+            let id = id.clone();
+            move |_, handle, _| {
+                assert_eq!(
+                    futures::executor::block_on(handle.unique_id_of(&addr)).unwrap(),
+                    id
+                );
+                TransformStatus::Success(artifact.clone())
+            }
+        });
+        ctx.insert_transform_for_test(&addr, Transform::new(mock));
+
+        let mut graph = Graph::new(2);
+        let index = graph.add(&ctx, &addr).await.unwrap();
+        graph.fetch(&ctx).await.unwrap();
+        assert_eq!(graph.graph.index(index).id(), Some(&id));
+        assert!(!graph.graph.index(index).is_cache_hit());
+        let workspace = TempDir::new().unwrap();
+        graph.run(workspace.path(), &ctx, &addr).await.unwrap();
+        assert_eq!(
+            graph.graph.index(index).status.load(AtomicOrdering::SeqCst),
+            super::super::node::NodeStatus::Success as u8
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(log_manager)]
+    async fn graph_fetch_memoizes_shared_diamond_dependency() {
+        let ctx = ctx_or_skip!();
+        let mut counts = Vec::new();
+        for (name, deps) in [
+            ("leaf", vec![]),
+            ("left", vec!["leaf"]),
+            ("right", vec!["leaf"]),
+            ("root", vec!["left", "right"]),
+        ] {
+            let addr = Addr::parse(&format!("//gmemo/{name}")).unwrap();
+            let deps: Vec<Addr> = deps
+                .iter()
+                .map(|dep| Addr::parse(&format!("//gmemo/{dep}")).unwrap())
+                .collect();
+            let count = Arc::new(AtomicUsize::new(0));
+            counts.push(count.clone());
+            let mut mock = MockTransformImpl::new();
+            mock.expect_depends().returning({
+                let deps = deps.clone();
+                move || Ok(deps.clone())
+            });
+            mock.expect_get_unique_id()
+                .times(1)
+                .returning(move |handle| {
+                    count.fetch_add(1, AtomicOrdering::SeqCst);
+                    let mut hash = blake3::Hasher::new();
+                    hash.update(name.as_bytes());
+                    for dep in &deps {
+                        let id = handle.unique_id_of(dep).now_or_never().unwrap()?;
+                        hash.update(id.digest().as_bytes());
+                    }
+                    Ok(Id::builder()
+                        .name(addr.to_id())
+                        .digest(hash.finalize().to_hex().to_string())
+                        .build())
+                });
+            mock.expect_needs_prepare().returning(|_| Ok(false));
+            mock.expect_prepare().never();
+            ctx.insert_transform_for_test(
+                &Addr::parse(&format!("//gmemo/{name}")).unwrap(),
+                Transform::new(mock),
+            );
+        }
+        let mut graph = Graph::new(4);
+        graph
+            .add(&ctx, &Addr::parse("//gmemo/root").unwrap())
+            .await
+            .unwrap();
+        graph.fetch(&ctx).await.unwrap();
+        assert_eq!(graph.graph.node_count(), 4);
+        for count in counts {
+            assert_eq!(count.load(AtomicOrdering::SeqCst), 1);
+        }
     }
 
     #[tokio::test]

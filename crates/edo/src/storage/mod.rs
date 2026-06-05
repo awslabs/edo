@@ -107,13 +107,21 @@ impl Inner {
 
     // Set a build cache
     fn set_build_cache(&mut self, cache: &Backend) {
-        debug!(component = "storage", "registering a build cache");
+        debug!(
+            subsystem = "storage",
+            op = "register",
+            "registering a build cache"
+        );
         self.build = Some(cache.clone());
     }
 
     // Set the output cache
     fn set_output_cache(&mut self, cache: &Backend) {
-        debug!(component = "storage", "registering an output cache");
+        debug!(
+            subsystem = "storage",
+            op = "register",
+            "registering an output cache"
+        );
         self.output = Some(cache.clone());
     }
 

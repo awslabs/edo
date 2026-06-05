@@ -24,6 +24,12 @@ pub enum SourceError {
         #[snafu(source(from(crate::storage::StorageError, Box::new)))]
         source: Box<crate::storage::StorageError>,
     },
+    /// A source's content changed after its id was memoized for this run.
+    #[snafu(display("source changed during the build: expected id {expected}, fetched {actual}"))]
+    Changed {
+        expected: Box<crate::storage::Id>,
+        actual: Box<crate::storage::Id>,
+    },
     /// A node field was present but had an unexpected type.
     #[snafu(display("field '{field}' should be defined as a {type_}"))]
     Field { field: String, type_: String },
