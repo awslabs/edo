@@ -126,7 +126,7 @@ impl TransformImpl for CargoVendorTransform {
             .name(self.addr.to_id())
             .digest(digest.to_hex().to_lowercase())
             .build();
-        trace!(component = "transform", type = "cargo-vendor", "id is calculated to be {id}");
+                trace!(subsystem = "transform", component = "cargo-vendor", id = %id, "calculated id");
         Ok(id.clone())
     }
 
@@ -154,7 +154,13 @@ impl TransformImpl for CargoVendorTransform {
         // For each source we are going to stage things into addr centered directories
         for (_, source) in self.sources.iter() {
             let id = source.get_unique_id().await?;
-            trace!(component = "transform", type = "cargo-vendor", "staging source {id}");
+                        trace!(
+                subsystem = "transform",
+                component = "cargo-vendor",
+                op = "stage",
+                id = %id,
+                "staging source"
+            );
             let string = id.to_string();
             let dir = Path::new(&string);
             env.create_dir(dir).await?;

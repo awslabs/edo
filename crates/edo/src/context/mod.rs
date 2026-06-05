@@ -24,6 +24,7 @@ use super::{
     source::{Source, Vendor},
     transform::Transform,
 };
+use crate::console::{Console, ConsoleEvent, JsonlSink, SimpleSink};
 use crate::storage::{Backend, LocalBackend, Storage};
 use dashmap::DashMap;
 use serde_json::json;
@@ -71,6 +72,29 @@ pub use registry::*;
 /// Re-exports the typed-schema types ([`Schema`], [`Requirement`]).
 pub use schema::*;
 
+/// Configuration for the build-event console.
+///
+/// Determines which sinks the [`Console`] inside [`Context`] is wired with.
+/// Mapped from the CLI's `--console-mode` and `--event-log` flags by
+/// `crates/cli/src/cmd/mod.rs::create_context`.
+#[derive(Clone, Debug)]
+pub struct ConsoleConfig {
+    /// Renderer mode (`auto`, `full`, `simple`, `none`).
+    pub mode: crate::console::ConsoleMode,
+    /// Path to the JSONL event log (overwritten each run). `None`
+    /// disables the JSONL sink.
+    pub event_log: Option<PathBuf>,
+}
+
+impl Default for ConsoleConfig {
+    fn default() -> Self {
+        Self {
+            mode: crate::console::ConsoleMode::Auto,
+            event_log: None,
+        }
+    }
+}
+
 /// Convenience alias for `Result<T, ContextError>`.
 pub type ContextResult<T> = std::result::Result<T, error::ContextError>;
 
@@ -94,6 +118,8 @@ pub struct Context {
     storage: Storage,
     /// Log Manager
     log: LogManager,
+    /// Build-event console (typed event bus + sinks)
+    console: Console,
     /// Execution Scheduler
     scheduler: Scheduler,
     /// Registry of implemented components
@@ -117,6 +143,7 @@ impl Context {
         config: Option<ConfigPath>,
         args: HashMap<String, String>,
         verbosity: LogVerbosity,
+        console_cfg: ConsoleConfig,
     ) -> ContextResult<Self>
     where
         ProjectPath: AsRef<Path>,
@@ -135,6 +162,40 @@ impl Context {
         // do not clash with other project workspaces.
         let log_path = path.join("logs");
         let log = LogManager::init(&log_path, verbosity).await?;
+        // Wire up the build-event console. The JSONL sink is on by
+        // default; disable by passing `event_log = None`.
+        let console = Console::new();
+        if let Some(jsonl_path) = &console_cfg.event_log {
+            match JsonlSink::create(jsonl_path) {
+                Ok(sink) => console.add_sink(sink),
+                Err(e) => {
+                    // Sink failure must never block a build; warn loudly
+                    // and continue with the remaining sinks.
+                    warn!(
+                        subsystem = "console",
+                        op = "open-event-log",
+                        path = %jsonl_path.display(),
+                        "failed to open event log {}: {e}", jsonl_path.display()
+                    );
+                }
+            }
+        }
+        match crate::console::sinks::resolve_mode(console_cfg.mode) {
+            crate::console::ConsoleMode::Simple => {
+                console.add_sink(SimpleSink::new());
+            }
+            crate::console::ConsoleMode::Full => {
+                // Spawn the inline ratatui canvas. Default canvas
+                // height is 8 rows; the renderer caps the active-task
+                // table internally.
+                console.install_canvas(8);
+            }
+            crate::console::ConsoleMode::None | crate::console::ConsoleMode::Auto => {
+                // `Auto` is normalised by `resolve_mode`; reaching here
+                // means stderr is non-TTY and we want no canvas.
+                // `None` means no console output at all.
+            }
+        }
         // Load the configuration
         let config = Config::load(config).await?;
         // Initialize the storage with the default local cache
@@ -161,6 +222,7 @@ impl Context {
             config: config.clone(),
             args,
             log: log.clone(),
+            console,
             storage,
             registry: Registry::default(),
             scheduler: Scheduler::new(&path.join("env"), &config).await?,
@@ -191,6 +253,7 @@ impl Context {
     pub fn get_handle(&self) -> Handle {
         Handle::new(
             self.log.clone(),
+            self.console.clone(),
             self.config.clone(),
             self.storage.clone(),
             self.transforms
@@ -220,6 +283,16 @@ impl Context {
         &self.log
     }
 
+    /// Returns a reference to the build-event console.
+    pub fn console(&self) -> &Console {
+        &self.console
+    }
+
+    /// Convenience: emit a [`ConsoleEvent`] through the build console.
+    pub fn emit(&self, event: ConsoleEvent) {
+        self.console.emit(event);
+    }
+
     /// Returns a reference to the execution scheduler.
     pub fn scheduler(&self) -> &Scheduler {
         &self.scheduler
@@ -241,9 +314,12 @@ impl Context {
     /// based on the address.
     pub async fn add_cache(&self, addr: &Addr, element: &Element) -> ContextResult<()> {
         debug!(
-            section = "context",
+            subsystem = "context",
             component = "context",
-            "adding a storage backend {addr}"
+            op = "register",
+            addr = %addr,
+            kind = %element.kind,
+            "adding a storage backend"
         );
         let backend = if element.kind == "local" || element.kind == "edo:local" {
             Backend::new(LocalBackend::new(element, self.config()).await?)
@@ -269,10 +345,12 @@ impl Context {
     /// Creates and registers a transform from the given node using the appropriate plugin.
     pub async fn add_transform(&self, element: &Element) -> ContextResult<()> {
         debug!(
-            section = "context",
+            subsystem = "context",
             component = "context",
-            "adding a transform {}",
-            element.addr,
+            op = "register",
+            addr = %element.addr,
+            kind = %element.kind,
+            "adding a transform"
         );
         self.transforms.insert(
             element.addr.clone(),
@@ -299,10 +377,12 @@ impl Context {
     /// Creates and registers an environment farm from the given node using the appropriate plugin.
     pub async fn add_farm(&self, element: &Element) -> ContextResult<()> {
         debug!(
-            section = "context",
+            subsystem = "context",
             component = "context",
-            "adding a farm {}",
-            element.addr,
+            op = "register",
+            addr = %element.addr,
+            kind = %element.kind,
+            "adding a farm"
         );
         // If we get here use the core plugin
         self.farms.insert(
@@ -315,10 +395,12 @@ impl Context {
     /// Creates a source fetcher from the given node using the appropriate plugin.
     pub async fn add_source(&self, element: &Element) -> ContextResult<Source> {
         debug!(
-            section = "context",
+            subsystem = "context",
             component = "context",
-            "adding a source {}",
-            element.addr,
+            op = "register",
+            addr = %element.addr,
+            kind = %element.kind,
+            "adding a source"
         );
         let result = self.registry().source(element, self).await?;
         Ok(result)
@@ -339,23 +421,59 @@ impl Context {
         // Run the initial setup for environments
         let log = self.log.create("setup").await?;
         log.set_subject("environment-setup");
+
+        // Provenance: surface farm-setup as its own pre-build phase so
+        // the canvas / JSONL log show what's happening between
+        // `ProjectLoaded` and `BuildStarted`. Container farms in
+        // particular can spend significant time here pulling images and
+        // loading them into the runtime; without these events the UI
+        // shows a blank screen for that whole window.
+        let total = self.farms.len();
+        let phase_started = std::time::Instant::now();
+        self.emit(ConsoleEvent::EnvSetupStarted { total });
+
         for entry in self.farms.iter() {
-            entry
+            let addr = entry.key().clone();
+            self.emit(ConsoleEvent::EnvSetupFarmStarted { addr: addr.clone() });
+            let started = std::time::Instant::now();
+            let result = entry
                 .setup(&log, self.storage())
                 .instrument(info_span!(
-                    target: "context",
-                    "setting up environment",
-                    addr = entry.key().to_string()
+                    "env-setup",
+                    subsystem = "environment",
+                    addr = %addr
                 ))
-                .await?;
+                .await;
+            let elapsed_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+            self.emit(ConsoleEvent::EnvSetupFarmFinished {
+                addr,
+                ok: result.is_ok(),
+                elapsed_ms,
+            });
+            // Emit the phase-end event before propagating the error so
+            // sinks see a balanced started/finished pair even on
+            // failure. The build won't start in this case.
+            if let Err(e) = result {
+                let elapsed_ms = phase_started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+                self.emit(ConsoleEvent::EnvSetupFinished { elapsed_ms });
+                return Err(e.into());
+            }
         }
+
+        let elapsed_ms = phase_started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        self.emit(ConsoleEvent::EnvSetupFinished { elapsed_ms });
         Ok(())
     }
 
     /// Sets up environments and executes the build for the given transform address.
     pub async fn run(&self, addr: &Addr) -> ContextResult<()> {
         self.setup_environments().await?;
-        self.scheduler().run(self, addr).await?;
+        let result = self.scheduler().run(self, addr).await;
+        // Drain the inline canvas before propagating the result so the
+        // user sees the final BuildFinished summary and the terminal is
+        // restored cleanly even on error.
+        self.console.shutdown().await;
+        result?;
         Ok(())
     }
 }
@@ -414,6 +532,7 @@ mod tests {
             None,
             HashMap::new(),
             LogVerbosity::Info,
+            ConsoleConfig::default(),
         )
         .await
         {

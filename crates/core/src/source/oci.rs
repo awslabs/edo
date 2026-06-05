@@ -39,14 +39,22 @@ impl SourceImpl for ImageSource {
             .name(self.uri.clone())
             .digest(self.digest.clone())
             .build();
-        trace!(component = "source", type = "oci", "calculated id to be {id}");
+        trace!(subsystem = "source", component = "oci", id = %id, "calculated id");
         Ok(id)
     }
 
     async fn fetch(&self, log: &Log, storage: &Storage) -> SourceResult<Artifact> {
         let id = self.get_unique_id().await?;
         let uri = Uri::new(&self.uri).await.context(error::OciSnafu)?;
-        trace!(component = "source", type = "oci", "pulling oci image from {}", self.uri);
+        info!(
+            subsystem = "source",
+            component = "oci",
+            op = "fetch",
+            id = %id,
+            uri = %self.uri,
+            "pulling oci image {}",
+            self.uri
+        );
 
         // We do something rather clever for oci images, as we are going to one to one map the layers
         // and then handle staging as a filesystem ourself

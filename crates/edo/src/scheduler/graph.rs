@@ -44,6 +44,7 @@ use std::{
     ops::Index,
     path::Path,
     sync::Arc,
+    time::Instant,
 };
 use tempfile::TempDir;
 use tokio::sync::{Mutex, Semaphore, mpsc::channel};
@@ -51,6 +52,7 @@ use tokio::task::{JoinError, JoinHandle};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
+use crate::console::{ConsoleEvent, Phase, event::duration_ms};
 use crate::context::{Addr, Context, Handle};
 use crate::storage::{Artifact, Id};
 use crate::transform::Transform;
@@ -119,6 +121,13 @@ impl Graph {
         }
     }
 
+    /// Returns the size of the reachable subgraph for `addr`, or 0 if
+    /// `addr` was never added. Used by the scheduler to populate the
+    /// `total` field of [`ConsoleEvent::BuildStarted`].
+    pub fn subgraph_size(&self, addr: &Addr) -> usize {
+        self.subgraphs.get(addr).map(|s| s.len()).unwrap_or(0)
+    }
+
     /// Recursively adds a transform and its dependencies to the graph.
     ///
     /// Returns the `NodeIndex` of the added (or existing) node. Edges are
@@ -135,7 +144,7 @@ impl Graph {
         if let Some(index) = self.index.get_by_left(addr) {
             return Ok(*index);
         }
-        trace!(component = "execution", "adding execution node for {addr}");
+                trace!(subsystem = "scheduler", op = "add-node", addr = %addr, "adding execution node");
         let transform = ctx
             .get_transform(addr)
             .context(error::ProjectTransformSnafu { addr: addr.clone() })?;
@@ -147,7 +156,7 @@ impl Graph {
         // `add_edge` is what catches cycles — daggy returns `WouldCycle`.
         for dep in transform.depends().await? {
             let child = self.add_recursive(ctx, &dep).await?;
-            trace!(component = "execution", "adding edge for {dep} -> {addr}");
+                        trace!(subsystem = "scheduler", op = "add-edge", from = %dep, to = %addr, "adding edge");
             self.graph
                 .add_edge(child, node_index, format!("{dep}->{addr}"))
                 .context(error::GraphSnafu)?;
@@ -251,10 +260,17 @@ impl Graph {
             // this node and any cache-hit ancestors to Success without
             // ever spawning an environment.
             if ctx.storage().find_build(&id, true).await?.is_some() {
-                info!("skipped fetch for built entry {}", node.addr);
                 node.set_cache_hit(true);
+                ctx.emit(ConsoleEvent::NodeCacheHit {
+                    addr: node.addr.clone(),
+                    id: id.clone(),
+                });
                 continue;
             }
+            ctx.emit(ConsoleEvent::NodeQueued {
+                addr: node.addr.clone(),
+                id: Some(id.clone()),
+            });
 
             let ctx = ctx.clone();
             let node_for_task = node.clone();
@@ -270,8 +286,20 @@ impl Graph {
             tasks.push(tokio::spawn(async move {
                 let logf = ctx.log().create(format!("{id}").as_str()).await?;
                 logf.set_subject("fetch");
+                ctx.emit(ConsoleEvent::NodePhase {
+                    addr: node_for_task.addr.clone(),
+                    phase: Phase::Fetch,
+                });
                 transform.prepare(&logf, &ctx).await?;
-                info!("pulled sources and artifacts for {}", node_for_task.addr);
+                // Mark the node as fetched-but-not-yet-running. Without
+                // this, the active-task table would display "FETCH" for
+                // every post-fetch node until a transform worker picks
+                // it up \u2014 which can be tens of seconds with a small
+                // batch_size against a large graph.
+                ctx.emit(ConsoleEvent::NodePhase {
+                    addr: node_for_task.addr.clone(),
+                    phase: Phase::Wait,
+                });
                 drop(logf);
                 // Explicit drop is documentation: the permit returns to
                 // the pool exactly when this task ends.
@@ -323,8 +351,16 @@ impl Graph {
     pub async fn run(&self, path: &Path, ctx: &Context, addr: &Addr) -> Result<()> {
         let ctx_handle = ctx.get_handle();
         let token = ctx_handle.cancellation();
+        let build_started_at = Instant::now();
 
-        // ── Step 1: resolve the target node. ──────────────────────────────
+        // ── Step 1: resolve the target node. ──────────────────────
+        //
+        // Note: [`ConsoleEvent::BuildStarted`] is emitted by
+        // [`Scheduler::run`] *before* `Graph::fetch`, so it sequences
+        // ahead of any `NodeQueued` / `NodeCacheHit` events fired during
+        // the fetch pass. We only emit `BuildFinished` from here
+        // because it needs the failed-address list which lives on the
+        // graph.
         let start = self
             .index
             .get_by_left(addr)
@@ -335,7 +371,11 @@ impl Graph {
         // `cache_hit`; if the root is one we don't even need to walk its
         // dependencies — they only matter if we have to rebuild.
         if root_node.is_cache_hit() {
-            info!("{addr} is already built, skipping...");
+            ctx_handle.emit(ConsoleEvent::BuildFinished {
+                ok: true,
+                elapsed_ms: duration_ms(build_started_at.elapsed()),
+                failed: vec![],
+            });
             return Ok(());
         }
 
@@ -448,7 +488,7 @@ impl Graph {
                     let result = run_transform_lifecycle(
                         &ctx_clone, &path_buf, &node, &transform, &id, &token,
                     )
-                    .instrument(info_span!("transforming", addr = node.addr.to_string()))
+                                        .instrument(info_span!("transform", subsystem = "scheduler", addr = %node.addr))
                     .await;
                     // If the driver has gone away (done_rx dropped) there's
                     // nobody left to report to — exit quietly.
@@ -530,7 +570,7 @@ impl Graph {
                     // failed, and clear `ready` so no further dispatch
                     // happens. We still need to drain `inflight` tasks
                     // so workers don't leak.
-                    error!("{} failed: {e}", node.addr);
+                                        error!(subsystem = "scheduler", addr = %node.addr, "{} failed: {e}", node.addr);
                     node.set_failed();
                     if first_error.is_none() {
                         first_error = Some(e);
@@ -556,12 +596,49 @@ impl Graph {
         // Failure takes precedence over cancellation in error reporting:
         // a real failure is more actionable than the generic "cancelled".
         if let Some(e) = first_error {
+            // Collect failed addresses for the BuildFinished payload
+            // before we surrender the graph reference. Skip any node
+            // whose index is not in the index map (defensive) or not
+            // in this root's subgraph \u2014 the previous `unwrap_or(*start)`
+            // fallback misclassified orphans as in-subgraph (P1).
+            let failed_addrs: Vec<Addr> = self
+                .graph
+                .node_references()
+                .filter_map(|(_, node)| {
+                    let idx = self.index.get_by_left(&node.addr).copied()?;
+                    if subgraph.contains(&idx)
+                        && matches!(
+                            node.status.load(std::sync::atomic::Ordering::SeqCst),
+                            x if x == super::node::NodeStatus::Failed as u8
+                        )
+                    {
+                        Some(node.addr.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            ctx_handle.emit(ConsoleEvent::BuildFinished {
+                ok: false,
+                elapsed_ms: duration_ms(build_started_at.elapsed()),
+                failed: failed_addrs,
+            });
             return Err(e);
         }
         if token.is_cancelled() {
+            ctx_handle.emit(ConsoleEvent::BuildFinished {
+                ok: false,
+                elapsed_ms: duration_ms(build_started_at.elapsed()),
+                failed: vec![],
+            });
             return error::CancelledSnafu.fail();
         }
 
+        ctx_handle.emit(ConsoleEvent::BuildFinished {
+            ok: true,
+            elapsed_ms: duration_ms(build_started_at.elapsed()),
+            failed: vec![],
+        });
         Ok(())
     }
 }
@@ -595,18 +672,24 @@ async fn run_transform_lifecycle(
     id: &Id,
     token: &CancellationToken,
 ) -> Result<Artifact> {
+    let started_at = Instant::now();
     // Per-transform scratch directory; dropped (and removed) when this
     // function returns regardless of success/failure path.
     let temp = TempDir::new_in(workspace).context(error::TemporaryDirectorySnafu)?;
     let logf = ctx.log().create(format!("{id}").as_str()).await?;
 
     logf.set_subject("create-environment");
+    ctx.emit(ConsoleEvent::NodePhase {
+        addr: node.addr.clone(),
+        phase: Phase::CreateEnv,
+    });
     let env_addr = transform.environment().await?;
     let environment = ctx
         .create_environment(&logf, &env_addr, temp.path())
-        .instrument(info_span!(
-            "creating environment",
-            addr = node.addr.to_string()
+                .instrument(info_span!(
+            "env-create",
+            subsystem = "environment",
+            addr = %node.addr
         ))
         .await?;
 
@@ -615,11 +698,16 @@ async fn run_transform_lifecycle(
     }
 
     logf.set_subject("setup-environment");
+    ctx.emit(ConsoleEvent::NodePhase {
+        addr: node.addr.clone(),
+        phase: Phase::Setup,
+    });
     environment
         .setup(&logf, ctx.storage())
-        .instrument(info_span!(
-            "setting up environment",
-            addr = node.addr.to_string()
+                .instrument(info_span!(
+            "env-setup",
+            subsystem = "environment",
+            addr = %node.addr
         ))
         .await?;
 
@@ -628,6 +716,10 @@ async fn run_transform_lifecycle(
     }
 
     logf.set_subject("spinup environment");
+    ctx.emit(ConsoleEvent::NodePhase {
+        addr: node.addr.clone(),
+        phase: Phase::SpinUp,
+    });
     environment.up(&logf).await?;
 
     // Past this point the environment is "up" and we owe it teardown.
@@ -639,11 +731,16 @@ async fn run_transform_lifecycle(
             return error::CancelledSnafu.fail();
         }
         logf.set_subject("staging");
+        ctx.emit(ConsoleEvent::NodePhase {
+            addr: node.addr.clone(),
+            phase: Phase::Stage,
+        });
         transform
             .stage(&logf, ctx, &environment)
-            .instrument(info_span!(
-                "staging into environment",
-                addr = node.addr.to_string()
+                        .instrument(info_span!(
+                "transform-stage",
+                subsystem = "transform",
+                addr = %node.addr
             ))
             .await?;
 
@@ -651,28 +748,48 @@ async fn run_transform_lifecycle(
             return error::CancelledSnafu.fail();
         }
         logf.set_subject("execution");
-        super::execute::execute(&logf, ctx, transform, &environment).await
+        ctx.emit(ConsoleEvent::NodePhase {
+            addr: node.addr.clone(),
+            phase: Phase::Execute,
+        });
+        super::execute::execute(&logf, ctx, &node.addr, transform, &environment).await
     }
     .await;
 
     // Best-effort teardown: errors are logged-and-swallowed so a clean-up
     // failure never overrides a successful build (or vice versa).
     logf.set_subject("spindown environment");
+    ctx.emit(ConsoleEvent::NodePhase {
+        addr: node.addr.clone(),
+        phase: Phase::SpinDown,
+    });
     let _ = environment.down(&logf).await;
     logf.set_subject("clean environment");
+    ctx.emit(ConsoleEvent::NodePhase {
+        addr: node.addr.clone(),
+        phase: Phase::Clean,
+    });
     let _ = environment
         .clean(&logf)
-        .instrument(info_span!("cleaning up", addr = node.addr.to_string()))
+                .instrument(info_span!("env-clean", subsystem = "environment", addr = %node.addr))
         .await;
 
     drop(logf);
     match outcome {
         Ok(artifact) => {
-            info!("transformation complete");
+            ctx.emit(ConsoleEvent::NodeFinished {
+                addr: node.addr.clone(),
+                ok: true,
+                elapsed_ms: duration_ms(started_at.elapsed()),
+            });
             Ok(artifact)
         }
         Err(e) => {
-            error!("transformation failed: {e}");
+            ctx.emit(ConsoleEvent::NodeFinished {
+                addr: node.addr.clone(),
+                ok: false,
+                elapsed_ms: duration_ms(started_at.elapsed()),
+            });
             Err(e)
         }
     }
@@ -748,6 +865,7 @@ pub(crate) mod tests {
             None,
             HashMap::new(),
             LogVerbosity::Info,
+            crate::context::ConsoleConfig::default(),
         )
         .await
         {
@@ -815,8 +933,8 @@ pub(crate) mod tests {
         /// Fail from the `stage` lifecycle method with a synthetic
         /// [`TransformError::Implementation`]. Failing in `stage` (rather
         /// than returning [`TransformStatus::Failed`] from `transform`)
-        /// avoids the interactive `dialoguer::Select::interact` prompt
-        /// in `execute::execute` so the scheduler's failure path can be
+        /// avoids the interactive console failure prompt in
+        /// `execute::execute` so the scheduler's failure path can be
         /// exercised from a unit test.
         FailInStage,
     }
@@ -1465,7 +1583,7 @@ pub(crate) mod tests {
     /// transform fails, the scheduler must surface the error and terminate
     /// rather than hanging. Failure is injected in the `stage` lifecycle
     /// so the error propagates out of the per-task future without going
-    /// through `execute::execute`'s interactive `dialoguer::Select` prompt.
+    /// through `execute::execute`'s interactive console prompt.
     #[tokio::test]
     #[serial_test::serial(log_manager)]
     async fn graph_run_failure_does_not_hang() {

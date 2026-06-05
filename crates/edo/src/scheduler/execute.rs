@@ -1,28 +1,27 @@
 //! Interactive transform executor with error recovery.
 //!
-//! Handles running a single transform, catching failures, and prompting the
-//! user with options to view logs, retry, open a shell, or abort.
+//! Handles running a single transform, catching failures, and surfacing the
+//! failure prompt through the build console.
 
 use super::{Result, error};
 use crate::{
+    console::{PromptChoice, PromptRequest},
     context::{Handle, Log},
     environment::Environment,
     storage::Artifact,
     transform::{Transform, TransformStatus},
 };
-use dialoguer::{Editor, Select};
-use snafu::ResultExt;
-use std::fs::read_to_string;
-use tracing_indicatif::suspend_tracing_indicatif;
+use std::io;
 
 /// Executes a transform with interactive error recovery.
 ///
 /// Runs the given transform within the provided environment. On failure,
-/// prompts the user with options to view logs, retry, open a shell, or quit.
+/// drives the failure prompt via [`crate::console::Console::prompt`].
 /// On success, uploads the resulting artifact to the build cache.
 pub async fn execute(
     log: &Log,
     ctx: &Handle,
+    addr: &crate::context::Addr,
     transform: &Transform,
     env: &Environment,
 ) -> Result<Artifact> {
@@ -40,67 +39,71 @@ pub async fn execute(
             // If the attempt failed for any reason we need to prompt the user what
             // we should do about it.
             TransformStatus::Retryable(log_file, e) | TransformStatus::Failed(log_file, e) => {
-                error!(target: "transform", "transformation failed: {}", e.to_string());
-                // Collect the valid options to present the user with
-                let mut options = Vec::new();
-                if log_file.is_some() {
-                    options.push("view log");
-                }
-                if matches!(attempt_result, TransformStatus::Retryable(..)) {
-                    options.push("retry");
-                }
-                if transform.can_shell() {
-                    options.push("shell");
-                }
-                options.push("quit");
-                // IMPORTANT! We need to susppend our progress bars to ask the
-                // user for what to do.
-                let should_quit = suspend_tracing_indicatif(|| {
-                    // Acquire an exclusive lock on the console through
-                    // the log manager
-                    let console_lock = ctx.log().acquire();
-                    'prompt: loop {
-                        let index = Select::new()
-                            .items(options.as_slice())
-                            .default(0)
-                            .interact()
-                            .context(error::InquireSnafu)?;
-                        let ans = options[index];
-                        match ans {
-                            "view log" => {
-                                let log_text =
-                                    read_to_string(log_file.as_ref().expect(
-                                        "log_file is Some when 'view log' option is present",
-                                    ))
-                                    .context(error::IoSnafu)?;
-                                Editor::new().edit(&log_text).context(error::InquireSnafu)?;
-                                continue 'prompt;
-                            }
-                            "shell" => {
-                                transform.shell(env)?;
-                                continue 'prompt;
-                            }
-                            "retry" => {
-                                return Ok(false);
-                            }
-                            "quit" => {
-                                ctx.cancellation().cancel();
-                                break 'prompt;
-                            }
-                            _ => {
-                                return Ok(false);
-                            }
+                error!(
+                    subsystem = "transform",
+                    op = "failed",
+                    addr = %addr,
+                    "transformation failed: {}",
+                    e.to_string()
+                );
+
+                let allow_retry = matches!(attempt_result, TransformStatus::Retryable(..));
+                let allow_shell = transform.can_shell();
+                let shell_callback: Option<Box<dyn FnMut() -> io::Result<()> + Send>> =
+                    if allow_shell {
+                        // Capture the env + transform handles into a closure
+                        // the render task can call once the canvas is
+                        // suspended.
+                        let transform = transform.clone();
+                        let env = env.clone();
+                        Some(Box::new(move || {
+                            transform
+                                .shell(&env)
+                                .map_err(|e| io::Error::other(e.to_string()))
+                        }))
+                    } else {
+                        None
+                    };
+                let request = PromptRequest {
+                    addr: addr.clone(),
+                    error: e.to_string(),
+                    log_file: log_file.clone(),
+                    allow_retry,
+                    allow_shell,
+                    shell: shell_callback,
+                };
+                let choice = ctx.console().prompt(request).await;
+                match choice {
+                    PromptChoice::Retry if allow_retry => {
+                        continue 'transform;
+                    }
+                    PromptChoice::Retry => {
+                        // Defensive: the prompt should never offer
+                        // `retry` when `allow_retry == false`, but if
+                        // it somehow returns one (canvas absent,
+                        // shutdown race, second prompt rejected) we
+                        // emit an explicit diagnostic instead of
+                        // silently downgrading to abort (P1).
+                        ctx.console().emit(crate::console::ConsoleEvent::diag(
+                            crate::console::event::Severity::Warn,
+                            "transform",
+                            format!("{addr}: retry not available for this failure; aborting"),
+                        ));
+                        ctx.cancellation().cancel();
+                        result = error::PassthroughSnafu {
+                            message: e.to_string(),
                         }
+                        .fail();
+                        break 'transform;
                     }
-                    drop(console_lock);
-                    Ok::<bool, error::SchedulerError>(true)
-                })?;
-                if should_quit {
-                    result = error::PassthroughSnafu {
-                        message: e.to_string(),
+                    PromptChoice::Quit => {
+                        ctx.cancellation().cancel();
+                        result = error::PassthroughSnafu {
+                            message: e.to_string(),
+                        }
+                        .fail();
+                        break 'transform;
                     }
-                    .fail();
-                    break 'transform;
                 }
             }
         }
@@ -115,18 +118,20 @@ pub async fn execute(
     }
 }
 
+/// Best-effort: derive the failed transform's `Addr`. The `Transform`
+/// trait does not expose its address directly — callers pass the
+/// scheduler's `node.addr` instead.
+#[allow(dead_code)]
+fn addr_for(_t: &Transform) -> Option<crate::context::Addr> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     //! Tests for `execute`.
     //!
-    //! Scope: success-path only. `TransformStatus::Retryable` and
-    //! `TransformStatus::Failed` both route through `dialoguer::Select::interact`
-    //! which requires an interactive TTY and cannot be driven from a unit
-    //! test without a harness we do not have.
-    //!
-    //! Mocks come from `mockall::automock` on the trait definitions; the
-    //! builders below configure them with the minimal pass-through behavior
-    //! required by `execute`.
+    //! Scope: success-path only. Failure paths drive the canvas prompt
+    //! which requires a TTY harness we do not have.
 
     use super::*;
     use crate::context::{Addr, Context, LogVerbosity};
@@ -156,6 +161,7 @@ mod tests {
             None,
             HashMap::new(),
             LogVerbosity::Info,
+            crate::context::ConsoleConfig::default(),
         )
         .await
         {
@@ -249,9 +255,15 @@ mod tests {
         let env = farm.create(&log, Path::new("/")).await.expect("env");
         let transform = success_transform("deadbeef");
 
-        let artifact = execute(&log, &handle, &transform, &env)
-            .await
-            .expect("execute success");
+        let artifact = execute(
+            &log,
+            &handle,
+            &Addr::parse("//exec/test").unwrap(),
+            &transform,
+            &env,
+        )
+        .await
+        .expect("execute success");
         assert_eq!(artifact.config().id().digest(), "deadbeef");
         assert_eq!(artifact.config().id().name(), "exec_mock");
     }

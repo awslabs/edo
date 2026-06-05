@@ -1,12 +1,67 @@
 //! Log manager and tracing initialization.
 //!
 //! [`LogManager`] owns the log directory, initializes the `tracing` subscriber
-//! with an indicatif progress layer, and creates per-task [`Log`] files.
-//! [`LogVerbosity`] controls the tracing filter level.
+//! and creates per-task [`Log`] files. [`LogVerbosity`] controls the tracing
+//! filter level.
 //!
-//! The [`elapsed_subsec`], [`build_sub_unit`], and [`build`] free functions
-//! are progress-bar helpers and demo instrumented tasks used during
-//! development.
+//! Tracing chatter (every `info!`/`debug!`/`trace!`) is written as JSON Lines
+//! to `<logdir>/edo.jsonl` via [`tracing_appender::non_blocking`] and
+//! [`tracing_subscriber::fmt::layer().json()`]. The build-event console (see
+//! [`crate::console`]) owns stderr; tracing events flow into the file so
+//! `--debug` / `--trace` never bleed onto the user's terminal. JSONL is
+//! machine-readable: one JSON object per line, with timestamp / level /
+//! target / span fields plus all structured event fields preserved verbatim.
+//!
+//! # Console events vs tracing log
+//!
+//! Two separate channels record what a build did:
+//!
+//! - **`ConsoleEvent`** (see [`crate::console::event`]) is the user-facing
+//!   lifecycle: `BuildStarted`, `NodeFinished{ok}`, `BuildFinished`, etc.
+//!   It is rendered live to the terminal and (optionally) to an
+//!   `--event-log` JSONL file. Console events answer *what* happened.
+//! - **`tracing` events** (this file) are internal instrumentation:
+//!   registration, cache hits, network IO, retry, the canonical
+//!   transform-failure log line. They answer *how* and *why* inside a
+//!   phase. Tracing never mirrors a `ConsoleEvent` — that would just
+//!   duplicate the same fact at two log levels.
+//!
+//! # Canonical structured-field schema
+//!
+//! Every `info!` / `debug!` / `trace!` / `warn!` / `error!` call uses
+//! a small fixed vocabulary of keyword fields (no `target:` overrides,
+//! no ad-hoc keys like `section` / `variant` / `type`):
+//!
+//! | field        | type | when                          | examples                                          |
+//! |--------------|------|-------------------------------|---------------------------------------------------|
+//! | `subsystem`  | str  | always                        | `context`, `scheduler`, `storage`, `source`, `transform`, `environment`, `console` |
+//! | `component`  | str  | when subsystem has variants   | `local`, `s3`, `git`, `oci`, `remote`, `container`, `script`, `compose`, `import`, `cargo-vendor`, `go-vendor` |
+//! | `addr`       | str  | when an `Addr` is in scope    | `//hello/build`                                   |
+//! | `id`         | str  | when an `Id` is in scope      | `name@digest`                                     |
+//! | `op`         | str  | for state-change lines        | `register`, `cache-hit`, `fetch`, `upload`, `prune`, `retry` |
+//!
+//! The default `target` (the module path) is fine — don't override it.
+//!
+//! # Severity policy
+//!
+//! - `error!`: irrecoverable failures **inside the tracing scope** that
+//!   aren't already covered by a `ConsoleEvent::NodeFinished{ok:false}`.
+//!   Most transform-error logging is owned by the single line in
+//!   `scheduler::execute`.
+//! - `warn!`: recoverable anomalies the user should know about — stale
+//!   S3 lock, unknown layer media-type, retry attempted, render task
+//!   failure.
+//! - `info!`: one-time decisions and state changes worth seeing in a
+//!   postmortem at default verbosity — project digest, lockfile reuse,
+//!   resolver `name@version` per dep, registration of caches/farms,
+//!   real source fetches, cache uploads/downloads with `id`+digest,
+//!   container image load, retry decisions.
+//! - `debug!`: per-loop registration noise, leaf-level "loading X" lines.
+//! - `trace!`: every fs op, every `cmd_collect_out` invocation, every
+//!   set-env-var call, internal id-calculation breadcrumbs.
+//!
+//! The [`build_sub_unit`] / [`build`] helpers are demo instrumented tasks
+//! used during development.
 
 use std::{
     path::{Path, PathBuf},
@@ -14,29 +69,13 @@ use std::{
     time::Duration,
 };
 
-use indicatif::ProgressState;
-use jiff::Zoned;
-use owo_colors::{OwoColorize, Stream};
 use parking_lot::{Mutex, MutexGuard};
 use rand::{RngExt, rng};
 use snafu::ResultExt;
 use tokio::fs::{create_dir_all, remove_dir_all};
-use tracing::{
-    Event, Level, Subscriber,
-    field::{Field, Visit},
-    level_filters::LevelFilter,
-};
-use tracing_indicatif::IndicatifLayer;
-use tracing_indicatif::style::ProgressStyle;
-use tracing_subscriber::{
-    Layer,
-    field::RecordFields,
-    filter::Targets,
-    fmt::{FmtContext, FormatEvent, FormatFields, FormattedFields, format::Writer},
-    layer::SubscriberExt,
-    registry::LookupSpan,
-    util::SubscriberInitExt,
-};
+use tracing::level_filters::LevelFilter;
+use tracing_appender::non_blocking::WorkerGuard;
+use tracing_subscriber::{Layer, filter::Targets, layer::SubscriberExt, util::SubscriberInitExt};
 
 pub use super::Log;
 use super::{ContextResult as Result, error};
@@ -100,13 +139,10 @@ impl LogManager {
 struct Inner {
     path: PathBuf,
     lock: Mutex<()>,
-}
-
-/// Formats the elapsed time as `<seconds>.<tenths>s` for progress bar display.
-pub fn elapsed_subsec(state: &ProgressState, writer: &mut dyn std::fmt::Write) {
-    let seconds = state.elapsed().as_secs();
-    let sub_seconds = (state.elapsed().as_millis() % 1000) / 100;
-    let _ = writer.write_str(&format!("{}.{}s", seconds, sub_seconds));
+    /// Keeps the non-blocking tracing-appender worker alive for the
+    /// lifetime of the [`LogManager`]. Dropping it flushes any pending
+    /// log lines.
+    _appender_guard: Option<WorkerGuard>,
 }
 
 /// Demo instrumented task that simulates a sub-unit of work with random delay.
@@ -145,38 +181,16 @@ impl Inner {
             remove_dir_all(&logdir).await.context(error::IoSnafu)?;
         }
         create_dir_all(&logdir).await.context(error::IoSnafu)?;
-        let indicatif_layer = IndicatifLayer::new()
-            .with_progress_style(
-            ProgressStyle::with_template(
-                "[{elapsed_precise}] {span_child_prefix} {cmd} {span_fields} {span_name} {msg} {spinner:.green}",
-            )
-            .unwrap()
-            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", "✔"])
-            .with_key(
-                "cmd",
-                |state: &indicatif::ProgressState, writer: &mut dyn std::fmt::Write| {
-                    let elapsed = state.elapsed();
-
-                    if elapsed > Duration::from_secs(15 * 60) {
-                        // Red
-                        let _ = write!(writer, "{}", "RUN  ".if_supports_color(Stream::Stderr, |text| text.bold().bright_red().to_string()));
-                    } else if elapsed > Duration::from_secs(5 * 60) {
-                        // Yellow
-                        let _ = write!(writer, "{}", "RUN  ".if_supports_color(Stream::Stderr, |text| text.bold().bright_yellow().to_string()));
-                    } else {
-                        let _ = write!(writer, "{}", "RUN  ".if_supports_color(Stream::Stderr, |text| text.bold().bright_blue().to_string()));
-                    }
-                },
-            )
-            .with_key(
-                "color_end",
-                |state: &indicatif::ProgressState, writer: &mut dyn std::fmt::Write| {
-                    if state.elapsed() > Duration::from_secs(4) {
-                        let _ =write!(writer, "\x1b[0m");
-                    }
-                },
-            ),
-        ).with_span_child_prefix_symbol("↳ ").with_span_child_prefix_indent("  ").with_max_progress_bars(100, None).with_span_field_formatter(TaskFormatter);
+        // Build a non-blocking writer that appends JSON Lines to
+        // <logdir>/edo.jsonl. The `WorkerGuard` is kept inside `Inner` so
+        // the writer thread stays alive for the rest of the session.
+        let log_file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(logdir.join("edo.jsonl"))
+            .context(error::IoSnafu)?;
+        let (file_writer, appender_guard) = tracing_appender::non_blocking(log_file);
 
         let level = match verbosity {
             LogVerbosity::Trace => LevelFilter::TRACE,
@@ -204,20 +218,26 @@ impl Inner {
                 },
             );
         }
+        // The fmt layer writes JSON Lines to <logdir>/edo.jsonl. The
+        // build-event console (see `crate::console`) owns stderr —
+        // tracing never touches the terminal directly. One JSON object
+        // per line; spans + structured fields are preserved so the file
+        // is machine-readable for postmortem analysis.
         tracing_subscriber::registry()
             .with(
                 tracing_subscriber::fmt::layer()
-                    .event_format(TaskFormatter)
-                    .fmt_fields(TaskFormatter)
-                    .with_writer(indicatif_layer.get_stdout_writer())
+                    .json()
+                    .with_current_span(true)
+                    .with_span_list(true)
+                    .with_writer(file_writer)
                     .with_filter(filter.clone()),
             )
-            .with(indicatif_layer.with_filter(filter.clone()))
             .try_init()
             .context(error::LogSnafu)?;
         Ok(Self {
             path: logdir.to_path_buf(),
             lock: Mutex::new(()),
+            _appender_guard: Some(appender_guard),
         })
     }
 
@@ -235,140 +255,6 @@ impl Inner {
 
     pub fn acquire(&self) -> MutexGuard<'_, ()> {
         self.lock.lock()
-    }
-}
-
-#[derive(Default, Clone)]
-struct TaskFormatter;
-
-impl<S, N> FormatEvent<S, N> for TaskFormatter
-where
-    S: Subscriber + for<'a> LookupSpan<'a>,
-    N: for<'a> FormatFields<'a> + 'static,
-{
-    fn format_event(
-        &self,
-        ctx: &FmtContext<'_, S, N>,
-        mut writer: Writer<'_>,
-        event: &Event<'_>,
-    ) -> std::fmt::Result {
-        let meta = event.metadata();
-        let level = *meta.level();
-        let mut depth = 0;
-
-        // Compute the span depth
-        if let Some(scope) = ctx.lookup_current() {
-            for _ in scope.scope() {
-                depth += 1;
-            }
-        }
-
-        // Create an indentation string based on depth
-        let indent = "  ".repeat(depth);
-
-        // Format the timestamp
-        let timestamp = Zoned::now().strftime("%H:%M:%S").to_string();
-
-        // Apply indentation after timestamp
-        write!(
-            writer,
-            "[{}] {}{} {} ",
-            timestamp,
-            indent,
-            if indent.is_empty() { "" } else { "↳ " },
-            match level {
-                Level::ERROR => "ERROR"
-                    .if_supports_color(Stream::Stdout, |text| text.bold().red().to_string())
-                    .to_string(),
-                Level::WARN => "WARN "
-                    .if_supports_color(Stream::Stdout, |text| text.bold().yellow().to_string())
-                    .to_string(),
-                Level::INFO => "INFO "
-                    .if_supports_color(Stream::Stdout, |text| text.bold().green().to_string())
-                    .to_string(),
-                Level::DEBUG => "DEBUG"
-                    .if_supports_color(Stream::Stdout, |text| text.bold().blue().to_string())
-                    .to_string(),
-                Level::TRACE => "TRACE"
-                    .if_supports_color(Stream::Stdout, |text| text.bold().cyan().to_string())
-                    .to_string(),
-            }
-        )?;
-
-        // Now we print out our fields
-        let span = event
-            .parent()
-            .and_then(|id| ctx.span(id))
-            .or_else(|| ctx.lookup_current());
-        let scope = span.into_iter().flat_map(|span| span.scope());
-        for span in scope {
-            let ext = span.extensions();
-            let fields = ext.get::<FormattedFields<N>>().unwrap();
-            write!(writer, "{}", fields)?;
-        }
-        ctx.format_fields(writer.by_ref(), event)?;
-        writeln!(writer)?;
-
-        Ok(())
-    }
-}
-
-impl<'a> FormatFields<'a> for TaskFormatter {
-    fn format_fields<R: RecordFields>(
-        &self,
-        mut writer: Writer<'a>,
-        fields: R,
-    ) -> std::fmt::Result {
-        let mut task_visitor = TaskVisitor {
-            writer: writer.by_ref(),
-        };
-        fields.record(&mut task_visitor);
-        Ok(())
-    }
-}
-
-struct TaskVisitor<'a> {
-    writer: Writer<'a>,
-}
-
-impl Visit for TaskVisitor<'_> {
-    fn record_str(&mut self, field: &Field, value: &str) {
-        if field.name() == "addr" {
-            let _ = self.writer.write_fmt(format_args!(
-                "{} → ",
-                value.if_supports_color(Stream::Stdout, |text| text.bold().to_string())
-            ));
-        } else if field.name() != "message" {
-            let _ = self.writer.write_fmt(format_args!(
-                " {}={} ",
-                field
-                    .name()
-                    .if_supports_color(Stream::Stdout, |text| text.bold().to_string()),
-                value
-            ));
-        } else {
-            let _ = self.writer.write_str(value);
-        }
-    }
-
-    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-        if field.name() == "addr" {
-            let _ = self.writer.write_fmt(format_args!(
-                "{} →",
-                format!("{:?}", value)
-                    .if_supports_color(Stream::Stdout, |text| text.bold().to_string())
-            ));
-        } else if field.name() != "message" {
-            let _ = self.writer.write_fmt(format_args!(
-                " {} = {:?} ",
-                field
-                    .name()
-                    .if_supports_color(Stream::Stdout, |text| text.bold().to_string()),
-                value
-            ));
-        } else {
-            let _ = self.writer.write_fmt(format_args!("{:?}", value));
-        }
     }
 }
 

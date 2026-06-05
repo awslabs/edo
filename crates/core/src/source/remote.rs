@@ -39,14 +39,22 @@ impl SourceImpl for RemoteSource {
             .name(self.url.path().to_string())
             .digest(self.digest.clone())
             .build();
-        trace!(component = "source", type = "remote", "calculated id to be {id}");
+        trace!(subsystem = "source", component = "remote", id = %id, "calculated id");
         Ok(id)
     }
 
     async fn fetch(&self, log: &Log, storage: &Storage) -> SourceResult<Artifact> {
         let id = self.get_unique_id().await?;
         let id_s = id.to_string();
-        trace!(component = "source", type = "remote", "fetching remote file from {}", self.url);
+        info!(
+            subsystem = "source",
+            component = "remote",
+            op = "fetch",
+            id = %id,
+            url = %self.url,
+            "fetching {}",
+            self.url
+        );
         let url = self.url.clone();
         async move {
             record!(log, "fetch", "fetching artifact from {url}");
@@ -119,9 +127,11 @@ impl SourceImpl for RemoteSource {
             Ok(artifact.clone())
         }
         .instrument(info_span!(
-            "fetching",
-            id = id_s,
-            url = self.url.clone().to_string(),
+            "source-fetch",
+            subsystem = "source",
+            component = "remote",
+            id = %id_s,
+            url = %self.url
         ))
         .await
     }

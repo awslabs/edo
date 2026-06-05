@@ -154,6 +154,16 @@ impl Inner {
     pub async fn run(&self, ctx: &Context, addr: &Addr) -> Result<()> {
         let mut graph = Graph::new(self.workers);
         graph.add(ctx, addr).await?;
+
+        // Emit BuildStarted *between* `add` and `fetch` so it sequences
+        // ahead of every NodeQueued / NodeCacheHit event (those fire
+        // inside `fetch`). Total is the reachable subgraph size, which
+        // is only known after `add` completes.
+        ctx.emit(crate::console::ConsoleEvent::BuildStarted {
+            root: addr.clone(),
+            total: graph.subgraph_size(addr),
+        });
+
         graph.fetch(ctx).await?;
         let graph_ref = Arc::new(graph);
         graph_ref.run(&self.path, ctx, addr).await?;

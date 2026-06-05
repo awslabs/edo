@@ -27,6 +27,8 @@ fn run_bad_cwd_has_no_edo_toml() {
         .env_remove("RUST_LOG")
         .arg("--storage")
         .arg(&storage)
+        .arg("--console-mode=none")
+        .arg("--event-log=none")
         .arg("run")
         .arg("//anything")
         .assert()

@@ -17,7 +17,6 @@ edo               = { path = "../edo" }
 futures           = { workspace = true }
 handlebars        = { workspace = true }
 indexmap          = { workspace = true }
-indicatif         = { workspace = true }
 merkle_hash       = { workspace = true }
 names             = { workspace = true }
 ocilot            = { workspace = true }
@@ -30,7 +29,6 @@ tempfile          = { workspace = true }
 tokio             = { workspace = true }
 tokio-util        = { workspace = true }
 tracing           = { workspace = true }
-tracing-indicatif = { workspace = true }
 url               = { workspace = true }
 uuid              = { workspace = true }
 which             = { workspace = true }

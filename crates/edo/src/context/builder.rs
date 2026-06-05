@@ -69,7 +69,7 @@ impl Project {
             let entry = entry.context(error::IoSnafu)?;
             let path = entry.path();
             if path.is_file() && path.file_name().and_then(|x| x.to_str()) == Some("edo.toml") {
-                debug!(component = "project", "loading project file {path:?}");
+                debug!(subsystem = "context", component = "project", op = "load", path = ?path, "loading project file");
                 let toml_text = std::fs::read_to_string(&path).context(error::IoSnafu)?;
                 let mut toml_schema: Schema =
                     toml::from_str(&toml_text).context(error::DeserializeSnafu)?;
@@ -92,18 +92,26 @@ impl Project {
         let digest = self.calculate_digest()?;
         ctx.add_config(self.schema.get_config());
 
+        // Track caches registered (for the `ProjectLoaded` provenance event)
+        // and whether the lockfile was reused.
+        let mut cache_count = 0usize;
+        let mut locked_reused = false;
+
         // Resolve all storage backends.
         for (name, element) in self.schema.get_source_caches() {
             let addr = Addr::parse(&format!("//edo-source-cache/{name}"))?;
             ctx.add_cache(&addr, element).await?;
+            cache_count += 1;
         }
         if let Some(element) = self.schema.get_build_cache() {
             ctx.add_cache(&Addr::parse("//edo-build-cache")?, element)
                 .await?;
+            cache_count += 1;
         }
         if let Some(element) = self.schema.get_output_cache() {
             ctx.add_cache(&Addr::parse("//edo-output-cache")?, element)
                 .await?;
+            cache_count += 1;
         }
 
         // Check for an existing lockfile.
@@ -114,7 +122,14 @@ impl Project {
             // If digests match, reuse the existing resolution rather than
             // re-running the resolver.
             if lock.digest() == digest {
-                info!(target: "project", "no changes detected in project, reusing lock resolution file");
+                locked_reused = true;
+                info!(
+                    subsystem = "context",
+                    component = "project",
+                    op = "lock-reuse",
+                    digest = %digest,
+                    "no changes detected in project, reusing lock resolution file"
+                );
                 // Collect first to release the borrow on `self.schema`
                 // before mutating it via `add_source`.
                 let pending: Vec<_> = self.schema.requires().keys().cloned().collect();
@@ -137,9 +152,11 @@ impl Project {
                 let vendor = ctx.add_vendor(element).await?;
                 vendors.insert(addr.to_string(), vendor.clone());
                 debug!(
-                    section = "context",
+                    subsystem = "context",
                     component = "project",
-                    "register vendor {addr}"
+                    op = "register",
+                    addr = %addr,
+                    "register vendor"
                 );
                 resolver.add_vendor(&addr.to_string(), vendor.clone());
             }
@@ -148,9 +165,10 @@ impl Project {
             let mut need_resolution = Vec::new();
             for (addr, requirement) in self.schema.requires() {
                 debug!(
-                    section = "context",
+                    subsystem = "context",
                     component = "project",
-                    "{addr} needs resolution"
+                    addr = %addr,
+                    "needs resolution"
                 );
                 let dep = Dependency::new(addr, requirement, ctx).await?;
                 resolver.build_db(dep.name.as_str()).await?;
@@ -165,9 +183,14 @@ impl Project {
             let mut lock = Lock::new(digest);
 
             for (addr, (vendor_name, name, version)) in resolved.iter() {
-                debug!(
-                    section = "context",
+                info!(
+                    subsystem = "context",
                     component = "project",
+                    op = "resolve",
+                    addr = %addr,
+                    name = %name,
+                    version = %version,
+                    vendor = %vendor_name,
                     "resolved {addr} to {name}@{version} from vendor {vendor_name}"
                 );
                 let vendor = vendors
@@ -191,21 +214,39 @@ impl Project {
 
         for (addr, element) in self.schema.environments() {
             debug!(
-                section = "context",
+                subsystem = "context",
                 component = "project",
-                "adding environment farm {addr}"
+                op = "register",
+                addr = %addr,
+                "adding environment farm"
             );
             ctx.add_farm(element).await?;
         }
 
         for (addr, element) in self.schema.transforms() {
             debug!(
-                section = "context",
+                subsystem = "context",
                 component = "project",
-                "adding transform {addr}"
+                op = "register",
+                addr = %addr,
+                "adding transform"
             );
             ctx.add_transform(element).await?;
         }
+
+        // Provenance: emit a typed summary of what got loaded so the canvas
+        // header, JSONL log, and simple sink all have a single record of
+        // project shape. Sequenced after registration so counts reflect
+        // post-resolution state.
+        ctx.emit(crate::console::ConsoleEvent::ProjectLoaded {
+            root: self.project_path.display().to_string(),
+            transforms: self.schema.transforms().len(),
+            sources: self.schema.sources().len(),
+            vendors: self.schema.vendors().len(),
+            farms: self.schema.environments().len(),
+            caches: cache_count,
+            locked: locked_reused,
+        });
 
         Ok(())
     }

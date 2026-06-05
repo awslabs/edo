@@ -70,7 +70,12 @@ impl TransformImpl for ComposeTransform {
             .digest(digest)
             .maybe_arch(self.arch.clone())
             .build();
-        trace!(component = "transform", type = "compose", "id is calculated to be {id}");
+        trace!(
+            subsystem = "transform",
+            component = "compose",
+            id = %id,
+            "calculated id"
+        );
         Ok(id.clone())
     }
 
@@ -93,7 +98,14 @@ impl TransformImpl for ComposeTransform {
                 .get(&dep)
                 .context(error::NotFoundSnafu { addr: dep.clone() })?;
             let id = t.get_unique_id(ctx).await?;
-            trace!(component = "transform", type = "compose", "staging dependencies {dep} with id {id} into install-root");
+                        trace!(
+                subsystem = "transform",
+                component = "compose",
+                op = "stage",
+                addr = %dep,
+                id = %id,
+                "staging dependency into install-root"
+            );
             env.stage(
                 ctx,
                 ArtifactStageOptions::builder()

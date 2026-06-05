@@ -26,7 +26,12 @@ impl FarmImpl for LocalFarm {
     }
 
     async fn create(&self, _log: &Log, path: &Path) -> EnvResult<Environment> {
-        trace!(component = "environment", type = "local", "creating new local environment at path: {}", path.display());
+        trace!(
+            subsystem = "environment",
+            component = "local",
+            path = %path.display(),
+            "creating new local environment"
+        );
         Ok(Environment::new(LocalEnv {
             path: path.to_path_buf(),
             env: DashMap::new(),
@@ -70,7 +75,14 @@ impl EnvironmentImpl for LocalEnv {
     }
 
     async fn set_env(&self, key: &str, value: &str) -> EnvResult<()> {
-        trace!(component = "environment", type = "local", "setting environment variable {key} to '{value}'");
+        trace!(
+            subsystem = "environment",
+            component = "local",
+            op = "set-env",
+            key = %key,
+            value = %value,
+            "setting environment variable"
+        );
         self.env.insert(key.to_string(), value.to_string());
         Ok(())
     }
@@ -82,7 +94,13 @@ impl EnvironmentImpl for LocalEnv {
     async fn setup(&self, log: &Log, _storage: &Storage) -> EnvResult<()> {
         // make sure the directory we want exists
         if !self.path.exists() {
-            trace!(component = "environment", type = "local", "creating environment directory at {}", self.path.display());
+            trace!(
+                subsystem = "environment",
+                component = "local",
+                op = "create-dir",
+                path = %self.path.display(),
+                "creating environment directory"
+            );
             record!(
                 log,
                 "create_dir",
@@ -110,7 +128,13 @@ impl EnvironmentImpl for LocalEnv {
     async fn clean(&self, log: &Log) -> EnvResult<()> {
         // Delete the directory
         if self.path.exists() {
-            trace!(component = "environment", type = "local", "removing environment directory at {}", self.path.display());
+            trace!(
+                subsystem = "environment",
+                component = "local",
+                op = "remove-dir",
+                path = %self.path.display(),
+                "removing environment directory"
+            );
             record!(
                 log,
                 "remove_dir",
@@ -126,7 +150,13 @@ impl EnvironmentImpl for LocalEnv {
 
     async fn create_dir(&self, path: &Path) -> EnvResult<()> {
         let path = self.path.join(path);
-        trace!(component = "environment", type = "local", "creating directory at {}", path.display());
+        trace!(
+            subsystem = "environment",
+            component = "local",
+            op = "create-dir",
+            path = %path.display(),
+            "creating directory"
+        );
         create_dir_all(path)
             .await
             .context(error::CreateDirectorySnafu)?;
@@ -142,7 +172,13 @@ impl EnvironmentImpl for LocalEnv {
                     .context(error::CreateDirectorySnafu)?;
             }
         }
-        trace!(component = "environment", type = "local", "writing contents to file at {}", file_path.display());
+        trace!(
+            subsystem = "environment",
+            component = "local",
+            op = "write-file",
+            path = %file_path.display(),
+            "writing contents to file"
+        );
         tokio::fs::write(&file_path, buffer)
             .await
             .context(error::CreateFileSnafu)?;
@@ -158,7 +194,13 @@ impl EnvironmentImpl for LocalEnv {
                     .context(error::CreateDirectorySnafu)?;
             }
         }
-        trace!(component = "environment", type = "local", "writing contents to file at {}", file_path.display());
+        trace!(
+            subsystem = "environment",
+            component = "local",
+            op = "write-file",
+            path = %file_path.display(),
+            "writing contents to file"
+        );
         let mut file = File::create(&file_path)
             .await
             .context(error::CreateFileSnafu)?;
@@ -182,11 +224,23 @@ impl EnvironmentImpl for LocalEnv {
         }
         match media_type {
             MediaType::Zip(..) => {
-                trace!(component = "environment", type = "local", "unpacking zip into {}", file_path.display());
+                trace!(
+                    subsystem = "environment",
+                    component = "local",
+                    op = "unpack-zip",
+                    path = %file_path.display(),
+                    "unpacking zip"
+                );
                 super::extract_zip_stream(&file_path, reader).await?;
             }
             _ => {
-                trace!(component = "environment", type = "local", "unpacking archive into {}", file_path.display());
+                trace!(
+                    subsystem = "environment",
+                    component = "local",
+                    op = "unpack",
+                    path = %file_path.display(),
+                    "unpacking archive"
+                );
                 let mut archive = tokio_tar::ArchiveBuilder::new(reader)
                     .set_preserve_permissions(true)
                     .build();
@@ -221,13 +275,25 @@ impl EnvironmentImpl for LocalEnv {
             }
         );
         if file_path.is_file() {
-            trace!(component = "environment", type = "local", "reading file at {}", file_path.display());
+            trace!(
+                subsystem = "environment",
+                component = "local",
+                op = "read-file",
+                path = %file_path.display(),
+                "reading file"
+            );
             let mut file = File::open(&file_path).await.context(error::ReadFileSnafu)?;
             tokio::io::copy(&mut file, &mut writer)
                 .await
                 .context(error::ReadFileSnafu)?;
         } else {
-            trace!(component = "environment", type = "local", "archiving directory at {}", file_path.display());
+            trace!(
+                subsystem = "environment",
+                component = "local",
+                op = "archive",
+                path = %file_path.display(),
+                "archiving directory"
+            );
             let mut archive = tokio_tar::Builder::new(writer);
             archive
                 .append_dir_all(".", &file_path)
@@ -240,17 +306,23 @@ impl EnvironmentImpl for LocalEnv {
 
     async fn execute(&self, log: &Log, id: &Id, path: &Path, cmd: &str) -> EnvResult<bool> {
         let work_dir = self.path.join(path);
-        trace!(component = "environment", type = "local", "running command in {}", work_dir.display());
+        trace!(
+            subsystem = "environment",
+            component = "local",
+            op = "exec",
+            path = %work_dir.display(),
+            "running command"
+        );
         async move {
             record!(log, "exec", "sh -c {cmd}");
             cmd_noinput(&work_dir, log, "sh", ["-c", cmd], &from_dash(&self.env))
                 .context(error::FailedSnafu)
         }
         .instrument(info_span!(
-            target: "local",
-            "execute in environment",
-            id = id.to_string(),
-            log = log.log_name()
+            "local-exec",
+            subsystem = "environment",
+            component = "local",
+            id = %id
         ))
         .await
         .map_err(|e| e.into())

@@ -50,11 +50,10 @@ impl LocalBackend {
     async fn new_(path: impl AsRef<Path>) -> StorageResult<Self> {
         let path = path.as_ref();
         trace!(
-            section = "storage",
-            component = "backend",
-            variant = "local",
-            "creating or loading local storage at {}",
-            path.display()
+            subsystem = "storage",
+            component = "local",
+            path = %path.display(),
+            "creating or loading local storage"
         );
         if !path.exists() {
             tokio::fs::create_dir_all(path)
@@ -187,11 +186,11 @@ impl BackendImpl for LocalBackend {
 
     async fn prune(&self, id: &Id) -> StorageResult<()> {
         trace!(
-            section = "storage",
-            component = "backend",
-            variant = "local",
-            "prunning all artifacts that do not match prefix: {}",
-            id.prefix()
+            subsystem = "storage",
+            component = "local",
+            op = "prune",
+            prefix = %id.prefix(),
+            "pruning all artifacts that do not match prefix"
         );
         // To prune historical artifacts we want to load our catalog for the id prefix
         let catalog = self.load()?;
@@ -200,11 +199,12 @@ impl BackendImpl for LocalBackend {
             if entry == *id {
                 continue;
             }
-            info!(
-                section = "storage",
-                component = "backend",
-                variant = "local",
-                "prunning artifact {entry}"
+            debug!(
+                subsystem = "storage",
+                component = "local",
+                op = "prune",
+                id = %entry,
+                "pruning artifact"
             );
             self.del(&entry).await?;
         }

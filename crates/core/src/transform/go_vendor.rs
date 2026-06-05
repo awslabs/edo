@@ -112,7 +112,7 @@ impl TransformImpl for GoVendorTransform {
             .name(self.addr.to_id())
             .digest(digest.to_hex().to_lowercase())
             .build();
-        trace!(component = "transform", type = "go-vendor", "id is calculated to be {id}");
+                trace!(subsystem = "transform", component = "go-vendor", id = %id, "calculated id");
         Ok(id.clone())
     }
 
@@ -188,7 +188,13 @@ impl TransformImpl for GoVendorTransform {
             for (src_path, target_path) in paths.iter() {
                 if src_path.try_exists("go.mod").await? {
                     // Found a go module to vendor
-                    trace!(component = "transform", type = "go-vendor", "vendoring go sources for module at {:?}", src_path.path());
+                                        trace!(
+                        subsystem = "transform",
+                        component = "go-vendor",
+                        op = "vendor",
+                        path = ?src_path.path(),
+                        "vendoring go sources"
+                    );
                     src_path.command("go-vendor", "go", &["mod", "vendor"]).await?;
                     // Copy the resulting vendor directory into target_path
                     let target_vendor = target_path.entry("vendor").await;

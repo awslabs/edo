@@ -82,16 +82,20 @@ impl Inner {
     // Add a source cache
     fn add_source_cache(&mut self, name: &str, cache: &Backend) {
         debug!(
-            component = "storage",
-            "registering source cache with name {name}"
+            subsystem = "storage",
+            op = "register",
+            name = %name,
+            "registering source cache"
         );
         self.source.insert(name.to_string(), cache.clone());
     }
 
     fn add_source_cache_front(&mut self, name: &str, cache: &Backend) {
         debug!(
-            component = "storage",
-            "registering source cache at front of priority list with name {name}"
+            subsystem = "storage",
+            op = "register",
+            name = %name,
+            "registering source cache at front of priority list"
         );
         self.source
             .insert_before(0, name.to_string(), cache.clone());
@@ -99,43 +103,45 @@ impl Inner {
 
     fn remove_source_cache(&mut self, name: &str) -> Option<Backend> {
         debug!(
-            component = "storage",
-            "deregistering source cache with name {name}"
+            subsystem = "storage",
+            op = "deregister",
+            name = %name,
+            "deregistering source cache"
         );
         self.source.shift_remove(name)
     }
 
     // Set a build cache
     fn set_build_cache(&mut self, cache: &Backend) {
-        debug!(component = "storage", "registering a build cache");
+        debug!(subsystem = "storage", op = "register", "registering a build cache");
         self.build = Some(cache.clone());
     }
 
     // Set the output cache
     fn set_output_cache(&mut self, cache: &Backend) {
-        debug!(component = "storage", "registering an output cache");
+        debug!(subsystem = "storage", op = "register", "registering an output cache");
         self.output = Some(cache.clone());
     }
 
     // Open an artifact in the local cache
     async fn safe_open(&self, id: &Id) -> StorageResult<Artifact> {
-        debug!(component = "storage", "opening local artifact ({id})");
+        debug!(subsystem = "storage", id = %id, "opening local artifact");
         self.local.open(id).await
     }
 
     // Open a layer in the local cache
     async fn safe_read(&self, layer: &Layer) -> StorageResult<Reader> {
         debug!(
-            component = "storage",
-            "opening local layer ({})",
-            layer.digest().digest()
+            subsystem = "storage",
+            digest = %layer.digest().digest(),
+            "opening local layer"
         );
         self.local.read(layer).await
     }
 
     // Create an artifact in the local cache
     async fn safe_start_layer(&self) -> StorageResult<Writer> {
-        debug!(component = "storage", "creating a new local layer");
+        debug!(subsystem = "storage", "creating a new local layer");
         self.local.start_layer().await
     }
 
@@ -151,9 +157,9 @@ impl Inner {
     // Save the artifact in the local cache
     async fn safe_save(&self, artifact: &Artifact) -> StorageResult<()> {
         debug!(
-            component = "storage",
-            "saving artifact ({}) to local cache",
-            artifact.config().id()
+            subsystem = "storage",
+            id = %artifact.config().id(),
+            "saving artifact to local cache"
         );
         self.local.save(artifact).await
     }
@@ -178,7 +184,7 @@ impl Inner {
                         .maybe_path_hint(layer.path_hint().clone())
                         .build()).await?;
                 Ok(())
-            }.instrument(info_span!(target: "storage", "downloading", id = artifact.config().id().to_string(), digest = digest))));
+            }.instrument(info_span!("cache-download", subsystem = "storage", op = "download", id = %artifact.config().id(), digest = %digest))));
         }
         wait(handles).await?;
         self.local.save(artifact).await?;
@@ -205,7 +211,7 @@ impl Inner {
                     .build()
                 ).await?;
                 Ok(())
-            }.instrument(info_span!(target: "storage", "uploading", id = artifact.config().id().to_string(), digest = digest))));
+            }.instrument(info_span!("cache-upload", subsystem = "storage", op = "upload", id = %artifact.config().id(), digest = %digest))));
         }
         wait(handles).await?;
         backend.save(artifact).await?;
@@ -216,13 +222,17 @@ impl Inner {
     // otherwise open it
     async fn fetch_source(&self, id: &Id) -> StorageResult<Option<Artifact>> {
         debug!(
-            component = "storage",
-            "fetching artifact {id} from source caches"
+            subsystem = "storage",
+            op = "fetch",
+            id = %id,
+            "fetching artifact from source caches"
         );
         if self.local.has(id).await? {
             trace!(
-                component = "storage",
-                "loading from the local cache as {id} exists already"
+                subsystem = "storage",
+                op = "cache-hit",
+                id = %id,
+                "loading from the local cache as artifact exists already"
             );
             return Ok(Some(self.local.open(id).await?));
         }
@@ -249,14 +259,19 @@ impl Inner {
     // asked to
     async fn find_build(&self, id: &Id, sync: bool) -> StorageResult<Option<Artifact>> {
         debug!(
-            component = "storage",
-            "fetching artifact {id} from build cache"
+            subsystem = "storage",
+            op = "fetch",
+            target = "build-cache",
+            id = %id,
+            "fetching artifact from build cache"
         );
         // Check if we already have this artifact locally
         if self.local.has(id).await? {
             trace!(
-                component = "storage",
-                "loading from the local cache as {id} exists already"
+                subsystem = "storage",
+                op = "cache-hit",
+                id = %id,
+                "loading from the local cache as artifact exists already"
             );
             // No need to sync as its already in the local cache
             return Ok(Some(self.local.open(id).await?));
@@ -281,7 +296,13 @@ impl Inner {
     async fn upload_build(&self, id: &Id) -> StorageResult<()> {
         // This only occurs if a build cache is registered
         if let Some(build) = self.build.as_ref() {
-            debug!(component = "storage", "build cache detected uploading {id}");
+            info!(
+                subsystem = "storage",
+                op = "upload",
+                target = "build-cache",
+                id = %id,
+                "build cache detected, uploading"
+            );
             let artifact = self.local.open(id).await?;
             self.upload(&artifact, build).await?;
         }
@@ -293,7 +314,13 @@ impl Inner {
     async fn upload_output(&self, id: &Id) -> StorageResult<()> {
         // This only occurs if an output cache is registered
         if let Some(output) = self.output.as_ref() {
-            debug!(component = "output cache detected, uploading {id}");
+            info!(
+                subsystem = "storage",
+                op = "upload",
+                target = "output-cache",
+                id = %id,
+                "output cache detected, uploading"
+            );
             let artifact = self.local.open(id).await?;
             self.upload(&artifact, output).await?;
         }

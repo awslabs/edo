@@ -25,7 +25,6 @@ use which::which;
 pub struct ContainerConfig {
     runtime: String,
     cli: Option<PathBuf>,
-    #[serde(default)]
     network: bool,
 }
 
@@ -34,7 +33,6 @@ pub struct ContainerConfig {
 #[serde(deny_unknown_fields)]
 struct ContainerOptions {
     user: String,
-    #[serde(flatten)]
     config: Option<ContainerConfig>,
 }
 
@@ -69,7 +67,14 @@ impl FromElement for ContainerFarm {
             } else {
                 return error::NoRuntimeSnafu {}.fail().map_err(|e| e.into());
             };
-            info!("found container runtime at: {cli:?}");
+            info!(
+                subsystem = "environment",
+                component = "container",
+                op = "runtime-detect",
+                cli = ?cli,
+                runtime = %runtime,
+                "found container runtime"
+            );
             ContainerConfig {
                 runtime: runtime.to_string(),
                 cli: Some(cli),
@@ -100,7 +105,11 @@ impl FromElement for ContainerFarm {
 impl FarmImpl for ContainerFarm {
     async fn setup(&self, log: &Log, storage: &Storage) -> EnvResult<()> {
         // Fetch our source image
-        trace!(component = "environment", type = "container", "fetching image for environments");
+        trace!(
+            subsystem = "environment",
+            component = "container",
+            "fetching image for environments"
+        );
         let artifact = self
             .source
             .cache(log, storage)
@@ -117,7 +126,11 @@ impl FarmImpl for ContainerFarm {
                 .replace('/', "-")
         );
         // First we want to check if the image already exists, if so skip the next step
-        trace!(component = "environment", type = "container", "check if the image is already loaded into the container runtime");
+        trace!(
+            subsystem = "environment",
+            component = "container",
+            "check if the image is already loaded into the container runtime"
+        );
         let cli = self.config.cli.as_ref().unwrap();
         if cmd_nulled(
             ".",
@@ -127,7 +140,13 @@ impl FarmImpl for ContainerFarm {
         )
         .context(error::RuntimeSnafu)?
         {
-            info!(component = "environment", type = "container", "image already loaded into container engine, if this is incorrect please remove {name} first.");
+            debug!(
+                subsystem = "environment",
+                component = "container",
+                op = "image-load",
+                name = %name,
+                "image already loaded into container engine, if this is incorrect please remove {name} first."
+            );
             return Ok(());
         }
         // The image source stores an oci image as an oci archive in the first layer
@@ -141,6 +160,7 @@ impl FarmImpl for ContainerFarm {
             .context(error::IoSnafu)?;
         drop(archive);
 
+        let artifact_id = artifact.config().id().to_string();
         async move {
             // Now we can load the image into the runtime using docker load then tag it accordingly
             record!(log, "load_image", "{:?} load -i {path:?}", cli);
@@ -166,21 +186,32 @@ impl FarmImpl for ContainerFarm {
                 &HashMap::new(),
             )
             .context(error::RuntimeSnafu)?;
-            info!("image loaded into container runtime");
+            info!(
+                subsystem = "environment",
+                component = "container",
+                op = "image-load",
+                id = %artifact_id,
+                "image loaded into container runtime"
+            );
             remove_file(&path).await.context(error::IoSnafu)?;
             Ok(())
         }
         .instrument(info_span!(
-            target: "container",
-            "loading image into container runtime",
-            id = artifact.config().id().to_string(),
-            log = log.log_name()
+            "container-load-image",
+            subsystem = "environment",
+            component = "container",
+            id = %artifact.config().id()
         ))
         .await
     }
 
     async fn create(&self, _log: &Log, path: &Path) -> EnvResult<Environment> {
-        trace!(component = "environment", type = "container", "creating new container environment with workspace at {}", path.display());
+        trace!(
+            subsystem = "environment",
+            component = "container",
+            path = %path.display(),
+            "creating new container environment"
+        );
         // Generate a random name
         let mut generator = names::Generator::default();
         let name = generator.next().unwrap();
@@ -218,6 +249,20 @@ pub struct Container {
 unsafe impl Send for Container {}
 unsafe impl Sync for Container {}
 
+impl Container {
+    fn local_path(&self, path: &Path) -> PathBuf {
+        if self.user == "root"
+            && let Ok(stripped) = path.strip_prefix("/root")
+        {
+            stripped.to_path_buf()
+        } else if let Ok(stripped) = path.strip_prefix(format!("/home/{}", self.user)) {
+            stripped.to_path_buf()
+        } else {
+            path.to_path_buf()
+        }
+    }
+}
+
 #[async_trait]
 impl EnvironmentImpl for Container {
     async fn expand(&self, path: &Path) -> EnvResult<PathBuf> {
@@ -231,7 +276,14 @@ impl EnvironmentImpl for Container {
     }
 
     async fn set_env(&self, key: &str, value: &str) -> EnvResult<()> {
-        trace!(component = "environment", type = "container", "setting environment variable {key} to '{value}'");
+        trace!(
+            subsystem = "environment",
+            component = "container",
+            op = "set-env",
+            key = %key,
+            value = %value,
+            "setting environment variable"
+        );
         self.env.insert(key.to_string(), value.to_string());
         Ok(())
     }
@@ -243,7 +295,13 @@ impl EnvironmentImpl for Container {
     async fn setup(&self, log: &Log, _storage: &Storage) -> EnvResult<()> {
         // make the directory we want exists
         if !self.path.exists() {
-            trace!(component = "environment", type = "container", "creating workspace directory at {}", self.path.display());
+            trace!(
+                subsystem = "environment",
+                component = "container",
+                op = "create-dir",
+                path = %self.path.display(),
+                "creating workspace directory"
+            );
             record!(log, "create_dir", "{:?}", self.path);
             tokio::fs::create_dir_all(&self.path)
                 .await
@@ -306,7 +364,11 @@ impl EnvironmentImpl for Container {
             self.running.store(true, Ordering::SeqCst);
             Ok::<(), error::Error>(())
         }
-        .instrument(info_span!(target: "container", "spinning up container", log = log.log_name()))
+        .instrument(info_span!(
+            "container-up",
+            subsystem = "environment",
+            component = "container"
+        ))
         .await?;
         Ok(())
     }
@@ -344,8 +406,15 @@ impl EnvironmentImpl for Container {
     }
 
     async fn create_dir(&self, path: &Path) -> EnvResult<()> {
+        let path = self.local_path(&path);
         let path = self.path.join(path);
-        trace!(component = "environment", type = "container", "creating directory at {}", path.display());
+        trace!(
+            subsystem = "environment",
+            component = "container",
+            op = "create-dir",
+            path = %path.display(),
+            "creating directory"
+        );
         create_dir_all(path)
             .await
             .context(error::CreateDirectorySnafu)?;
@@ -353,7 +422,8 @@ impl EnvironmentImpl for Container {
     }
 
     async fn write_bytes(&self, path: &Path, buffer: &[u8]) -> EnvResult<()> {
-        let file_path = self.path.join(path);
+        let path = self.local_path(path);
+        let file_path = self.path.join(&path);
         if let Some(parent) = file_path.parent() {
             if !parent.exists() {
                 tokio::fs::create_dir_all(parent)
@@ -361,7 +431,13 @@ impl EnvironmentImpl for Container {
                     .context(error::CreateDirectorySnafu)?;
             }
         }
-        trace!(component = "environment", type = "container", "writing contents to file at {}", file_path.display());
+        trace!(
+            subsystem = "environment",
+            component = "container",
+            op = "write-file",
+            path = %file_path.display(),
+            "writing contents to file"
+        );
         let mut file = File::create(&file_path)
             .await
             .context(error::CreateFileSnafu)?;
@@ -373,7 +449,8 @@ impl EnvironmentImpl for Container {
     }
 
     async fn write_stream(&self, path: &Path, mut reader: Reader) -> EnvResult<()> {
-        let file_path = self.path.join(path);
+        let path = self.local_path(path);
+        let file_path = self.path.join(&path);
         if let Some(parent) = file_path.parent() {
             if !parent.exists() {
                 tokio::fs::create_dir_all(parent)
@@ -381,7 +458,13 @@ impl EnvironmentImpl for Container {
                     .context(error::CreateDirectorySnafu)?;
             }
         }
-        trace!(component = "environment", type = "container", "writing contents to file at {}", file_path.display());
+        trace!(
+            subsystem = "environment",
+            component = "container",
+            op = "write-file",
+            path = %file_path.display(),
+            "writing contents to file"
+        );
         let mut file = File::create(&file_path)
             .await
             .context(error::CreateFileSnafu)?;
@@ -397,7 +480,8 @@ impl EnvironmentImpl for Container {
         media_type: &MediaType,
         reader: Reader,
     ) -> EnvResult<()> {
-        let file_path = self.path.join(path);
+        let path = self.local_path(path);
+        let file_path = self.path.join(&path);
         if !file_path.exists() {
             tokio::fs::create_dir_all(&file_path)
                 .await
@@ -405,11 +489,23 @@ impl EnvironmentImpl for Container {
         }
         match media_type {
             MediaType::Zip(..) => {
-                trace!(component = "environment", type = "container", "unpacking zip into {}", file_path.display());
+                trace!(
+                    subsystem = "environment",
+                    component = "container",
+                    op = "unpack-zip",
+                    path = %file_path.display(),
+                    "unpacking zip"
+                );
                 super::extract_zip_stream(&file_path, reader).await?;
             }
             _ => {
-                trace!(component = "environment", type = "container", "unpacking archive into {}", file_path.display());
+                trace!(
+                    subsystem = "environment",
+                    component = "container",
+                    op = "unpack",
+                    path = %file_path.display(),
+                    "unpacking archive"
+                );
                 let mut archive = tokio_tar::ArchiveBuilder::new(reader)
                     .set_preserve_permissions(true)
                     .build();
@@ -423,7 +519,8 @@ impl EnvironmentImpl for Container {
     }
 
     async fn read_stream(&self, path: &Path, mut writer: Writer) -> EnvResult<()> {
-        let file_path = self.path.join(path);
+        let path = self.local_path(path);
+        let file_path = self.path.join(&path);
         ensure!(
             file_path.exists(),
             error::NotFoundSnafu {
@@ -431,13 +528,25 @@ impl EnvironmentImpl for Container {
             }
         );
         if file_path.is_file() {
-            trace!(component = "environment", type = "container", "reading file at {}", file_path.display());
+            trace!(
+                subsystem = "environment",
+                component = "container",
+                op = "read-file",
+                path = %file_path.display(),
+                "reading file"
+            );
             let mut file = File::open(&file_path).await.context(error::ReadFileSnafu)?;
             tokio::io::copy(&mut file, &mut writer)
                 .await
                 .context(error::ReadFileSnafu)?;
         } else {
-            trace!(component = "environment", type = "container", "archiving directory at {}", file_path.display());
+            trace!(
+                subsystem = "environment",
+                component = "container",
+                op = "archive",
+                path = %file_path.display(),
+                "archiving directory"
+            );
             let mut archive = tokio_tar::Builder::new(writer);
             archive
                 .append_dir_all(".", &file_path)
@@ -449,7 +558,8 @@ impl EnvironmentImpl for Container {
     }
 
     async fn read_bytes(&self, path: &Path) -> EnvResult<Vec<u8>> {
-        let file_path = self.path.join(path);
+        let path = self.local_path(path);
+        let file_path = self.path.join(&path);
         ensure!(
             file_path.exists(),
             error::NotFoundSnafu {
@@ -493,7 +603,13 @@ impl EnvironmentImpl for Container {
 
     async fn execute(&self, log: &Log, id: &Id, path: &Path, cmd: &str) -> EnvResult<bool> {
         let work_dir = Path::new("/root").join(path);
-        trace!(component = "environment", type = "container", "running command in {}", work_dir.display());
+        trace!(
+            subsystem = "environment",
+            component = "container",
+            op = "exec",
+            path = %work_dir.display(),
+            "running command"
+        );
         async move {
             let cli = self.config.cli.as_ref().unwrap();
             let mut args = vec![
@@ -526,10 +642,10 @@ impl EnvironmentImpl for Container {
                 .context(error::RuntimeSnafu)
         }
         .instrument(info_span!(
-            target: "container",
-            "executing in environment",
-            id = id.to_string(),
-            log = log.log_name()
+            "container-exec",
+            subsystem = "environment",
+            component = "container",
+            id = %id
         ))
         .await
         .map_err(|e| e.into())

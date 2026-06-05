@@ -48,7 +48,7 @@ impl SourceImpl for LocalSource {
             )
             .digest(digest)
             .build();
-        trace!(component = "source", type = "local", "calculated id to be {id}");
+        trace!(subsystem = "source", component = "local", id = %id, "calculated id");
         Ok(id)
     }
 
@@ -64,7 +64,13 @@ impl SourceImpl for LocalSource {
         let mut writer = storage.safe_start_layer().await?;
         // If the path is a file we do that
         let (media_type, path_hint) = if self.path.is_file() {
-            trace!(component = "source", type = "local", "reading file at {}", self.path.display());
+            trace!(
+                subsystem = "source",
+                component = "local",
+                op = "read",
+                path = %self.path.display(),
+                "reading file"
+            );
             let mut reader = File::open(&self.path).await.context(error::ReadFileSnafu)?;
             record!(log, "copy", "storing file from {:?}", self.path);
             tokio::io::copy(&mut reader, &mut writer)
@@ -88,7 +94,13 @@ impl SourceImpl for LocalSource {
             (media_type, path_hint)
         } else {
             // We want to archive it if its a directory
-            trace!(component = "source", type = "local", "archiving directory at {}", self.path.display());
+            trace!(
+                subsystem = "source",
+                component = "local",
+                op = "archive",
+                path = %self.path.display(),
+                "archiving directory"
+            );
             record!(
                 log,
                 "archive",

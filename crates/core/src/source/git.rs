@@ -34,17 +34,35 @@ impl FromElement for GitSource {
 impl SourceImpl for GitSource {
     async fn get_unique_id(&self) -> SourceResult<Id> {
         let id = Id::builder()
-            .name(format!("{}@{}", self.url, self.reference))
+            .name(format!(
+                "{}@{}-{:?}",
+                self.url,
+                self.reference,
+                self.out
+                    .as_ref()
+                    .and_then(|x| x.to_str())
+                    .unwrap_or_default()
+            ))
             .digest(base16::encode_lower(self.reference.as_bytes()))
             .build();
-        trace!(component = "source", type = "git", "calculated id to be {id}");
+        trace!(subsystem = "source", component = "git", id = %id, "calculated id");
         Ok(id)
     }
 
     async fn fetch(&self, log: &Log, storage: &Storage) -> SourceResult<Artifact> {
         let id = self.get_unique_id().await?;
         let id_s = id.to_string();
-        trace!(component = "source", type = "git", "cloning git repository: git clone -b {} {}", self.reference, self.url);
+        info!(
+            subsystem = "source",
+            component = "git",
+            op = "fetch",
+            id = %id,
+            url = %self.url,
+            reference = %self.reference,
+            "cloning {}@{}",
+            self.url,
+            self.reference
+        );
         record!(log, "clone", "git clone -b {} {}", self.reference, self.url);
         async move {
             let temp = tempdir().context(error::TempDirectorySnafu)?;
@@ -101,11 +119,13 @@ impl SourceImpl for GitSource {
             storage.safe_save(&artifact).await?;
             Ok(artifact.clone())
         }
-        .instrument(info_span!(
-            "fetching",
-            id = id_s,
-            log = log.log_name(),
-            component = "source"
+                .instrument(info_span!(
+            "source-fetch",
+            subsystem = "source",
+            component = "git",
+            id = %id_s,
+            url = %self.url,
+            reference = %self.reference
         ))
         .await
     }

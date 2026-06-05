@@ -9,7 +9,7 @@ pub struct List {}
 
 impl List {
     pub async fn run(&self, args: Args) -> Result<()> {
-        let ctx = super::create_context(&args, HashMap::default(), true).await?;
+        let ctx = super::create_context(&args, "<list>", HashMap::default(), true).await?;
         ctx.print_transforms();
         Ok(())
     }

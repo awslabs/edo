@@ -69,7 +69,7 @@ impl TransformImpl for ImportTransform {
             )
             .digest(digest)
             .build();
-        trace!(component = "transform", type = "import", "calculated id to be {id}");
+                trace!(subsystem = "transform", component = "import", id = %id, "calculated id");
         Ok(id)
     }
 
@@ -79,7 +79,13 @@ impl TransformImpl for ImportTransform {
 
     async fn prepare(&self, log: &Log, ctx: &Handle) -> TransformResult<()> {
         for (addr, source_list) in self.sources.iter() {
-            trace!(component = "transform", type = "import", "fetching source {addr}");
+                        trace!(
+                subsystem = "transform",
+                component = "import",
+                op = "fetch",
+                addr = %addr,
+                "fetching source"
+            );
             for source in source_list {
                 source.cache(log, ctx.storage()).await?;
             }
@@ -94,7 +100,13 @@ impl TransformImpl for ImportTransform {
 
         // Stage all the sources in the output directory
         for (addr, source_list) in self.sources.iter() {
-            trace!(component = "transform", type = "import", "staging source {addr}");
+                        trace!(
+                subsystem = "transform",
+                component = "import",
+                op = "stage",
+                addr = %addr,
+                "staging source"
+            );
             for source in source_list {
                 let id = source.get_unique_id().await?;
                 env.stage(
