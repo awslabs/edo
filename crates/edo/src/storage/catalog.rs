@@ -9,17 +9,6 @@ use crate::storage::{Artifact, Id, Layer};
 /// Tracks manifests by [`Id`], groups them by prefix for pruning, and
 /// maintains per-digest reference counts so blobs can be safely deleted
 /// when no manifest references them.
-///
-/// On-disk JSON layout (see `catalog.json` in the `LocalBackend`'s storage
-/// root and the analogous object in the `S3Backend`):
-///
-/// ```text
-/// {
-///   "prefix_index": { "*": [...ids...], "<prefix>": [...ids...] },
-///   "manifests":    { "<id>": { ... artifact ... } },
-///   "blob_counts":  { "<digest>": <refcount> }
-/// }
-/// ```
 #[derive(Deserialize, Serialize, Default, Debug)]
 pub struct Catalog {
     /// Maps a prefix (`"*"` for the unrestricted view, or [`Id::prefix()`]

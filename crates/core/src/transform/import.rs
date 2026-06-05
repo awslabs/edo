@@ -69,7 +69,7 @@ impl TransformImpl for ImportTransform {
             )
             .digest(digest)
             .build();
-        trace!(component = "transform", type = "import", "calculated id to be {id}");
+        trace!(subsystem = "transform", component = "import", id = %id, "calculated id");
         Ok(id)
     }
 
@@ -77,9 +77,29 @@ impl TransformImpl for ImportTransform {
         Ok(Vec::new())
     }
 
+    /// Short-circuits prepare when every input source is already cached.
+    /// Import transforms only fetch sources in `prepare`, so the call is
+    /// pure overhead when everything is already on disk.
+    async fn needs_prepare(&self, ctx: &Handle) -> TransformResult<bool> {
+        for source_list in self.sources.values() {
+            for source in source_list {
+                if !source.is_cached(ctx.storage()).await? {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
     async fn prepare(&self, log: &Log, ctx: &Handle) -> TransformResult<()> {
         for (addr, source_list) in self.sources.iter() {
-            trace!(component = "transform", type = "import", "fetching source {addr}");
+            trace!(
+                subsystem = "transform",
+                component = "import",
+                op = "fetch",
+                addr = %addr,
+                "fetching source"
+            );
             for source in source_list {
                 source.cache(log, ctx.storage()).await?;
             }
@@ -94,7 +114,13 @@ impl TransformImpl for ImportTransform {
 
         // Stage all the sources in the output directory
         for (addr, source_list) in self.sources.iter() {
-            trace!(component = "transform", type = "import", "staging source {addr}");
+            trace!(
+                subsystem = "transform",
+                component = "import",
+                op = "stage",
+                addr = %addr,
+                "staging source"
+            );
             for source in source_list {
                 let id = source.get_unique_id().await?;
                 env.stage(
