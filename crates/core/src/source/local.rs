@@ -69,7 +69,10 @@ impl SourceImpl for LocalSource {
 
     async fn fetch(&self, log: &Log, storage: &Storage) -> SourceResult<Artifact> {
         let id = self.get_unique_id().await?;
+        self.fetch_with_id(log, storage, id).await
+    }
 
+    async fn fetch_with_id(&self, log: &Log, storage: &Storage, id: Id) -> SourceResult<Artifact> {
         // First create the manifest
         let mut artifact = Artifact::builder()
             .media_type(MediaType::File(Compression::None))

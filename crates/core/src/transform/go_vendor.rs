@@ -99,10 +99,10 @@ impl TransformImpl for GoVendorTransform {
 
     /// Computes a deterministic id from the environment address and the
     /// source's unique id. Changing either invalidates the cached output.
-    async fn get_unique_id(&self, _ctx: &Handle) -> TransformResult<Id> {
+    async fn get_unique_id(&self, ctx: &Handle) -> TransformResult<Id> {
         let mut hash = blake3::Hasher::new();
         hash.update(self.environment.to_string().as_bytes());
-        let source_id = self.source.get_unique_id().await?;
+        let source_id = self.source.cached_unique_id(ctx).await?;
         hash.update(source_id.digest().as_bytes());
         for module in self.modules.iter() {
             hash.update(module.to_string_lossy().as_bytes());
@@ -112,7 +112,7 @@ impl TransformImpl for GoVendorTransform {
             .name(self.addr.to_id())
             .digest(digest.to_hex().to_lowercase())
             .build();
-        trace!(component = "transform", type = "go-vendor", "id is calculated to be {id}");
+        trace!(subsystem = "transform", component = "go-vendor", id = %id, "calculated id");
         Ok(id.clone())
     }
 
@@ -123,12 +123,18 @@ impl TransformImpl for GoVendorTransform {
         Ok(Vec::default())
     }
 
+    /// Short-circuits prepare when the vendored source is already in
+    /// the local cache.
+    async fn needs_prepare(&self, ctx: &Handle) -> TransformResult<bool> {
+        Ok(!self.source.is_cached(ctx).await?)
+    }
+
     /// Caches the input source into the context's source storage so that
     /// [`stage`](Self::stage) can lay it out in the environment without
     /// further network access.
     async fn prepare(&self, log: &Log, ctx: &Handle) -> TransformResult<()> {
         // Fetch the source we are vendoring code for
-        self.source.cache(log, ctx.storage()).await?;
+        self.source.cache_in(log, ctx).await?;
         Ok(())
     }
 
@@ -141,7 +147,7 @@ impl TransformImpl for GoVendorTransform {
         let build_root = Path::new("build-root");
         env.create_dir(build_root).await?;
 
-        let source_id = self.source.get_unique_id().await?;
+        let source_id = self.source.cached_unique_id(ctx).await?;
         env.stage(
             ctx,
             ArtifactStageOptions::builder()
@@ -168,7 +174,7 @@ impl TransformImpl for GoVendorTransform {
     /// may attempt the transform again.
     async fn transform(&self, log: &Log, ctx: &Handle, env: &Environment) -> TransformStatus {
         match async move {
-            let id = self.get_unique_id(ctx).await?;
+            let id = ctx.unique_id_of(&self.addr).await?;
             let vfs = Vfs::new(&id, env, log).await?;
 
             let build_root = vfs.entry("build-root").await;
@@ -180,17 +186,27 @@ impl TransformImpl for GoVendorTransform {
             } else {
                 let mut paths = Vec::new();
                 for path in self.modules.iter() {
-                    paths.push((build_root.entry(path).await, install_root.create_dir(path).await?));
+                    paths.push((
+                        build_root.entry(path).await,
+                        install_root.create_dir(path).await?,
+                    ));
                 }
                 paths
             };
 
-
             for (src_path, target_path) in paths.iter() {
                 if src_path.try_exists("go.mod").await? {
                     // Found a go module to vendor
-                    trace!(component = "transform", type = "go-vendor", "vendoring go sources for module at {:?}", src_path.path());
-                    src_path.command("go-vendor", "go", &["mod", "vendor"]).await?;
+                    trace!(
+                        subsystem = "transform",
+                        component = "go-vendor",
+                        op = "vendor",
+                        path = ?src_path.path(),
+                        "vendoring go sources"
+                    );
+                    src_path
+                        .command("go-vendor", "go", &["mod", "vendor"])
+                        .await?;
                     // Copy the resulting vendor directory into target_path
                     let target_vendor = target_path.entry("vendor").await;
                     let src_vendor = src_path.entry("vendor").await;
@@ -201,16 +217,18 @@ impl TransformImpl for GoVendorTransform {
             // that can overlay with the source
             let writer = ctx.storage().safe_start_layer().await?;
             env.read_stream(install_root.path(), writer.clone()).await?;
-            let layer = ctx.storage().safe_finish_layer(&writer, &LayerOptions::builder()
-                .media_type(MediaType::Tar(Compression::None))
-                .build()
-            ).await?;
+            let layer = ctx
+                .storage()
+                .safe_finish_layer(
+                    &writer,
+                    &LayerOptions::builder()
+                        .media_type(MediaType::Tar(Compression::None))
+                        .build(),
+                )
+                .await?;
 
             let artifact = Artifact::builder()
-                .config(Config::builder()
-                    .id(id)
-                    .build()
-                )
+                .config(Config::builder().id(id).build())
                 .media_type(MediaType::Manifest)
                 .layers(vec![layer])
                 .build();

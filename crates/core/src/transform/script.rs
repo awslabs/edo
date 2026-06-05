@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use handlebars::Handlebars;
 use indexmap::IndexMap;
 use ocilot::models::Platform;
-use snafu::{OptionExt, ResultExt};
+use snafu::ResultExt;
 
 #[derive(serde::Deserialize, Debug, Clone)]
 #[serde(deny_unknown_fields)]
@@ -91,16 +91,12 @@ impl TransformImpl for ScriptTransform {
         let mut depends = self.options.depends.clone();
         depends.sort();
         for depend in depends.iter() {
-            // We should use the resolved id for the dependency
-            let t = ctx.get(depend).context(error::NotFoundSnafu {
-                addr: depend.clone(),
-            })?;
-            let id = t.get_unique_id(ctx).await?;
+            let id = ctx.unique_id_of(depend).await?;
             hash.update(id.digest().as_bytes());
         }
         for source_list in self.sources.values() {
             for source in source_list {
-                let source_id = source.get_unique_id().await?;
+                let source_id = source.cached_unique_id(ctx).await?;
                 hash.update(source_id.digest().as_bytes());
             }
         }
@@ -113,7 +109,7 @@ impl TransformImpl for ScriptTransform {
             .digest(digest)
             .maybe_arch(self.options.arch.clone())
             .build();
-        trace!(component = "transform", type = "script", "id is calculated to be {id}");
+        trace!(subsystem = "transform", component = "script", id = %id, "calculated id");
         Ok(id.clone())
     }
 
@@ -121,11 +117,25 @@ impl TransformImpl for ScriptTransform {
         Ok(self.options.depends.clone())
     }
 
+    /// Short-circuits prepare when every input source is already present
+    /// in the local cache. Script transforms only fetch sources during
+    /// prepare, so once the bytes are on disk there's nothing to do.
+    async fn needs_prepare(&self, ctx: &Handle) -> TransformResult<bool> {
+        for source_list in self.sources.values() {
+            for source in source_list {
+                if !source.is_cached(ctx).await? {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
     async fn prepare(&self, log: &Log, ctx: &Handle) -> TransformResult<()> {
         // We should fetch all our sources
         for source_list in self.sources.values() {
             for source in source_list {
-                source.cache(log, ctx.storage()).await?;
+                source.cache_in(log, ctx).await?;
             }
         }
         Ok(())
@@ -139,11 +149,15 @@ impl TransformImpl for ScriptTransform {
 
         // Stage all dependencies into the build-root
         for dep in self.depends().await? {
-            let t = ctx
-                .get(&dep)
-                .context(error::NotFoundSnafu { addr: dep.clone() })?;
-            let id = t.get_unique_id(ctx).await?;
-            trace!(component = "transform", type = "script", "staging dependency {dep} with id {id}");
+            let id = ctx.unique_id_of(&dep).await?;
+            trace!(
+                subsystem = "transform",
+                component = "script",
+                op = "stage",
+                addr = %dep,
+                id = %id,
+                "staging dependency"
+            );
             // Use Environment::stage so decompression, archive vs file
             // dispatch, and path_hint placement are handled uniformly
             // (matching how sources are staged below).
@@ -160,8 +174,14 @@ impl TransformImpl for ScriptTransform {
         // Stage all sources in our build-root
         for source_list in self.sources.values() {
             for source in source_list {
-                let id = source.get_unique_id().await?;
-                trace!(component = "transform", type = "script", "staging source {id}");
+                let id = source.cached_unique_id(ctx).await?;
+                trace!(
+                    subsystem = "transform",
+                    component = "script",
+                    op = "stage",
+                    id = %id,
+                    "staging source"
+                );
                 env.stage(
                     ctx,
                     ArtifactStageOptions::builder()
@@ -178,7 +198,7 @@ impl TransformImpl for ScriptTransform {
     async fn transform(&self, log: &Log, ctx: &Handle, env: &Environment) -> TransformStatus {
         match async move {
             // Run the script in our environment
-            let id = self.get_unique_id(ctx).await?;
+            let id = ctx.unique_id_of(&self.addr).await?;
             // Handlebars defaults to HTML-escaping interpolated values
             // (`&` → `&amp;`, `<` → `&lt;`, etc.) which corrupts shell
             // commands — e.g. `--arg url='https://h?a=1&b=2'` would render

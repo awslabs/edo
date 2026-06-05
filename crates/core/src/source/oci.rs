@@ -47,6 +47,10 @@ impl SourceImpl for ImageSource {
 
     async fn fetch(&self, log: &Log, storage: &Storage) -> SourceResult<Artifact> {
         let id = self.get_unique_id().await?;
+        self.fetch_with_id(log, storage, id).await
+    }
+
+    async fn fetch_with_id(&self, log: &Log, storage: &Storage, id: Id) -> SourceResult<Artifact> {
         let uri = Uri::new(&self.uri).await.context(error::OciSnafu)?;
         trace!(component = "source", type = "oci", "pulling oci image from {}", self.uri);
 

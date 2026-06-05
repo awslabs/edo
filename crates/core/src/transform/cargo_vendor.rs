@@ -104,11 +104,11 @@ impl TransformImpl for CargoVendorTransform {
     /// Computes a deterministic id from the environment address and the
     /// unique ids of every input source. Changing any source (or the
     /// environment) invalidates the cached output.
-    async fn get_unique_id(&self, _ctx: &Handle) -> TransformResult<Id> {
+    async fn get_unique_id(&self, ctx: &Handle) -> TransformResult<Id> {
         let mut hash = blake3::Hasher::new();
         hash.update(self.environment.to_string().as_bytes());
         for source in self.sources.values() {
-            let source_id = source.get_unique_id().await?;
+            let source_id = source.cached_unique_id(ctx).await?;
             hash.update(source_id.digest().as_bytes());
         }
 
@@ -126,7 +126,7 @@ impl TransformImpl for CargoVendorTransform {
             .name(self.addr.to_id())
             .digest(digest.to_hex().to_lowercase())
             .build();
-        trace!(component = "transform", type = "cargo-vendor", "id is calculated to be {id}");
+        trace!(subsystem = "transform", component = "cargo-vendor", id = %id, "calculated id");
         Ok(id.clone())
     }
 
@@ -136,13 +136,24 @@ impl TransformImpl for CargoVendorTransform {
         Ok(Vec::default())
     }
 
+    /// Short-circuits prepare when every vendored source is already in
+    /// the local cache.
+    async fn needs_prepare(&self, ctx: &Handle) -> TransformResult<bool> {
+        for source in self.sources.values() {
+            if !source.is_cached(ctx).await? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Caches every input source into the context's source storage so that
     /// [`stage`](Self::stage) can lay them out in the environment without
     /// further network access.
     async fn prepare(&self, log: &Log, ctx: &Handle) -> TransformResult<()> {
         // Fetch the source we are vendoring code for
         for source in self.sources.values() {
-            source.cache(log, ctx.storage()).await?;
+            source.cache_in(log, ctx).await?;
         }
         Ok(())
     }
@@ -153,8 +164,14 @@ impl TransformImpl for CargoVendorTransform {
     async fn stage(&self, _log: &Log, ctx: &Handle, env: &Environment) -> TransformResult<()> {
         // For each source we are going to stage things into addr centered directories
         for (_, source) in self.sources.iter() {
-            let id = source.get_unique_id().await?;
-            trace!(component = "transform", type = "cargo-vendor", "staging source {id}");
+            let id = source.cached_unique_id(ctx).await?;
+            trace!(
+                subsystem = "transform",
+                component = "cargo-vendor",
+                op = "stage",
+                id = %id,
+                "staging source"
+            );
             let string = id.to_string();
             let dir = Path::new(&string);
             env.create_dir(dir).await?;
@@ -188,7 +205,7 @@ impl TransformImpl for CargoVendorTransform {
     /// may attempt the transform again.
     async fn transform(&self, log: &Log, ctx: &Handle, env: &Environment) -> TransformStatus {
         match async move {
-            let id = self.get_unique_id(ctx).await?;
+            let id = ctx.unique_id_of(&self.addr).await?;
             let vfs = Vfs::new(&id, env, log).await?;
 
             let install_root = vfs.create_dir("install-root").await?;
@@ -198,7 +215,7 @@ impl TransformImpl for CargoVendorTransform {
             // Now we want to gather our directory paths
             let mut cargo_tomls = VecDeque::new();
             for (addr, source) in self.sources.iter() {
-                let src_id = source.get_unique_id().await?;
+                let src_id = source.cached_unique_id(ctx).await?;
                 let src_dir = vfs.entry(src_id.to_string()).await;
                 let name = addr.last().unwrap();
                 // If we have an override use those paths for the cargo tomls and assume their presence
