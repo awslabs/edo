@@ -37,6 +37,20 @@ pub trait Transform {
     async fn get_unique_id(&self, ctx: &Handle) -> TransformResult<Id>;
     /// Returns addresses of all transforms this one depends on.
     async fn depends(&self) -> TransformResult<Vec<Addr>>;
+    /// Reports whether this transform needs its `prepare` step to run.
+    ///
+    /// The scheduler's fetch phase calls this *after* a build-cache miss
+    /// to decide whether spawning a per-node prepare task is worthwhile.
+    /// Returning `false` lets the scheduler skip the spawn entirely \u2014
+    /// useful for transforms whose `prepare` only fetches sources that
+    /// are already in the local cache.
+    ///
+    /// Defaults to `true` so plugin transforms keep their existing
+    /// behaviour. Builtins that only fetch sources in `prepare` override
+    /// this to short-circuit when every input source reports cached.
+    async fn needs_prepare(&self, _ctx: &Handle) -> TransformResult<bool> {
+        Ok(true)
+    }
     /// Prepare the transform by fetching all sources and dependent artifacts into storage.
     async fn prepare(&self, log: &Log, ctx: &Handle) -> TransformResult<()>;
     /// Stage all required files into the given environment before execution.
@@ -47,6 +61,34 @@ pub trait Transform {
     fn can_shell(&self) -> bool;
     /// Open an interactive shell in the environment at the transform's working directory.
     fn shell(&self, env: &Environment) -> TransformResult<()>;
+}
+
+impl Transform {
+    /// Memoized [`Transform::get_unique_id`] keyed by `addr`.
+    ///
+    /// If the [`Handle`] carries an [`IdCache`](crate::context::IdCache)
+    /// (i.e. we are inside a scheduler run), the result is looked up /
+    /// inserted there so a transitive id is computed at most once per
+    /// [`Scheduler::run`](crate::scheduler::Scheduler::run) invocation.
+    /// Without a cache (e.g. ad-hoc tooling) it falls through to the raw
+    /// [`Transform::get_unique_id`] call.
+    ///
+    /// Callers should prefer this helper whenever they have the transform's
+    /// address handy. The recursive id loops in `script` and `compose`
+    /// transforms — and the scheduler's per-node fetch loop — were the
+    /// motivating call sites.
+    pub async fn cached_unique_id(&self, ctx: &Handle, addr: &Addr) -> TransformResult<Id> {
+        if let Some(cache) = ctx.id_cache()
+            && let Some(id) = cache.get(addr)
+        {
+            return Ok(id);
+        }
+        let id = self.get_unique_id(ctx).await?;
+        if let Some(cache) = ctx.id_cache() {
+            cache.insert(addr.clone(), id.clone());
+        }
+        Ok(id)
+    }
 }
 
 /// The outcome of a transform execution.

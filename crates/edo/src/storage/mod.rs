@@ -113,13 +113,21 @@ impl Inner {
 
     // Set a build cache
     fn set_build_cache(&mut self, cache: &Backend) {
-        debug!(subsystem = "storage", op = "register", "registering a build cache");
+        debug!(
+            subsystem = "storage",
+            op = "register",
+            "registering a build cache"
+        );
         self.build = Some(cache.clone());
     }
 
     // Set the output cache
     fn set_output_cache(&mut self, cache: &Backend) {
-        debug!(subsystem = "storage", op = "register", "registering an output cache");
+        debug!(
+            subsystem = "storage",
+            op = "register",
+            "registering an output cache"
+        );
         self.output = Some(cache.clone());
     }
 
@@ -367,6 +375,18 @@ impl Storage {
     /// Set the output cache
     pub async fn set_output(&self, cache: &Backend) {
         self.inner.write().await.set_output_cache(cache);
+    }
+
+    /// Reports whether `id` is present in the **local** cache only.
+    ///
+    /// Cheap, side-effect-free probe: never touches networked source or
+    /// build caches. Used by [`Source::is_cached`](crate::source::Source::is_cached)
+    /// and the scheduler's fetch-phase short-circuit to avoid spawning
+    /// per-node prepare tasks when every input is already on disk.
+    ///
+    /// **safe operation** No network IO.
+    pub async fn has_local(&self, id: &Id) -> StorageResult<bool> {
+        self.inner.read().await.local.has(id).await
     }
 
     /// Open an artifact stored in the local cache

@@ -119,7 +119,7 @@ impl SourceImpl for GitSource {
             storage.safe_save(&artifact).await?;
             Ok(artifact.clone())
         }
-                .instrument(info_span!(
+        .instrument(info_span!(
             "source-fetch",
             subsystem = "source",
             component = "git",

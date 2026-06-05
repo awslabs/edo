@@ -10,13 +10,51 @@ use crate::console::{Console, ConsoleEvent};
 use crate::{
     context::Config,
     environment::{Environment, Farm},
-    storage::Storage,
+    storage::{Id, Storage},
     transform::Transform,
 };
+use dashmap::DashMap;
 use snafu::OptionExt;
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
+
+/// Per-run memoization of [`Transform::get_unique_id`] results.
+///
+/// The scheduler computes transform ids many times per run — once per node
+/// in [`Graph::fetch`](crate::scheduler::Graph::fetch), again from
+/// [`run_transform_lifecycle`] per worker, and *recursively* from
+/// transforms whose own id depends on dependent transforms' ids (e.g.
+/// `script` and `compose`). Without memoization a single shared leaf is
+/// re-hashed once per ancestor on every pass.
+///
+/// The cache is bound to a single [`Scheduler::run`](crate::scheduler::Scheduler::run)
+/// invocation by attaching it to a fresh [`Handle`] (see
+/// [`Handle::with_id_cache`]). It must NOT outlive the run — between runs
+/// transforms may legitimately produce different ids (e.g. `update`
+/// re-pinned a source).
+#[derive(Clone, Default)]
+pub struct IdCache {
+    inner: Arc<DashMap<Addr, Id>>,
+}
+
+impl IdCache {
+    /// Create an empty cache.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Look up a previously memoized id.
+    pub fn get(&self, addr: &Addr) -> Option<Id> {
+        self.inner.get(addr).map(|e| e.clone())
+    }
+
+    /// Insert an id (idempotent — first writer wins).
+    pub fn insert(&self, addr: Addr, id: Id) {
+        self.inner.entry(addr).or_insert(id);
+    }
+}
 
 /// A handle is passed to transforms where it needs to look up
 /// things in the transform state.
@@ -30,6 +68,11 @@ pub struct Handle {
     farms: HashMap<Addr, Farm>,
     args: HashMap<String, String>,
     cancellation: CancellationToken,
+    /// Optional per-run id memoization. `None` for handles created outside
+    /// a scheduler run (e.g. `update`, `list`, ad-hoc tooling). The
+    /// scheduler attaches a fresh cache via [`Handle::with_id_cache`] at
+    /// the start of every run.
+    id_cache: Option<IdCache>,
 }
 
 unsafe impl Send for Handle {}
@@ -55,7 +98,24 @@ impl Handle {
             farms,
             args,
             cancellation: CancellationToken::new(),
+            id_cache: None,
         }
+    }
+
+    /// Returns a clone of this handle with the given [`IdCache`] attached.
+    ///
+    /// Callers (the scheduler) use this to bind a fresh cache to the
+    /// handle for the duration of one run. The cache is reachable from
+    /// transforms via [`Handle::id_cache`] so they can memoize recursive
+    /// dependency-id lookups.
+    pub fn with_id_cache(mut self, cache: IdCache) -> Self {
+        self.id_cache = Some(cache);
+        self
+    }
+
+    /// Returns the per-run id cache if one is attached.
+    pub fn id_cache(&self) -> Option<&IdCache> {
+        self.id_cache.as_ref()
     }
 
     /// Returns the project wide configuration nodes

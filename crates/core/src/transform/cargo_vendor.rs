@@ -126,7 +126,7 @@ impl TransformImpl for CargoVendorTransform {
             .name(self.addr.to_id())
             .digest(digest.to_hex().to_lowercase())
             .build();
-                trace!(subsystem = "transform", component = "cargo-vendor", id = %id, "calculated id");
+        trace!(subsystem = "transform", component = "cargo-vendor", id = %id, "calculated id");
         Ok(id.clone())
     }
 
@@ -134,6 +134,17 @@ impl TransformImpl for CargoVendorTransform {
     /// purely [`Source`]s, which are fetched in [`prepare`](Self::prepare).
     async fn depends(&self) -> TransformResult<Vec<Addr>> {
         Ok(Vec::default())
+    }
+
+    /// Short-circuits prepare when every vendored source is already in
+    /// the local cache.
+    async fn needs_prepare(&self, ctx: &Handle) -> TransformResult<bool> {
+        for source in self.sources.values() {
+            if !source.is_cached(ctx.storage()).await? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Caches every input source into the context's source storage so that
@@ -154,7 +165,7 @@ impl TransformImpl for CargoVendorTransform {
         // For each source we are going to stage things into addr centered directories
         for (_, source) in self.sources.iter() {
             let id = source.get_unique_id().await?;
-                        trace!(
+            trace!(
                 subsystem = "transform",
                 component = "cargo-vendor",
                 op = "stage",

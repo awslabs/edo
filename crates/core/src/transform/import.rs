@@ -69,7 +69,7 @@ impl TransformImpl for ImportTransform {
             )
             .digest(digest)
             .build();
-                trace!(subsystem = "transform", component = "import", id = %id, "calculated id");
+        trace!(subsystem = "transform", component = "import", id = %id, "calculated id");
         Ok(id)
     }
 
@@ -77,9 +77,23 @@ impl TransformImpl for ImportTransform {
         Ok(Vec::new())
     }
 
+    /// Short-circuits prepare when every input source is already cached.
+    /// Import transforms only fetch sources in `prepare`, so the call is
+    /// pure overhead when everything is already on disk.
+    async fn needs_prepare(&self, ctx: &Handle) -> TransformResult<bool> {
+        for source_list in self.sources.values() {
+            for source in source_list {
+                if !source.is_cached(ctx.storage()).await? {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
     async fn prepare(&self, log: &Log, ctx: &Handle) -> TransformResult<()> {
         for (addr, source_list) in self.sources.iter() {
-                        trace!(
+            trace!(
                 subsystem = "transform",
                 component = "import",
                 op = "fetch",
@@ -100,7 +114,7 @@ impl TransformImpl for ImportTransform {
 
         // Stage all the sources in the output directory
         for (addr, source_list) in self.sources.iter() {
-                        trace!(
+            trace!(
                 subsystem = "transform",
                 component = "import",
                 op = "stage",

@@ -92,11 +92,15 @@ impl TransformImpl for ScriptTransform {
         let mut depends = self.options.depends.clone();
         depends.sort();
         for depend in depends.iter() {
-            // We should use the resolved id for the dependency
+            // We should use the resolved id for the dependency. Use the
+            // cached lookup so a shared transitive dependency is hashed
+            // at most once per scheduler run — without this, a graph
+            // where N parents share one leaf re-hashes that leaf N times
+            // per fetch pass.
             let t = ctx.get(depend).context(error::NotFoundSnafu {
                 addr: depend.clone(),
             })?;
-            let id = t.get_unique_id(ctx).await?;
+            let id = t.cached_unique_id(ctx, depend).await?;
             hash.update(id.digest().as_bytes());
         }
         for source_list in self.sources.values() {
@@ -114,12 +118,26 @@ impl TransformImpl for ScriptTransform {
             .digest(digest)
             .maybe_arch(self.options.arch.clone())
             .build();
-                trace!(subsystem = "transform", component = "script", id = %id, "calculated id");
+        trace!(subsystem = "transform", component = "script", id = %id, "calculated id");
         Ok(id.clone())
     }
 
     async fn depends(&self) -> TransformResult<Vec<Addr>> {
         Ok(self.options.depends.clone())
+    }
+
+    /// Short-circuits prepare when every input source is already present
+    /// in the local cache. Script transforms only fetch sources during
+    /// prepare, so once the bytes are on disk there's nothing to do.
+    async fn needs_prepare(&self, ctx: &Handle) -> TransformResult<bool> {
+        for source_list in self.sources.values() {
+            for source in source_list {
+                if !source.is_cached(ctx.storage()).await? {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
     }
 
     async fn prepare(&self, log: &Log, ctx: &Handle) -> TransformResult<()> {
@@ -143,7 +161,7 @@ impl TransformImpl for ScriptTransform {
             let t = ctx
                 .get(&dep)
                 .context(error::NotFoundSnafu { addr: dep.clone() })?;
-            let id = t.get_unique_id(ctx).await?;
+            let id = t.cached_unique_id(ctx, &dep).await?;
             trace!(
                 subsystem = "transform",
                 component = "script",
@@ -169,7 +187,7 @@ impl TransformImpl for ScriptTransform {
         for source_list in self.sources.values() {
             for source in source_list {
                 let id = source.get_unique_id().await?;
-                                trace!(
+                trace!(
                     subsystem = "transform",
                     component = "script",
                     op = "stage",

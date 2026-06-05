@@ -9,7 +9,7 @@ use crate::storage::{Artifact, Id, Layer};
 /// Tracks manifests by [`Id`], groups them by prefix for pruning, and
 /// maintains per-digest reference counts so blobs can be safely deleted
 /// when no manifest references them.
-#[derive(Deserialize, Serialize, Default)]
+#[derive(Deserialize, Serialize, Default, Debug)]
 pub struct Catalog {
     catalog: BTreeMap<String, BTreeSet<Id>>,
     manifests: BTreeMap<Id, Artifact>,

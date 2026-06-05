@@ -18,10 +18,27 @@ use super::catalog::Catalog;
 /// Layers are stored as individual blobs under `blobs/blake3/<digest>` and
 /// manifests are tracked in a JSON catalog file. The shared blob layout means
 /// copy operations are metadata-only.
+///
+/// The on-disk catalog is mirrored by an in-memory [`Catalog`] snapshot
+/// (see [`CatalogSlot`]) that is kept current by every mutating method.
+/// Reads consult the snapshot directly, avoiding repeated JSON deserialization
+/// of `catalog.json` on hot paths like the scheduler's fetch phase.
 #[derive(Debug)]
 pub struct LocalBackend {
     layer_dir: PathBuf,
-    catalog_file: RwLock<PathBuf>,
+    catalog: RwLock<CatalogSlot>,
+}
+
+/// Path + in-memory snapshot of the on-disk catalog.
+///
+/// The path is held alongside the snapshot so a single lock guard covers
+/// both the file location and its decoded contents — preserving the
+/// "lock held across read/modify/write" guarantee that mutating methods
+/// rely on, while letting reads skip disk IO entirely.
+#[derive(Debug)]
+struct CatalogSlot {
+    path: PathBuf,
+    catalog: Catalog,
 }
 
 #[derive(serde::Deserialize, Debug, Clone)]
@@ -67,9 +84,16 @@ impl LocalBackend {
                 .await
                 .context(error::NewSnafu)?;
         }
+        // Load the catalog once at construction; subsequent reads consult
+        // the in-memory snapshot, and mutating methods keep both copies
+        // in sync under the write lock.
+        let catalog = Self::load_at(&catalog_file)?;
         Ok(Self {
             layer_dir,
-            catalog_file: RwLock::new(catalog_file),
+            catalog: RwLock::new(CatalogSlot {
+                path: catalog_file,
+                catalog,
+            }),
         })
     }
 }
@@ -95,28 +119,22 @@ impl LocalBackend {
         serde_json::to_writer(&mut writer, catalog).context(error::SerializeSnafu)?;
         Ok(())
     }
-
-    fn load(&self) -> StorageResult<Catalog> {
-        let lock = self.catalog_file.read();
-        Self::load_at(lock.as_path())
-    }
 }
 
 #[async_trait]
 impl BackendImpl for LocalBackend {
     async fn list(&self) -> StorageResult<BTreeSet<Id>> {
-        let catalog = self.load()?;
-        Ok(catalog.list_all())
+        Ok(self.catalog.read().catalog.list_all())
     }
 
     async fn has(&self, id: &Id) -> StorageResult<bool> {
-        let catalog = self.load()?;
-        Ok(catalog.has(id))
+        Ok(self.catalog.read().catalog.has(id))
     }
 
     async fn open(&self, id: &Id) -> StorageResult<Artifact> {
-        let catalog = self.load()?;
-        let artifact = catalog
+        let guard = self.catalog.read();
+        let artifact = guard
+            .catalog
             .get(id)
             .context(error::NotFoundSnafu { id: id.clone() })?;
         Ok(artifact.clone())
@@ -133,12 +151,11 @@ impl BackendImpl for LocalBackend {
                 }
             );
         }
-        // Hold the write lock across load+mutate+flush so concurrent saves
-        // cannot read a stale catalog and clobber each other's writes.
-        let lock = self.catalog_file.write();
-        let mut catalog = Self::load_at(lock.as_path())?;
-        catalog.add(artifact);
-        Self::flush_at(lock.as_path(), &catalog)?;
+        // Hold the write lock across mutate+flush so concurrent saves
+        // cannot read a stale snapshot and clobber each other's writes.
+        let mut guard = self.catalog.write();
+        guard.catalog.add(artifact);
+        Self::flush_at(&guard.path.clone(), &guard.catalog)?;
         Ok(())
     }
 
@@ -146,25 +163,29 @@ impl BackendImpl for LocalBackend {
         // Hold the write lock across the read-modify-write so concurrent
         // saves/dels cannot interleave and lose updates.
         let artifact = {
-            let lock = self.catalog_file.write();
-            let mut catalog = Self::load_at(lock.as_path())?;
-            if !catalog.has(id) {
+            let mut guard = self.catalog.write();
+            if !guard.catalog.has(id) {
                 return Ok(());
             }
-            let artifact = catalog
+            let artifact = guard
+                .catalog
                 .get(id)
                 .context(error::NotFoundSnafu { id: id.clone() })?
                 .clone();
-            catalog.del(id);
-            Self::flush_at(lock.as_path(), &catalog)?;
+            guard.catalog.del(id);
+            Self::flush_at(&guard.path.clone(), &guard.catalog)?;
             artifact
         };
         for layer in artifact.layers() {
             let digest = layer.digest().digest();
             let blob_path = self.layer_dir.join(digest.clone());
-            let lock = self.catalog_file.read();
-            let catalog = Self::load_at(lock.as_path())?;
-            if catalog.count(layer) <= 0 && blob_path.exists() {
+            // Re-check the blob refcount under the read lock; another
+            // concurrent save may have re-introduced it.
+            let drop_blob = {
+                let guard = self.catalog.read();
+                guard.catalog.count(layer) <= 0 && blob_path.exists()
+            };
+            if drop_blob {
                 tokio::fs::remove_file(&blob_path)
                     .await
                     .context(error::RemoveSnafu)?;
@@ -192,10 +213,11 @@ impl BackendImpl for LocalBackend {
             prefix = %id.prefix(),
             "pruning all artifacts that do not match prefix"
         );
-        // To prune historical artifacts we want to load our catalog for the id prefix
-        let catalog = self.load()?;
+        // Snapshot the prefix listing under the read lock; `del` takes
+        // the write lock per-entry so we cannot hold our guard across it.
+        let matching = self.catalog.read().catalog.matching(id);
 
-        for entry in catalog.matching(id) {
+        for entry in matching {
             if entry == *id {
                 continue;
             }
@@ -211,15 +233,26 @@ impl BackendImpl for LocalBackend {
         Ok(())
     }
 
-    #[allow(clippy::await_holding_lock)]
     async fn prune_all(&self) -> StorageResult<()> {
-        let lock = self.catalog_file.write();
-        tokio::fs::remove_file(lock.as_path())
-            .await
-            .context(error::RemoveSnafu)?;
-        tokio::fs::remove_dir_all(&self.layer_dir)
-            .await
-            .context(error::RemoveSnafu)?;
+        // Take the write lock first so reads see an empty snapshot the
+        // instant the on-disk file disappears. The lock is held across
+        // the (cheap) filesystem removals; no other thread can observe
+        // the half-removed state.
+        let path = {
+            let mut guard = self.catalog.write();
+            guard.catalog = Catalog::default();
+            guard.path.clone()
+        };
+        if path.exists() {
+            tokio::fs::remove_file(&path)
+                .await
+                .context(error::RemoveSnafu)?;
+        }
+        if self.layer_dir.exists() {
+            tokio::fs::remove_dir_all(&self.layer_dir)
+                .await
+                .context(error::RemoveSnafu)?;
+        }
         Ok(())
     }
 
