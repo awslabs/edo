@@ -65,6 +65,22 @@ impl Source {
         self.fetch(log, storage).await
     }
 
+    /// Reports whether the source's artifact is already present in the
+    /// local cache backing `storage`.
+    ///
+    /// Used by transforms to short-circuit the per-node `prepare` task in
+    /// the scheduler's fetch phase: if every input source reports cached,
+    /// `prepare` would only re-confirm what we already know, so the
+    /// scheduler can skip spawning the task entirely.
+    ///
+    /// Probes only the local cache \u2014 networked source caches are not
+    /// consulted, because doing so would defeat the point (the goal is to
+    /// avoid network IO when everything is already on disk).
+    pub async fn is_cached(&self, storage: &Storage) -> SourceResult<bool> {
+        let id = self.get_unique_id().await?;
+        Ok(storage.has_local(&id).await?)
+    }
+
     /// Helper for staging sources off their layer media_types instead of deferring
     /// to an individual's source stage logic. Transforms may just want flat extracts.
     /// this will also ignore the source specific out transforms

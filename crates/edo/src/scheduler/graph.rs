@@ -51,7 +51,7 @@ use tokio::task::{JoinError, JoinHandle};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
-use crate::context::{Addr, Context, Handle};
+use crate::context::{Addr, Context, Handle, IdCache};
 use crate::storage::{Artifact, Id};
 use crate::transform::Transform;
 
@@ -100,6 +100,12 @@ pub struct Graph {
     /// `run` clones the inner map at start and decrements it as nodes
     /// complete; that's why this is a "template" rather than mutable state.
     indegrees: HashMap<Addr, HashMap<NodeIndex, u32>>,
+    /// Per-run id memoization shared across `fetch` and `run`. Created
+    /// fresh in [`Graph::new`] so each scheduler run starts with an
+    /// empty cache; reusing the same `Graph` across runs reuses its
+    /// cache too, which is fine because the graph is itself per-run
+    /// (the scheduler recreates it on each call).
+    id_cache: IdCache,
 }
 
 impl Graph {
@@ -116,6 +122,7 @@ impl Graph {
             index: BiHashMap::new(),
             subgraphs: HashMap::new(),
             indegrees: HashMap::new(),
+            id_cache: IdCache::new(),
         }
     }
 
@@ -135,7 +142,7 @@ impl Graph {
         if let Some(index) = self.index.get_by_left(addr) {
             return Ok(*index);
         }
-        trace!(component = "execution", "adding execution node for {addr}");
+        trace!(subsystem = "scheduler", op = "add-node", addr = %addr, "adding execution node");
         let transform = ctx
             .get_transform(addr)
             .context(error::ProjectTransformSnafu { addr: addr.clone() })?;
@@ -147,7 +154,7 @@ impl Graph {
         // `add_edge` is what catches cycles — daggy returns `WouldCycle`.
         for dep in transform.depends().await? {
             let child = self.add_recursive(ctx, &dep).await?;
-            trace!(component = "execution", "adding edge for {dep} -> {addr}");
+            trace!(subsystem = "scheduler", op = "add-edge", from = %dep, to = %addr, "adding edge");
             self.graph
                 .add_edge(child, node_index, format!("{dep}->{addr}"))
                 .context(error::GraphSnafu)?;
@@ -225,7 +232,10 @@ impl Graph {
     /// pool that throttles the network.
     pub async fn fetch(&self, ctx: &Context) -> Result<()> {
         let mut tasks = Vec::new();
-        let ctx = ctx.get_handle();
+        // Attach the per-run id cache so transforms (script, compose, …)
+        // and the per-node loop below all collapse repeated
+        // `get_unique_id` calls onto the same memoized result.
+        let ctx = ctx.get_handle().with_id_cache(self.id_cache.clone());
         let max_concurrent = self.batch_size;
 
         // Fetching is network-bound. We don't want to issue thousands of
@@ -241,8 +251,9 @@ impl Graph {
             })?;
             // Compute the content-addressed id and stash it on the node so
             // workers in `run` can index into the build cache without
-            // recomputing it.
-            let id = transform.get_unique_id(&ctx).await?;
+            // recomputing it. Use the memoized helper so a transitive id
+            // referenced by multiple parents is hashed exactly once.
+            let id = transform.cached_unique_id(&ctx, &node.addr).await?;
             node.set_id(&id);
 
             // Build cache probe. `find_build(.., true)` requires a *full*
@@ -253,6 +264,13 @@ impl Graph {
             if ctx.storage().find_build(&id, true).await?.is_some() {
                 info!("skipped fetch for built entry {}", node.addr);
                 node.set_cache_hit(true);
+                continue;
+            }
+
+            // Build-cache miss — but if the transform reports that its
+            // `prepare` step has nothing to do (e.g. every input source is
+            // already in the local cache), skip the spawn entirely.
+            if !transform.needs_prepare(&ctx).await? {
                 continue;
             }
 
@@ -321,7 +339,11 @@ impl Graph {
     /// post the result. That keeps the scheduling logic single-threaded and
     /// lock-free without giving up parallelism on the actual work.
     pub async fn run(&self, path: &Path, ctx: &Context, addr: &Addr) -> Result<()> {
-        let ctx_handle = ctx.get_handle();
+        // Bind the same id cache that `fetch` populated so workers that
+        // call `transform.get_unique_id` (e.g. inside `stage`/`transform`
+        // bodies) hit the same memoized results instead of re-walking
+        // dependency trees on every transform.
+        let ctx_handle = ctx.get_handle().with_id_cache(self.id_cache.clone());
         let token = ctx_handle.cancellation();
 
         // ── Step 1: resolve the target node. ──────────────────────────────
@@ -448,7 +470,7 @@ impl Graph {
                     let result = run_transform_lifecycle(
                         &ctx_clone, &path_buf, &node, &transform, &id, &token,
                     )
-                    .instrument(info_span!("transforming", addr = node.addr.to_string()))
+                    .instrument(info_span!("transform", subsystem = "scheduler", addr = %node.addr))
                     .await;
                     // If the driver has gone away (done_rx dropped) there's
                     // nobody left to report to — exit quietly.
@@ -530,7 +552,7 @@ impl Graph {
                     // failed, and clear `ready` so no further dispatch
                     // happens. We still need to drain `inflight` tasks
                     // so workers don't leak.
-                    error!("{} failed: {e}", node.addr);
+                    error!(subsystem = "scheduler", addr = %node.addr, "{} failed: {e}", node.addr);
                     node.set_failed();
                     if first_error.is_none() {
                         first_error = Some(e);
@@ -605,8 +627,9 @@ async fn run_transform_lifecycle(
     let environment = ctx
         .create_environment(&logf, &env_addr, temp.path())
         .instrument(info_span!(
-            "creating environment",
-            addr = node.addr.to_string()
+            "env-create",
+            subsystem = "environment",
+            addr = %node.addr
         ))
         .await?;
 
@@ -618,8 +641,9 @@ async fn run_transform_lifecycle(
     environment
         .setup(&logf, ctx.storage())
         .instrument(info_span!(
-            "setting up environment",
-            addr = node.addr.to_string()
+            "env-setup",
+            subsystem = "environment",
+            addr = %node.addr
         ))
         .await?;
 
@@ -642,8 +666,9 @@ async fn run_transform_lifecycle(
         transform
             .stage(&logf, ctx, &environment)
             .instrument(info_span!(
-                "staging into environment",
-                addr = node.addr.to_string()
+                "transform-stage",
+                subsystem = "transform",
+                addr = %node.addr
             ))
             .await?;
 
@@ -662,7 +687,7 @@ async fn run_transform_lifecycle(
     logf.set_subject("clean environment");
     let _ = environment
         .clean(&logf)
-        .instrument(info_span!("cleaning up", addr = node.addr.to_string()))
+        .instrument(info_span!("env-clean", subsystem = "environment", addr = %node.addr))
         .await;
 
     drop(logf);
@@ -876,6 +901,7 @@ pub(crate) mod tests {
             let deps = deps.clone();
             m.expect_depends().returning(move || Ok(deps.clone()));
         }
+        m.expect_needs_prepare().returning(|_ctx| Ok(true));
         {
             let prepare_called = prepare_called.clone();
             m.expect_prepare().returning(move |_log, _ctx| {

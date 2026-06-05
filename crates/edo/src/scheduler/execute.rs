@@ -210,6 +210,7 @@ mod tests {
             });
         }
         t.expect_depends().returning(|| Ok(Vec::new()));
+        t.expect_needs_prepare().returning(|_ctx| Ok(true));
         t.expect_prepare().returning(|_, _| Ok(()));
         t.expect_stage().returning(|_, _, _| Ok(()));
         {
