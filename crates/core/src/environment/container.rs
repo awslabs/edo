@@ -21,11 +21,48 @@ use uuid::Uuid;
 use which::which;
 
 /// Configuration for the container runtime (e.g. which CLI binary to use).
-#[derive(serde::Deserialize, Debug, Clone)]
+///
+/// All fields are optional; an unset `runtime` triggers autodetection
+/// (`finch` -> `podman` -> `docker`), and an unset `cli` is resolved via
+/// `which(runtime)`.
+#[derive(serde::Deserialize, Debug, Clone, Default)]
 pub struct ContainerConfig {
-    runtime: String,
+    #[serde(default)]
+    runtime: Option<String>,
+    #[serde(default)]
     cli: Option<PathBuf>,
+    #[serde(default)]
     network: bool,
+    /// Maximum number of processes/threads the container may spawn.
+    ///
+    /// Maps to `--pids-limit`. `-1` (the default) means unlimited; rootless
+    /// runtimes otherwise inherit a low cap (often 2048) which fork-heavy
+    /// builds (Go, Kubernetes) trivially exhaust with EAGAIN from `fork(2)`.
+    /// Set to `None` to omit the flag and use the runtime's default.
+    #[serde(default = "default_pids_limit")]
+    pids_limit: Option<i64>,
+    /// Per-container ulimits, each formatted as `name=soft[:hard]` and passed
+    /// through verbatim as repeated `--ulimit` flags (e.g. `"nproc=65535"`,
+    /// `"nofile=1048576"`). Defaults to empty (runtime defaults apply).
+    #[serde(default)]
+    ulimits: Vec<String>,
+}
+
+fn default_pids_limit() -> Option<i64> {
+    Some(-1)
+}
+
+/// Probe `PATH` for a supported container runtime, in priority order.
+fn detect_runtime() -> Option<(&'static str, PathBuf)> {
+    if let Ok(cli) = which("finch") {
+        Some(("finch", cli))
+    } else if let Ok(cli) = which("podman") {
+        Some(("podman", cli))
+    } else if let Ok(cli) = which("docker") {
+        Some(("docker", cli))
+    } else {
+        None
+    }
 }
 
 /// Options for a Container environment
@@ -51,6 +88,9 @@ impl FromElement for ContainerFarm {
 
     async fn new(element: &Element, ctx: &Context) -> EnvResult<Self> {
         let options: ContainerOptions = element.get()?;
+        // Precedence: per-environment `config` block, then the project-level
+        // `[container]` table, then full defaults. Any unset field in the
+        // chosen source falls back to the same autodetect/`which` logic.
         let mut config = if let Some(config) = options.config.as_ref() {
             config.clone()
         } else if let Some(config) = ctx.config().get("container") {
@@ -58,15 +98,10 @@ impl FromElement for ContainerFarm {
                 addr: element.addr.clone(),
             })?
         } else {
-            let (runtime, cli) = if let Ok(finch) = which("finch") {
-                ("finch", finch)
-            } else if let Ok(podman) = which("podman") {
-                ("podman", podman)
-            } else if let Ok(docker) = which("docker") {
-                ("docker", docker)
-            } else {
-                return error::NoRuntimeSnafu {}.fail().map_err(|e| e.into());
-            };
+            ContainerConfig::default()
+        };
+        if config.runtime.is_none() {
+            let (runtime, cli) = detect_runtime().context(error::NoRuntimeSnafu)?;
             info!(
                 subsystem = "environment",
                 component = "container",
@@ -75,14 +110,18 @@ impl FromElement for ContainerFarm {
                 runtime = %runtime,
                 "found container runtime"
             );
-            ContainerConfig {
-                runtime: runtime.to_string(),
-                cli: Some(cli),
-                network: false,
+            config.runtime = Some(runtime.to_string());
+            // Only fill `cli` from autodetect if the user didn't override it,
+            // so an explicit `cli = "..."` keeps working with autodetected
+            // runtime kind.
+            if config.cli.is_none() {
+                config.cli = Some(cli);
             }
-        };
+        }
         if config.cli.is_none() {
-            config.cli = Some(which(&config.runtime).ok().context(error::NoRuntimeSnafu)?);
+            // SAFETY: runtime is Some at this point.
+            let runtime = config.runtime.as_deref().unwrap();
+            config.cli = Some(which(runtime).ok().context(error::NoRuntimeSnafu)?);
         }
         let src_element = element
             .source
@@ -327,6 +366,18 @@ impl EnvironmentImpl for Container {
             ];
             if !self.config.network {
                 args.push("--network=none".to_string());
+            }
+            // Heavy builds (Kubernetes' Go toolchain, parallel rpmbuild, etc.)
+            // can blow past the rootless default `pids.max` and fail with
+            // `fork/exec ...: resource temporarily unavailable`. Default to
+            // unlimited; honour an explicit override if the user set one.
+            if let Some(limit) = self.config.pids_limit {
+                args.push("--pids-limit".to_string());
+                args.push(limit.to_string());
+            }
+            for ulimit in &self.config.ulimits {
+                args.push("--ulimit".to_string());
+                args.push(ulimit.clone());
             }
             if self.user == "root" {
                 args.push("--mount".to_string());
