@@ -85,6 +85,10 @@ impl TransformImpl for ComposeTransform {
         Ok(self.depends.clone())
     }
 
+    async fn needs_prepare(&self, _ctx: &Handle) -> TransformResult<bool> {
+        Ok(true)
+    }
+
     async fn prepare(&self, _log: &Log, _ctx: &Handle) -> TransformResult<()> {
         // Do nothing for a compose
         Ok(())

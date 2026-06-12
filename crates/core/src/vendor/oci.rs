@@ -164,7 +164,11 @@ impl ImageVendor {
             .context(error::OciSnafu)?
         {
             // Check if this is an edo artifact, if it is we can read it
-            let mut config = image.config().open(&uri).await.context(error::OciSnafu)?;
+            let mut config = image
+                .config()
+                .open(&uri, None)
+                .await
+                .context(error::OciSnafu)?;
             let mut buffer = Vec::new();
             config
                 .read_to_end(&mut buffer)

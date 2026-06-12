@@ -41,16 +41,10 @@ pub trait Transform {
     ///
     /// The scheduler's fetch phase calls this *after* a build-cache miss
     /// to decide whether spawning a per-node prepare task is worthwhile.
-    /// Returning `false` lets the scheduler skip the spawn entirely \u2014
+    /// Returning `false` lets the scheduler skip the spawn entirely
     /// useful for transforms whose `prepare` only fetches sources that
     /// are already in the local cache.
-    ///
-    /// Defaults to `true` so plugin transforms keep their existing
-    /// behaviour. Builtins that only fetch sources in `prepare` override
-    /// this to short-circuit when every input source reports cached.
-    async fn needs_prepare(&self, _ctx: &Handle) -> TransformResult<bool> {
-        Ok(true)
-    }
+    async fn needs_prepare(&self, _ctx: &Handle) -> TransformResult<bool>;
     /// Prepare the transform by fetching all sources and dependent artifacts into storage.
     async fn prepare(&self, log: &Log, ctx: &Handle) -> TransformResult<()>;
     /// Stage all required files into the given environment before execution.

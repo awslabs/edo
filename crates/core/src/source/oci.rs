@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use edo::record;
+use ocilot::progress::SharedProgress;
 use ocilot::{index::Index, models::Platform, uri::Uri};
 use snafu::ResultExt;
 use snafu::ensure;
@@ -95,7 +96,12 @@ impl SourceImpl for ImageSource {
             platform
         );
         index
-            .to_oci(&uri, Some(platform.clone()), writer.clone())
+            .to_oci(
+                &uri,
+                Some(platform.clone()),
+                writer.clone(),
+                SharedProgress::none(),
+            )
             .await
             .context(error::OciSnafu)?;
         let layer = storage

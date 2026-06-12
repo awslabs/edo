@@ -189,7 +189,6 @@ impl Inner {
                     &writer, &LayerOptions::builder()
                         .media_type(layer.media_type().clone())
                         .maybe_platform(layer.platform().clone())
-                        .maybe_path_hint(layer.path_hint().clone())
                         .build()).await?;
                 Ok(())
             }.instrument(info_span!("cache-download", subsystem = "storage", op = "download", id = %artifact.config().id(), digest = %digest))));
@@ -214,7 +213,6 @@ impl Inner {
                 tokio::io::copy(&mut reader, &mut writer).await.context(error::IoSnafu)?;
                 backend.finish_layer(&writer, &LayerOptions::builder()
                     .media_type(layer.media_type().clone())
-                    .maybe_path_hint(layer.path_hint().clone())
                     .maybe_platform(layer.platform().clone())
                     .build()
                 ).await?;
@@ -387,6 +385,26 @@ impl Storage {
     /// **safe operation** No network IO.
     pub async fn has_local(&self, id: &Id) -> StorageResult<bool> {
         self.inner.read().await.local.has(id).await
+    }
+
+    /// Reports whether the **local** cache already stores a blob with the
+    /// given bare hex digest. Used by content-addressed sources (e.g.
+    /// [`RemoteSource`](https://example.com)) to skip the network fetch when
+    /// only the manifest id changed (e.g. because `out` changed) but the
+    /// underlying blob is unchanged.
+    ///
+    /// **safe operation** No network IO.
+    pub async fn has_local_blob(&self, digest: &str) -> StorageResult<bool> {
+        self.inner.read().await.local.has_blob(digest).await
+    }
+
+    /// Returns the on-disk size of a blob in the **local** cache, if
+    /// present. Used by content-addressed sources to populate the
+    /// accurate `Layer::size` when reusing an existing blob.
+    ///
+    /// **safe operation** No network IO.
+    pub async fn local_blob_size(&self, digest: &str) -> StorageResult<Option<u64>> {
+        self.inner.read().await.local.blob_size(digest).await
     }
 
     /// Open an artifact stored in the local cache

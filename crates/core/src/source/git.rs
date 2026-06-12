@@ -33,17 +33,22 @@ impl FromElement for GitSource {
 #[async_trait]
 impl SourceImpl for GitSource {
     async fn get_unique_id(&self) -> SourceResult<Id> {
+        // Fold `out` into the digest so changing the staging path
+        // invalidates the cached manifest. The name is kept stable
+        // (no longer embeds `out`) so the human-facing id stays clean.
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(self.reference.as_bytes());
+        hasher.update(
+            self.out
+                .as_ref()
+                .and_then(|p| p.to_str())
+                .unwrap_or("")
+                .as_bytes(),
+        );
+        let digest = base16::encode_lower(hasher.finalize().as_bytes());
         let id = Id::builder()
-            .name(format!(
-                "{}@{}-{:?}",
-                self.url,
-                self.reference,
-                self.out
-                    .as_ref()
-                    .and_then(|x| x.to_str())
-                    .unwrap_or_default()
-            ))
-            .digest(base16::encode_lower(self.reference.as_bytes()))
+            .name(format!("{}@{}", self.url, self.reference))
+            .digest(digest)
             .build();
         trace!(subsystem = "source", component = "git", id = %id, "calculated id");
         Ok(id)
@@ -104,17 +109,23 @@ impl SourceImpl for GitSource {
             writer.flush().await.context(error::ArchiveSnafu)?;
             archive.finish().await.context(error::ArchiveSnafu)?;
             // Now we can add the the layer to the artifact
-            artifact.layers_mut().push(
-                storage
-                    .safe_finish_layer(
-                        &writer,
-                        &LayerOptions::builder()
-                            .media_type(MediaType::Tar(Compression::None))
-                            .maybe_path_hint(self.out.clone())
-                            .build(),
-                    )
-                    .await?,
-            );
+            let layer = storage
+                .safe_finish_layer(
+                    &writer,
+                    &LayerOptions::builder()
+                        .media_type(MediaType::Tar(Compression::None))
+                        .build(),
+                )
+                .await?;
+            // Record `out` as the artifact-level staging hint keyed by
+            // the layer's digest. See `Config::path_hints`.
+            if let Some(hint) = self.out.clone() {
+                artifact
+                    .config_mut()
+                    .path_hints_mut()
+                    .insert(layer.digest().digest(), hint);
+            }
+            artifact.layers_mut().push(layer);
             // Now save the artifact itself
             storage.safe_save(&artifact).await?;
             Ok(artifact.clone())

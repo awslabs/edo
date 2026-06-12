@@ -24,6 +24,7 @@ impl Run {
                 .map(HashMap::from_iter)
                 .unwrap_or_default(),
             true,
+            true,
         )
         .await?;
         let addr = Addr::parse(self.addr.as_str())?;

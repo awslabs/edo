@@ -10,7 +10,7 @@ pub struct Update {}
 
 impl Update {
     pub async fn run(&self, args: Args) -> Result<()> {
-        let _ = super::create_context(&args, "<update>", HashMap::default(), false).await?;
+        let _ = super::create_context(&args, "<update>", HashMap::default(), false, false).await?;
         Ok(())
     }
 }

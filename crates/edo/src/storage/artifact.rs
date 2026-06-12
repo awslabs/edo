@@ -259,6 +259,13 @@ pub type Requires = BTreeMap<String, BTreeMap<String, VersionReq>>;
 ///
 /// Contains the unique [`Id`], a set of capability strings this artifact
 /// provides, its dependency requirements, and freeform metadata.
+///
+/// `path_hints` maps a layer's bare hex digest (matching `Catalog::blob_counts`
+/// keys and `LayerDigest::digest()`) to a relative path that
+/// [`Environment::stage`](crate::environment::Environment::stage) uses when
+/// extracting/writing the layer. Stored at the artifact level (rather than
+/// per-`Layer`) so that the same content-addressed blob can be shared by
+/// multiple manifests that present it at different paths.
 #[derive(Serialize, Deserialize, Clone, Debug, Builder)]
 pub struct Config {
     id: Id,
@@ -268,6 +275,9 @@ pub struct Config {
     requires: Requires,
     #[builder(into, default = Metadata::default())]
     metadata: Metadata,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[builder(into, default = BTreeMap::new())]
+    path_hints: BTreeMap<String, PathBuf>,
 }
 
 macro_rules! handle {
@@ -287,10 +297,16 @@ impl Config {
     handle!(metadata, metadata_mut, metadata, Metadata);
     handle!(requires, requires_mut, requires, Requires);
     handle!(provides, provides_mut, provides, BTreeSet<String>);
+    handle!(path_hints, path_hints_mut, path_hints, BTreeMap<String, PathBuf>);
+
+    /// Look up the staging path hint for `digest`, if one was recorded.
+    pub fn path_hint_for(&self, digest: &LayerDigest) -> Option<&PathBuf> {
+        self.path_hints.get(&digest.digest())
+    }
 }
 
 /// A BLAKE3 content digest identifying a layer's blob.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct LayerDigest(String);
 
 impl LayerDigest {
@@ -340,7 +356,9 @@ impl<'de> Deserialize<'de> for LayerDigest {
 /// A single content-addressed blob within an [`Artifact`].
 ///
 /// Each layer has a media type describing its content format, a BLAKE3 digest,
-/// a byte size, and an optional platform constraint.
+/// a byte size, and an optional platform constraint. Layers are purely
+/// content-addressed; presentation hints (where to stage the blob) live on
+/// [`Config::path_hints`] so the same blob can be reused across artifacts.
 #[derive(Serialize, Deserialize, Debug, Clone, Builder)]
 pub struct Layer {
     #[builder(into)]
@@ -351,8 +369,6 @@ pub struct Layer {
     size: usize,
     #[builder(into)]
     platform: Option<Platform>,
-    #[builder(into)]
-    path_hint: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Builder)]
@@ -360,14 +376,11 @@ pub struct LayerOptions {
     #[builder(into)]
     media_type: MediaType,
     #[builder(into)]
-    path_hint: Option<PathBuf>,
-    #[builder(into)]
     platform: Option<Platform>,
 }
 
 impl LayerOptions {
     handle!(media_type, media_type_mut, media_type, MediaType);
-    handle!(path_hint, path_hint_mut, path_hint, Option<PathBuf>);
     handle!(platform, platform_mut, platform, Option<Platform>);
 
     pub fn create<L: Into<LayerDigest>>(&self, digest: L, size: usize) -> Layer {
@@ -376,7 +389,6 @@ impl LayerOptions {
             .digest(digest.into())
             .size(size)
             .maybe_platform(self.platform.clone())
-            .maybe_path_hint(self.path_hint.clone())
             .build()
     }
 }
@@ -386,7 +398,6 @@ impl Layer {
     handle!(digest, digest_mut, digest, LayerDigest);
     handle!(size, size_mut, size, usize);
     handle!(platform, platform_mut, platform, Option<Platform>);
-    handle!(path_hint, path_hint_mut, path_hint, Option<PathBuf>);
 }
 
 /// An artifact is used to store any data in-flight or final. All artifacts are stored and represented
@@ -424,6 +435,9 @@ pub struct ArtifactStageOptions {
     // If this is an archive extract it when staging
     #[builder(into, default = true)]
     extract: bool,
+    // Ignore source artifact path_hint
+    #[builder(into, default = false)]
+    ignore_artifact_path: bool,
 }
 
 impl ArtifactStageOptions {
@@ -441,5 +455,9 @@ impl ArtifactStageOptions {
 
     pub fn extract(&self) -> bool {
         self.extract
+    }
+
+    pub fn ignore_artifact_path(&self) -> bool {
+        self.ignore_artifact_path
     }
 }

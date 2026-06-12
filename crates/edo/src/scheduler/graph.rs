@@ -1162,6 +1162,87 @@ pub(crate) mod tests {
         }
     }
 
+    /// Register a no-prepare mock at `addr_str`. Identical to
+    /// [`register_mock`] except its `needs_prepare` returns `Ok(false)`.
+    /// Used to validate the scheduler's fetch-phase short-circuit: when
+    /// every input is already cached, `prepare` must not be invoked.
+    ///
+    /// Hand-rolls the [`MockTransformImpl`] (rather than reusing
+    /// [`build_mock_transform`]) so the `needs_prepare` expectation is
+    /// configured exactly once with the desired return value — mockall's
+    /// behaviour when multiple expectations target the same method is
+    /// not guaranteed to be "last writer wins".
+    pub(crate) fn register_mock_no_prepare(
+        ctx: &Context,
+        addr_str: &str,
+        deps: &[&str],
+    ) -> MockHandles {
+        let addr = Addr::parse(addr_str).unwrap();
+        let deps_vec: Vec<Addr> = deps
+            .iter()
+            .map(|s| Addr::parse(s).expect("dep addr"))
+            .collect();
+        let env_addr = Addr::parse("//default").unwrap();
+        let digest = format!("{:064x}", fxhash(addr_str));
+        let prepare_called = Arc::new(AtomicUsize::new(0));
+        let stage_called = Arc::new(AtomicUsize::new(0));
+        let transform_called = Arc::new(AtomicUsize::new(0));
+        let max_inflight = Arc::new(AtomicUsize::new(0));
+        let order = Arc::new(std::sync::Mutex::new(Vec::<Addr>::new()));
+
+        let mut m = MockTransformImpl::new();
+        {
+            let env_addr = env_addr.clone();
+            m.expect_environment()
+                .returning(move || Ok(env_addr.clone()));
+        }
+        {
+            let addr = addr.clone();
+            let digest = digest.clone();
+            m.expect_get_unique_id().returning(move |_ctx| {
+                Ok(Id::builder()
+                    .name(addr.to_string())
+                    .digest(digest.clone())
+                    .build())
+            });
+        }
+        m.expect_depends().returning(move || Ok(deps_vec.clone()));
+        m.expect_needs_prepare().returning(|_ctx| Ok(false));
+        {
+            let prepare_called = prepare_called.clone();
+            m.expect_prepare().returning(move |_log, _ctx| {
+                prepare_called.fetch_add(1, AtomicOrdering::SeqCst);
+                Ok(())
+            });
+        }
+        {
+            let stage_called = stage_called.clone();
+            m.expect_stage().returning(move |_log, _ctx, _env| {
+                stage_called.fetch_add(1, AtomicOrdering::SeqCst);
+                Ok(())
+            });
+        }
+        {
+            let transform_called = transform_called.clone();
+            let digest_for_status = digest.clone();
+            m.expect_transform().returning(move |_log, _ctx, _env| {
+                transform_called.fetch_add(1, AtomicOrdering::SeqCst);
+                TransformStatus::Success(make_artifact(&digest_for_status))
+            });
+        }
+        m.expect_can_shell().return_const(false);
+        m.expect_shell().returning(|_env| Ok(()));
+        ctx.insert_transform_for_test(&addr, Transform::new(m));
+        MockHandles {
+            addr,
+            prepare_called,
+            stage_called,
+            transform_called,
+            max_inflight,
+            order_log: order,
+        }
+    }
+
     /// Tiny non-cryptographic hash used only to generate stable digest
     /// strings so each mock ends up with a distinct `Id`.
     fn fxhash(s: &str) -> u128 {
@@ -1300,6 +1381,30 @@ pub(crate) mod tests {
         assert_eq!(h_a.prepare_called.load(AtomicOrdering::SeqCst), 1);
         assert_eq!(h_b.prepare_called.load(AtomicOrdering::SeqCst), 1);
         assert_eq!(h_c.prepare_called.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    /// When `Transform::needs_prepare` returns `Ok(false)`, the
+    /// scheduler's fetch phase must NOT call `prepare` for that node.
+    /// Validates the short-circuit at `graph.rs:~291` against accidental
+    /// regressions (e.g. always returning `true`).
+    #[tokio::test]
+    #[serial_test::serial(log_manager)]
+    async fn graph_fetch_skips_prepare_when_needs_prepare_false() {
+        let ctx = ctx_or_skip!();
+        ensure_default_farm(&ctx);
+        let h_a = register_mock_no_prepare(&ctx, "//gfnp/a", &[]);
+
+        let mut g = Graph::new(4);
+        g.add(&ctx, &Addr::parse("//gfnp/a").unwrap())
+            .await
+            .unwrap();
+        g.fetch(&ctx).await.expect("fetch");
+
+        assert_eq!(
+            h_a.prepare_called.load(AtomicOrdering::SeqCst),
+            0,
+            "prepare must not be called when needs_prepare returned false"
+        );
     }
 
     #[tokio::test]

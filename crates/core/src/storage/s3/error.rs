@@ -43,6 +43,10 @@ pub enum Error {
     List {
         source: SdkError<aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Error>,
     },
+    #[snafu(display(
+        "lock object {key} did not clear after the retry budget; refusing to proceed to avoid losing a peer writer's catalog update"
+    ))]
+    LockTimeout { key: String },
     #[snafu(display("storage backend does not contain an artifact with id: {id}"))]
     NotFound { id: edo::storage::Id },
     #[snafu(display("failed to upload part of a multipart upload to s3 cache: {source}"))]
@@ -57,6 +61,10 @@ pub enum Error {
         "due to the danger of it we do not support prune-all on s3 backends, if you need to clear the bucket use the s3 console"
     ))]
     PruneAll,
+    #[snafu(display("failed to read s3 response body: {source}"))]
+    ReadBody {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
     #[snafu(display("failed to serialize manifest: {source}"))]
     Serialize { source: serde_json::Error },
     #[snafu(display("failed to start multipart upload to s3 cache: {source}"))]

@@ -177,7 +177,11 @@ impl TransformImpl for CargoVendorTransform {
             env.create_dir(dir).await?;
             env.stage(
                 ctx,
-                ArtifactStageOptions::builder().id(id).path(dir).build(),
+                ArtifactStageOptions::builder()
+                    .id(id)
+                    .path(dir)
+                    .ignore_artifact_path(true)
+                    .build(),
             )
             .await?;
         }
@@ -240,19 +244,14 @@ impl TransformImpl for CargoVendorTransform {
             args.push(vendor_dir.as_ref());
 
             // Now we want to execute the command
-            vfs.command("cargo-vendor", "cargo", args).await?;
+            let output = vfs.output("cargo-vendor", "cargo", args).await?;
 
-            // Now we want to generate the config.toml
-            let cargo_toml = format!(
-                r###"[source.crates-io]
-replace-with = "vendored-sources"
-
-[source.vendored-sources]
-directory = ".cargo/vendor"
-"###
-            );
+            // We need to patch the directory = path to remove edo's environment path
+            let mut cargo_config = String::from_utf8_lossy(&output).to_string();
+            let pattern = install_root.path().to_str().unwrap();
+            cargo_config = cargo_config.replace(&format!("{pattern}/"), "");
             cargo_dir
-                .write("config.toml", cargo_toml.as_bytes())
+                .write("config.toml", cargo_config.as_bytes())
                 .await?;
 
             // Now we build an artifact containing an archive of the resulting vendoring

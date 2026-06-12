@@ -42,6 +42,7 @@ impl Checkout {
                 .map(HashMap::from_iter)
                 .unwrap_or_default(),
             true,
+            false,
         )
         .await?;
         let addr = Addr::parse(self.addr.as_str())?;
@@ -88,9 +89,10 @@ impl Checkout {
                         .map_err(|source| error::Error::ZipExtract { source })?;
                 }
                 MediaType::File(compression) => {
-                    let filename = layer
-                        .path_hint()
-                        .clone()
+                    let filename = artifact
+                        .config()
+                        .path_hint_for(layer.digest())
+                        .cloned()
                         .unwrap_or_else(|| PathBuf::from(layer.digest().digest()));
                     let dest = self.output.join(filename);
                     if let Some(parent) = dest.parent() {

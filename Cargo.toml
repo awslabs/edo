@@ -48,7 +48,7 @@ keyring              = "3.6"
 merkle_hash          = "3.8"
 mockall              = "0.14"
 names                = { version = "0.14", default-features = false, features = [] }
-ocilot               = "0.1"
+ocilot               = "0.2"
 os_pipe              = "1.2"
 owo-colors           = { version = "4.3", features = ["supports-colors"] }
 parking_lot          = { version = "0.12", features = ["send_guard"] }

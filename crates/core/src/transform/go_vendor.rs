@@ -153,6 +153,7 @@ impl TransformImpl for GoVendorTransform {
             ArtifactStageOptions::builder()
                 .id(source_id)
                 .path(build_root)
+                .ignore_artifact_path(true)
                 .build(),
         )
         .await?;

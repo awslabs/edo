@@ -17,6 +17,16 @@ pub struct LocalSource {
     out: Option<PathBuf>,
 }
 
+/// Folds an optional `out` value into a hash so two otherwise-identical
+/// sources with different `out`s produce different ids. Empty/missing
+/// `out` hashes a stable empty marker so old ids stay deterministic.
+fn out_bytes(out: Option<&PathBuf>) -> Vec<u8> {
+    out.and_then(|p| p.to_str())
+        .unwrap_or("")
+        .as_bytes()
+        .to_vec()
+}
+
 #[async_trait]
 impl FromElement for LocalSource {
     type Error = error::Error;
@@ -35,8 +45,13 @@ impl SourceImpl for LocalSource {
             .build()
             .context(error::MerkleSnafu)?;
         let hash = merkle.root.item.hash;
-        // Local files will never be precached usually
-        let digest = base16::encode_lower(hash.as_slice());
+        // Fold `out` into the manifest digest so `out` changes invalidate
+        // the cached manifest. The blob itself is still derived purely
+        // from the file content; only the *manifest* id changes.
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(hash.as_slice());
+        hasher.update(&out_bytes(self.out.as_ref()));
+        let digest = base16::encode_lower(hasher.finalize().as_bytes());
 
         let id = Id::builder()
             .name(
@@ -118,17 +133,21 @@ impl SourceImpl for LocalSource {
         };
         writer.flush().await.context(error::ReadFileSnafu)?;
         // Save the layer
-        artifact.layers_mut().push(
-            storage
-                .safe_finish_layer(
-                    &writer,
-                    &LayerOptions::builder()
-                        .media_type(media_type)
-                        .maybe_path_hint(path_hint)
-                        .build(),
-                )
-                .await?,
-        );
+        let layer = storage
+            .safe_finish_layer(
+                &writer,
+                &LayerOptions::builder().media_type(media_type).build(),
+            )
+            .await?;
+        // Record the staging hint at the artifact level keyed by the layer
+        // digest (matches `Catalog::blob_counts` and `LayerDigest::digest()`).
+        if let Some(hint) = path_hint {
+            artifact
+                .config_mut()
+                .path_hints_mut()
+                .insert(layer.digest().digest(), hint);
+        }
+        artifact.layers_mut().push(layer);
         // Save the artifact
         storage.safe_save(&artifact).await?;
         Ok(artifact)

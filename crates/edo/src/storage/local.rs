@@ -5,10 +5,10 @@ use crate::context::{Config, Element, FromElementNoContext};
 use crate::storage::{Artifact, BackendImpl, Id, Layer, LayerOptions, StorageResult};
 use crate::util::{Reader, Writer};
 use async_trait::async_trait;
-use parking_lot::RwLock;
 use serde_json::json;
-use snafu::{OptionExt, ResultExt, ensure};
+use snafu::{IntoError, OptionExt, ResultExt, ensure};
 use tokio::fs::{File, OpenOptions};
+use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use super::catalog::Catalog;
@@ -23,6 +23,12 @@ use super::catalog::Catalog;
 /// (see [`CatalogSlot`]) that is kept current by every mutating method.
 /// Reads consult the snapshot directly, avoiding repeated JSON deserialization
 /// of `catalog.json` on hot paths like the scheduler's fetch phase.
+///
+/// Concurrency model: the snapshot is guarded by a [`tokio::sync::RwLock`]
+/// so the write path can hold the guard across async filesystem operations
+/// (atomic catalog flush, blob deletion). Mutating ops thus serialize with
+/// each other; reads run in parallel with each other and only block when a
+/// write is in progress.
 #[derive(Debug)]
 pub struct LocalBackend {
     layer_dir: PathBuf,
@@ -87,7 +93,7 @@ impl LocalBackend {
         // Load the catalog once at construction; subsequent reads consult
         // the in-memory snapshot, and mutating methods keep both copies
         // in sync under the write lock.
-        let catalog = Self::load_at(&catalog_file)?;
+        let catalog = Self::load_at(&catalog_file).await?;
         Ok(Self {
             layer_dir,
             catalog: RwLock::new(CatalogSlot {
@@ -99,24 +105,46 @@ impl LocalBackend {
 }
 
 impl LocalBackend {
-    fn load_at(path: &Path) -> StorageResult<Catalog> {
-        if !path.exists() {
+    async fn load_at(path: &Path) -> StorageResult<Catalog> {
+        if !tokio::fs::try_exists(path)
+            .await
+            .context(error::ReadCatalogSnafu)?
+        {
             return Ok(Catalog::default());
         }
-        let mut reader = std::fs::File::open(path).context(error::ReadCatalogSnafu)?;
-        let catalog: Catalog =
-            serde_json::from_reader(&mut reader).context(error::DeserializeSnafu)?;
-        Ok(catalog)
+        let bytes = tokio::fs::read(path)
+            .await
+            .context(error::ReadCatalogSnafu)?;
+        serde_json::from_slice(&bytes)
+            .context(error::DeserializeSnafu)
+            .map_err(Into::into)
     }
 
-    fn flush_at(path: &Path, catalog: &Catalog) -> StorageResult<()> {
-        let mut writer = std::fs::OpenOptions::new()
+    /// Atomically write the catalog to disk by serializing into a sibling
+    /// temp file and renaming over the target. `rename(2)` is atomic
+    /// within a filesystem, so a concurrent reader either sees the old
+    /// file or the new file — never an empty/partial one.
+    async fn flush_at(path: &Path, catalog: &Catalog) -> StorageResult<()> {
+        let bytes = serde_json::to_vec(catalog).context(error::SerializeSnafu)?;
+        let tmp = path.with_extension("json.tmp");
+        // Use `OpenOptions` with `create(true).truncate(true)` so a
+        // leftover tmp file from a previous crash is overwritten.
+        let mut file = OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
-            .open(path)
+            .open(&tmp)
+            .await
             .context(error::WriteCatalogSnafu)?;
-        serde_json::to_writer(&mut writer, catalog).context(error::SerializeSnafu)?;
+        use tokio::io::AsyncWriteExt;
+        file.write_all(&bytes)
+            .await
+            .context(error::WriteCatalogSnafu)?;
+        file.sync_all().await.context(error::WriteCatalogSnafu)?;
+        drop(file);
+        tokio::fs::rename(&tmp, path)
+            .await
+            .context(error::WriteCatalogSnafu)?;
         Ok(())
     }
 }
@@ -124,15 +152,15 @@ impl LocalBackend {
 #[async_trait]
 impl BackendImpl for LocalBackend {
     async fn list(&self) -> StorageResult<BTreeSet<Id>> {
-        Ok(self.catalog.read().catalog.list_all())
+        Ok(self.catalog.read().await.catalog.list_all())
     }
 
     async fn has(&self, id: &Id) -> StorageResult<bool> {
-        Ok(self.catalog.read().catalog.has(id))
+        Ok(self.catalog.read().await.catalog.has(id))
     }
 
     async fn open(&self, id: &Id) -> StorageResult<Artifact> {
-        let guard = self.catalog.read();
+        let guard = self.catalog.read().await;
         let artifact = guard
             .catalog
             .get(id)
@@ -141,51 +169,58 @@ impl BackendImpl for LocalBackend {
     }
 
     async fn save(&self, artifact: &Artifact) -> StorageResult<()> {
-        // Before we allow the save we should validate that all layers exist
+        // Hold the write lock across precondition check, catalog mutation,
+        // and on-disk flush so concurrent saves cannot race each other and
+        // a concurrent `del` cannot remove a blob between our check and
+        // our register.
+        let mut guard = self.catalog.write().await;
         for layer in artifact.layers() {
             let blob_path = self.layer_dir.join(layer.digest().digest());
             ensure!(
-                blob_path.exists(),
+                tokio::fs::try_exists(&blob_path)
+                    .await
+                    .context(error::ReadSnafu)?,
                 error::LayerMissingSnafu {
                     digest: layer.digest().digest()
                 }
             );
         }
-        // Hold the write lock across mutate+flush so concurrent saves
-        // cannot read a stale snapshot and clobber each other's writes.
-        let mut guard = self.catalog.write();
         guard.catalog.add(artifact);
-        Self::flush_at(&guard.path.clone(), &guard.catalog)?;
+        let path = guard.path.clone();
+        Self::flush_at(&path, &guard.catalog).await?;
         Ok(())
     }
 
     async fn del(&self, id: &Id) -> StorageResult<()> {
-        // Hold the write lock across the read-modify-write so concurrent
-        // saves/dels cannot interleave and lose updates.
-        let artifact = {
-            let mut guard = self.catalog.write();
-            if !guard.catalog.has(id) {
-                return Ok(());
-            }
-            let artifact = guard
-                .catalog
-                .get(id)
-                .context(error::NotFoundSnafu { id: id.clone() })?
-                .clone();
-            guard.catalog.del(id);
-            Self::flush_at(&guard.path.clone(), &guard.catalog)?;
-            artifact
-        };
+        // Hold the write lock across the entire delete: mutate the
+        // catalog, flush it, then remove blob files. Holding the lock
+        // until the blob files are gone closes the TOCTOU window where
+        // a racing `save` could observe the blob via `try_exists`,
+        // proceed past its precondition, and end up registering a
+        // manifest pointing at a digest whose file we are about to
+        // unlink.
+        let mut guard = self.catalog.write().await;
+        if !guard.catalog.has(id) {
+            return Ok(());
+        }
+        let artifact = guard
+            .catalog
+            .get(id)
+            .context(error::NotFoundSnafu { id: id.clone() })?
+            .clone();
+        guard.catalog.del(id);
+        let path = guard.path.clone();
+        Self::flush_at(&path, &guard.catalog).await?;
         for layer in artifact.layers() {
+            if guard.catalog.count(layer) > 0 {
+                continue;
+            }
             let digest = layer.digest().digest();
-            let blob_path = self.layer_dir.join(digest.clone());
-            // Re-check the blob refcount under the read lock; another
-            // concurrent save may have re-introduced it.
-            let drop_blob = {
-                let guard = self.catalog.read();
-                guard.catalog.count(layer) <= 0 && blob_path.exists()
-            };
-            if drop_blob {
+            let blob_path = self.layer_dir.join(&digest);
+            if tokio::fs::try_exists(&blob_path)
+                .await
+                .context(error::RemoveSnafu)?
+            {
                 tokio::fs::remove_file(&blob_path)
                     .await
                     .context(error::RemoveSnafu)?;
@@ -215,7 +250,7 @@ impl BackendImpl for LocalBackend {
         );
         // Snapshot the prefix listing under the read lock; `del` takes
         // the write lock per-entry so we cannot hold our guard across it.
-        let matching = self.catalog.read().catalog.matching(id);
+        let matching = self.catalog.read().await.catalog.matching(id);
 
         for entry in matching {
             if entry == *id {
@@ -238,17 +273,21 @@ impl BackendImpl for LocalBackend {
         // instant the on-disk file disappears. The lock is held across
         // the (cheap) filesystem removals; no other thread can observe
         // the half-removed state.
-        let path = {
-            let mut guard = self.catalog.write();
-            guard.catalog = Catalog::default();
-            guard.path.clone()
-        };
-        if path.exists() {
+        let mut guard = self.catalog.write().await;
+        guard.catalog = Catalog::default();
+        let path = guard.path.clone();
+        if tokio::fs::try_exists(&path)
+            .await
+            .context(error::RemoveSnafu)?
+        {
             tokio::fs::remove_file(&path)
                 .await
                 .context(error::RemoveSnafu)?;
         }
-        if self.layer_dir.exists() {
+        if tokio::fs::try_exists(&self.layer_dir)
+            .await
+            .context(error::RemoveSnafu)?
+        {
             tokio::fs::remove_dir_all(&self.layer_dir)
                 .await
                 .context(error::RemoveSnafu)?;
@@ -300,6 +339,31 @@ impl BackendImpl for LocalBackend {
         }
         Ok(layer)
     }
+
+    async fn has_blob(&self, digest: &str) -> StorageResult<bool> {
+        // Treat the catalog as a hint, not an authority: confirm the
+        // file actually exists on disk before reporting `true`. This
+        // closes the gap where the catalog and filesystem disagree
+        // (out-of-band corruption, partial backup restore, etc.) and
+        // a false positive would have steered the caller into the
+        // digest-verification short-circuit.
+        if !self.catalog.read().await.catalog.has_blob(digest) {
+            return Ok(false);
+        }
+        let path = self.layer_dir.join(digest);
+        Ok(tokio::fs::try_exists(&path)
+            .await
+            .context(error::ReadSnafu)?)
+    }
+
+    async fn blob_size(&self, digest: &str) -> StorageResult<Option<u64>> {
+        let path = self.layer_dir.join(digest);
+        match tokio::fs::metadata(&path).await {
+            Ok(meta) => Ok(Some(meta.len())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(error::ReadSnafu.into_error(e).into()),
+        }
+    }
 }
 
 pub(crate) mod error {
@@ -347,5 +411,70 @@ pub(crate) mod error {
                 source: Box::new(value),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::{Config as ArtifactConfig, MediaType};
+    use tempfile::TempDir;
+
+    async fn setup() -> (TempDir, LocalBackend) {
+        let dir = TempDir::new().expect("tempdir");
+        let backend = LocalBackend::new_(dir.path()).await.expect("new local");
+        (dir, backend)
+    }
+
+    fn artifact(name: &str, digest: &str) -> Artifact {
+        let id = Id::builder()
+            .name(name.to_string())
+            .digest(digest.to_string())
+            .build();
+        Artifact::builder()
+            .media_type(MediaType::Manifest)
+            .config(ArtifactConfig::builder().id(id).build())
+            .build()
+    }
+
+    #[tokio::test]
+    async fn save_then_open_round_trips() {
+        let (_dir, b) = setup().await;
+        let a = artifact("foo", "deadbeef");
+        b.save(&a).await.expect("save");
+        let opened = b.open(a.config().id()).await.expect("open");
+        assert_eq!(opened.config().id(), a.config().id());
+    }
+
+    #[tokio::test]
+    async fn flush_is_atomic_no_orphan_tmp() {
+        // After a save, the on-disk layout should be the catalog file and
+        // (for an empty artifact) no orphan tmp files in the storage root.
+        let (dir, b) = setup().await;
+        let a = artifact("foo", "deadbeef");
+        b.save(&a).await.expect("save");
+        let entries = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        // We allow `catalog.json` and `blobs`, but `catalog.json.tmp` must
+        // not survive a successful flush.
+        assert!(
+            !entries.iter().any(|n| n.ends_with(".tmp")),
+            "no tmp files after flush: {entries:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn save_persists_across_reload() {
+        let dir = TempDir::new().expect("tempdir");
+        {
+            let b = LocalBackend::new_(dir.path()).await.expect("new local");
+            b.save(&artifact("foo", "111")).await.expect("save");
+        }
+        // Re-open the same directory and confirm the manifest is loaded.
+        let b = LocalBackend::new_(dir.path()).await.expect("reopen");
+        let id = artifact("foo", "111").config().id().clone();
+        assert!(b.has(&id).await.expect("has"));
     }
 }

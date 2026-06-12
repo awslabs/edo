@@ -40,16 +40,75 @@ pub struct ContainerConfig {
     /// builds (Go, Kubernetes) trivially exhaust with EAGAIN from `fork(2)`.
     /// Set to `None` to omit the flag and use the runtime's default.
     #[serde(default = "default_pids_limit")]
-    pids_limit: Option<i64>,
+    pids_limit: i64,
     /// Per-container ulimits, each formatted as `name=soft[:hard]` and passed
     /// through verbatim as repeated `--ulimit` flags (e.g. `"nproc=65535"`,
-    /// `"nofile=1048576"`). Defaults to empty (runtime defaults apply).
-    #[serde(default)]
+    /// `"nofile=1048576"`).
+    ///
+    /// Defaults provide unlimited `nproc` and a `nofile` value capped at the
+    /// host user's hard limit so fork-heavy builds (Go, Kubernetes, parallel
+    /// rpmbuild) don't hit `EAGAIN` from rootless `RLIMIT_NPROC`/`RLIMIT_NOFILE`
+    /// inherited from the host user. Rootless container runtimes (crun/runc)
+    /// invoke `setrlimit(RLIMIT_NOFILE, ...)` inside the user namespace, and
+    /// the kernel still enforces the parent's hard limit — exceeding it
+    /// triggers `setrlimit RLIMIT_NOFILE: Operation not permitted` at OCI
+    /// container start. Any user-supplied entry for the same ulimit name
+    /// overrides the default.
+    #[serde(default = "default_ulimits")]
     ulimits: Vec<String>,
 }
 
-fn default_pids_limit() -> Option<i64> {
-    Some(-1)
+fn default_pids_limit() -> i64 {
+    -1
+}
+
+/// Read the current process' hard `RLIMIT_NOFILE` from `/proc/self/limits`.
+/// Returns `None` if the file is unreadable or the value can't be parsed
+/// (e.g. non-Linux, or the entry shows `unlimited`). The caller falls back
+/// to omitting the ulimit so the runtime inherits the host default.
+fn host_nofile_hard_limit() -> Option<u64> {
+    let contents = std::fs::read_to_string("/proc/self/limits").ok()?;
+    for line in contents.lines() {
+        // Format: "Max open files   <soft>   <hard>   files"
+        let Some(rest) = line.strip_prefix("Max open files") else {
+            continue;
+        };
+        let mut cols = rest.split_whitespace();
+        let _soft = cols.next()?;
+        let hard = cols.next()?;
+        return hard.parse::<u64>().ok();
+    }
+    None
+}
+
+fn default_ulimits() -> Vec<String> {
+    let mut out = vec!["nproc=-1:-1".to_string()];
+    // Cap our preferred 1M nofile target at whatever the host user actually
+    // permits; rootless crun/runc cannot raise nofile above the inherited
+    // hard limit. If we can't probe the host (non-Linux, /proc not mounted),
+    // omit the flag and inherit the runtime's default.
+    if let Some(hard) = host_nofile_hard_limit() {
+        let target = hard.min(1_048_576);
+        out.push(format!("nofile={target}:{target}"));
+    }
+    out
+}
+
+/// Merge user-supplied ulimit entries with the defaults so the user's
+/// settings win for any ulimit name they specify, but defaults are still
+/// applied for names they didn't set.
+fn merge_ulimits(user: &[String]) -> Vec<String> {
+    fn name_of(entry: &str) -> &str {
+        entry.split('=').next().unwrap_or(entry)
+    }
+    let user_names: std::collections::HashSet<&str> = user.iter().map(|e| name_of(e)).collect();
+    let mut out: Vec<String> = user.to_vec();
+    for default in default_ulimits() {
+        if !user_names.contains(name_of(&default)) {
+            out.push(default);
+        }
+    }
+    out
 }
 
 /// Probe `PATH` for a supported container runtime, in priority order.
@@ -371,13 +430,14 @@ impl EnvironmentImpl for Container {
             // can blow past the rootless default `pids.max` and fail with
             // `fork/exec ...: resource temporarily unavailable`. Default to
             // unlimited; honour an explicit override if the user set one.
-            if let Some(limit) = self.config.pids_limit {
-                args.push("--pids-limit".to_string());
-                args.push(limit.to_string());
-            }
-            for ulimit in &self.config.ulimits {
+            args.push("--pids-limit".to_string());
+            args.push(self.config.pids_limit.to_string());
+
+            // Merge user-configured ulimits with defaults so unset names
+            // (typically `nproc`/`nofile`) still get sensible caps.
+            for ulimit in merge_ulimits(&self.config.ulimits) {
                 args.push("--ulimit".to_string());
-                args.push(ulimit.clone());
+                args.push(ulimit);
             }
             if self.user == "root" {
                 args.push("--mount".to_string());
