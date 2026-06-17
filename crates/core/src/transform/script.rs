@@ -145,21 +145,17 @@ impl TransformImpl for ScriptTransform {
                 .context(error::NotFoundSnafu { addr: dep.clone() })?;
             let id = t.get_unique_id(ctx).await?;
             trace!(component = "transform", type = "script", "staging dependency {dep} with id {id}");
-            let artifact = ctx.storage().safe_open(&id).await?;
-            for layer in artifact.layers() {
-                let reader = ctx.storage().safe_read(layer).await?;
-                match layer.media_type() {
-                    MediaType::Tar(..) | MediaType::Zip(..) => {
-                        env.unpack_stream(build_root, layer.media_type(), reader)
-                            .await?;
-                    }
-                    _ => {
-                        warn!(
-                            "skipping stage for dependency layer that we do not know how to stage"
-                        );
-                    }
-                }
-            }
+            // Use Environment::stage so decompression, archive vs file
+            // dispatch, and path_hint placement are handled uniformly
+            // (matching how sources are staged below).
+            env.stage(
+                ctx,
+                ArtifactStageOptions::builder()
+                    .id(id)
+                    .path(build_root)
+                    .build(),
+            )
+            .await?;
         }
 
         // Stage all sources in our build-root
@@ -184,7 +180,14 @@ impl TransformImpl for ScriptTransform {
         match async move {
             // Run the script in our environment
             let id = self.get_unique_id(ctx).await?;
-            let handlebars = Handlebars::new();
+            // Handlebars defaults to HTML-escaping interpolated values
+            // (`&` → `&amp;`, `<` → `&lt;`, etc.) which corrupts shell
+            // commands — e.g. `--arg url='https://h?a=1&b=2'` would render
+            // with the ampersand escaped into the generated script. The
+            // script template is producing shell, not HTML, so swap in
+            // `no_escape` to render values verbatim.
+            let mut handlebars = Handlebars::new();
+            handlebars.register_escape_fn(handlebars::no_escape);
             let vfs = Vfs::new(&id, env, log).await?;
 
             let mut script = vec![format!("#!/usr/bin/env {}", self.options.interpreter)];
@@ -224,13 +227,17 @@ impl TransformImpl for ScriptTransform {
             vfs.command("chmod", "chmod", &["+x", AsRef::<str>::as_ref(&script)])
                 .await?;
             // Run the script via the configured interpreter so the script
-            // path resolves regardless of whether `.` is in PATH.
-            vfs.command(
-                "script",
-                &self.options.interpreter,
-                &[AsRef::<str>::as_ref(&script)],
-            )
-            .await?;
+            // path resolves regardless of whether `.` is in PATH. Dispatch
+            // through the build-root vfs so the script's working directory is
+            // build-root, matching the pre-refactor behaviour where scripts
+            // could reference staged sources by build-root-relative paths.
+            build_root
+                .command(
+                    "script",
+                    &self.options.interpreter,
+                    &[AsRef::<str>::as_ref(&script)],
+                )
+                .await?;
 
             // The result of a script transform is everything put in the install-root
             let mut artifact = Artifact::builder()
