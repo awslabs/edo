@@ -13,9 +13,11 @@ use clap::Parser;
 use edo::context::Addr;
 use edo::storage::Compression;
 use edo::storage::MediaType;
+use edo::util::Reader;
+use edo_core::environment::extract_zip_stream;
 use snafu::ResultExt;
 use std::pin::Pin;
-use tokio::fs::create_dir_all;
+use tokio::fs::{File, create_dir_all};
 use tokio::io::BufReader;
 use tokio_tar::Archive;
 
@@ -42,7 +44,11 @@ impl Checkout {
         )
         .await?;
         let addr = Addr::parse(self.addr.as_str())?;
-        let transform = ctx.get_transform(&addr).unwrap();
+        let transform = ctx
+            .get_transform(&addr)
+            .ok_or_else(|| error::Error::UnknownTransform {
+                addr: addr.to_string(),
+            })?;
         let handle = ctx.get_handle();
         let id = transform.get_unique_id(&handle).await?;
         let artifact = ctx.storage().safe_open(&id).await?;
@@ -50,26 +56,69 @@ impl Checkout {
             create_dir_all(&self.output).await.context(error::IoSnafu)?;
         }
         for layer in artifact.layers() {
-            // Do different things depending on the media_type
-            let reader = BufReader::new(ctx.storage().safe_read(layer).await?);
-            match layer.media_type() {
+            let raw_reader = ctx.storage().safe_read(layer).await?;
+            let media_type = layer.media_type();
+            match media_type {
                 MediaType::Tar(compression) => {
+                    let buffered = BufReader::new(raw_reader);
                     let reader: Pin<Box<dyn tokio::io::AsyncRead>> = match compression {
-                        Compression::Bzip2 => Box::pin(BzDecoder::new(reader)),
-                        Compression::Lz4 => Box::pin(Lz4Decoder::new(reader)),
-                        Compression::Lzma => Box::pin(LzmaDecoder::new(reader)),
-                        Compression::Xz => Box::pin(XzDecoder::new(reader)),
-                        Compression::Gzip => Box::pin(GzipDecoder::new(reader)),
-                        Compression::Zstd => Box::pin(ZstdDecoder::new(reader)),
-                        _ => Box::pin(reader),
+                        Compression::Bzip2 => Box::pin(BzDecoder::new(buffered)),
+                        Compression::Lz4 => Box::pin(Lz4Decoder::new(buffered)),
+                        Compression::Lzma => Box::pin(LzmaDecoder::new(buffered)),
+                        Compression::Xz => Box::pin(XzDecoder::new(buffered)),
+                        Compression::Gzip => Box::pin(GzipDecoder::new(buffered)),
+                        Compression::Zstd => Box::pin(ZstdDecoder::new(buffered)),
+                        Compression::None => Box::pin(buffered),
                     };
                     let mut archive = Archive::new(reader);
                     archive.unpack(&self.output).await.context(error::IoSnafu)?;
                 }
+                MediaType::Zip(compression) => {
+                    // Outer compression for zip layers is unusual, but honor
+                    // it via Reader::with_decompression so the inner
+                    // async_zip stream sees a plain zip byte stream.
+                    let reader = if matches!(compression, Compression::None) {
+                        raw_reader
+                    } else {
+                        Reader::with_decompression(raw_reader, compression)
+                    };
+                    extract_zip_stream(&self.output, reader)
+                        .await
+                        .map_err(|source| error::Error::ZipExtract { source })?;
+                }
+                MediaType::File(compression) => {
+                    let filename = layer
+                        .path_hint()
+                        .clone()
+                        .unwrap_or_else(|| PathBuf::from(layer.digest().digest()));
+                    let dest = self.output.join(filename);
+                    if let Some(parent) = dest.parent() {
+                        create_dir_all(parent).await.context(error::IoSnafu)?;
+                    }
+                    let mut reader: Pin<Box<dyn tokio::io::AsyncRead>> =
+                        if matches!(compression, Compression::None) {
+                            Box::pin(raw_reader)
+                        } else {
+                            let buffered = BufReader::new(raw_reader);
+                            match compression {
+                                Compression::Bzip2 => Box::pin(BzDecoder::new(buffered)),
+                                Compression::Lz4 => Box::pin(Lz4Decoder::new(buffered)),
+                                Compression::Lzma => Box::pin(LzmaDecoder::new(buffered)),
+                                Compression::Xz => Box::pin(XzDecoder::new(buffered)),
+                                Compression::Gzip => Box::pin(GzipDecoder::new(buffered)),
+                                Compression::Zstd => Box::pin(ZstdDecoder::new(buffered)),
+                                Compression::None => unreachable!(),
+                            }
+                        };
+                    let mut file = File::create(&dest).await.context(error::IoSnafu)?;
+                    tokio::io::copy(&mut reader, &mut file)
+                        .await
+                        .context(error::IoSnafu)?;
+                }
                 value => {
-                    tracing::error!(
-                        "skipping artifact layer with media_type {value} as we do not know how to extract it"
-                    );
+                    return Err(error::Error::UnsupportedMediaType {
+                        media_type: value.to_string(),
+                    });
                 }
             }
         }

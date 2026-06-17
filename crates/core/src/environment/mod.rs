@@ -14,7 +14,7 @@ use tokio::io::{AsyncWriteExt, BufReader};
 
 /// Errors produced while extracting a zip archive into an environment.
 #[derive(Debug, Snafu)]
-#[snafu(visibility(pub(crate)))]
+#[snafu(visibility(pub))]
 pub enum ZipError {
     #[snafu(display("failed to read zip archive: {source}"))]
     Read { source: async_zip::error::ZipError },
@@ -31,7 +31,7 @@ pub enum ZipError {
 /// The `Reader` must already be decompressed at the *outer* level (zip stores
 /// per-entry compression which `async_zip` handles internally). Symlinks and
 /// directory traversal are blocked.
-pub(crate) async fn extract_zip_stream(root: &Path, reader: Reader) -> Result<(), ZipError> {
+pub async fn extract_zip_stream(root: &Path, reader: Reader) -> Result<(), ZipError> {
     use async_zip::base::read::stream::ZipFileReader;
     let buffered = BufReader::new(reader);
     let mut zip = ZipFileReader::with_tokio(buffered);
