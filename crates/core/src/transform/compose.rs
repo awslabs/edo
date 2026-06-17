@@ -11,12 +11,15 @@ use std::path::Path;
 #[derive(serde::Deserialize, Debug, Clone)]
 #[serde(deny_unknown_fields)]
 struct ComposeOptions {
+    #[serde(default)]
+    arch: Option<String>,
     depends: Vec<Addr>,
 }
 
 /// A transform that composes multiple dependency artifacts into a single output artifact.
 pub struct ComposeTransform {
     pub addr: Addr,
+    pub arch: Option<String>,
     pub depends: Vec<Addr>,
 }
 
@@ -24,10 +27,18 @@ pub struct ComposeTransform {
 impl FromElement for ComposeTransform {
     type Error = error::Error;
 
-    async fn new(element: &Element, _ctx: &Context) -> Result<Self, error::Error> {
-        let options: ComposeOptions = element.get()?;
+    async fn new(element: &Element, ctx: &Context) -> Result<Self, error::Error> {
+        let mut options: ComposeOptions = element.get()?;
+        options.arch = if options.arch.is_none()
+            && let Some(arch) = ctx.args().get("arch")
+        {
+            Some(arch.clone())
+        } else {
+            options.arch
+        };
         Ok(Self {
             addr: element.addr.clone(),
+            arch: options.arch,
             depends: options.depends,
         })
     }
@@ -54,7 +65,11 @@ impl TransformImpl for ComposeTransform {
         let hash_bytes = hash.finalize();
         let digest = base16::encode_lower(hash_bytes.as_bytes());
 
-        let id = Id::builder().name(self.addr.to_id()).digest(digest).build();
+        let id = Id::builder()
+            .name(self.addr.to_id())
+            .digest(digest)
+            .maybe_arch(self.arch.clone())
+            .build();
         trace!(component = "transform", type = "compose", "id is calculated to be {id}");
         Ok(id.clone())
     }
