@@ -89,8 +89,14 @@ impl SourceImpl for RemoteSource {
             tokio::io::copy(&mut reader, &mut writer)
                 .await
                 .context(error::IoSnafu)?;
-            // Determine the mediatype from the url
-            let media_type = MediaType::detect(url.as_str())?;
+            // Determine the mediatype from the url's filename component
+            // (ignoring query/fragment which would defeat the suffix-anchored regexes).
+            let filename = url
+                .path_segments()
+                .and_then(|segments| segments.last())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| url.path());
+            let media_type = MediaType::detect(filename)?;
             let layer = storage
                 .safe_finish_layer(
                     &writer,

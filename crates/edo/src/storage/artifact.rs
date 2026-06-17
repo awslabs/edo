@@ -102,7 +102,21 @@ pub enum MediaType {
 
 impl MediaType {
     pub fn detect(input: &str) -> StorageResult<MediaType> {
-        let (stripped, compression) = Compression::detect(input)?;
+        // Normalize compound archive suffixes that bundle tar+compression
+        // (.tgz, .tbz, .tbz2, .txz) into their expanded form so the
+        // downstream `.contains(".tar")` check classifies them correctly.
+        let normalized = if let Some(stem) = input.strip_suffix(".tgz") {
+            format!("{stem}.tar.gz")
+        } else if let Some(stem) = input.strip_suffix(".tbz2") {
+            format!("{stem}.tar.bz2")
+        } else if let Some(stem) = input.strip_suffix(".tbz") {
+            format!("{stem}.tar.bz2")
+        } else if let Some(stem) = input.strip_suffix(".txz") {
+            format!("{stem}.tar.xz")
+        } else {
+            input.to_string()
+        };
+        let (stripped, compression) = Compression::detect(&normalized)?;
         if stripped.contains(".tar") {
             Ok(MediaType::Tar(compression))
         } else if stripped.contains(".zip") {

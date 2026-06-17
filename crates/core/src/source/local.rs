@@ -70,18 +70,22 @@ impl SourceImpl for LocalSource {
             tokio::io::copy(&mut reader, &mut writer)
                 .await
                 .context(error::ReadFileSnafu)?;
-            (
-                MediaType::File(Compression::None),
-                Some(
-                    self.out.clone().unwrap_or(
-                        self.path
-                            .file_name()
-                            .map(|x| x.to_str().unwrap())
-                            .map(PathBuf::from)
-                            .unwrap(),
-                    ),
-                ),
-            )
+            // Detect the media type from the filename so local archives
+            // (.tar, .tar.gz, .tgz, .zip, ...) are extracted at stage
+            // time rather than copied verbatim.
+            let filename = self
+                .path
+                .file_name()
+                .map(|x| x.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let media_type = MediaType::detect(&filename)?;
+            let path_hint = self.out.clone().or_else(|| {
+                self.path
+                    .file_name()
+                    .map(|x| x.to_str().unwrap())
+                    .map(PathBuf::from)
+            });
+            (media_type, path_hint)
         } else {
             // We want to archive it if its a directory
             trace!(component = "source", type = "local", "archiving directory at {}", self.path.display());
