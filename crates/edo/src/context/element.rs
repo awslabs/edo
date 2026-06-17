@@ -174,7 +174,12 @@ impl Element {
     where
         T: for<'de> Deserialize<'de>,
     {
-        let object = serde_json::Value::Object(self.config.iter().map(|(k, v)| (k.clone(), v.clone())).collect());
+        let object = serde_json::Value::Object(
+            self.config
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        );
         serde_json::from_value(object).context(error::InvalidSnafu {
             kind: self.kind.clone(),
             addr: self.addr.clone(),

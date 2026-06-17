@@ -14,8 +14,8 @@ use std::{
     time::Duration,
 };
 
-use jiff::Zoned;
 use indicatif::ProgressState;
+use jiff::Zoned;
 use owo_colors::{OwoColorize, Stream};
 use parking_lot::{Mutex, MutexGuard};
 use rand::{RngExt, rng};
