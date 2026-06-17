@@ -119,6 +119,22 @@ pub enum ContextError {
         /// The unresolved source address.
         id: String,
     },
+    /// The resolver returned a vendor name that is not registered. This
+    /// usually indicates a mismatch between `[requires]` and `[vendor]`
+    /// configuration.
+    #[snafu(display(
+        "resolver picked vendor '{name}' which is not registered; add a [vendor.\"{name}\"] entry or fix the requires reference"
+    ))]
+    MissingVendor {
+        /// The vendor name reported by the resolver.
+        name: String,
+    },
+    /// The dependency resolver task panicked or was cancelled.
+    #[snafu(display("dependency resolver task failed: {source}"))]
+    ResolverJoin {
+        /// The underlying tokio join error.
+        source: tokio::task::JoinError,
+    },
     /// The block is not a vendor definition.
     #[snafu(display("block is not a vendor definition"))]
     NotVendor,
