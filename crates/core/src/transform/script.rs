@@ -227,13 +227,17 @@ impl TransformImpl for ScriptTransform {
             vfs.command("chmod", "chmod", &["+x", AsRef::<str>::as_ref(&script)])
                 .await?;
             // Run the script via the configured interpreter so the script
-            // path resolves regardless of whether `.` is in PATH.
-            vfs.command(
-                "script",
-                &self.options.interpreter,
-                &[AsRef::<str>::as_ref(&script)],
-            )
-            .await?;
+            // path resolves regardless of whether `.` is in PATH. Dispatch
+            // through the build-root vfs so the script's working directory is
+            // build-root, matching the pre-refactor behaviour where scripts
+            // could reference staged sources by build-root-relative paths.
+            build_root
+                .command(
+                    "script",
+                    &self.options.interpreter,
+                    &[AsRef::<str>::as_ref(&script)],
+                )
+                .await?;
 
             // The result of a script transform is everything put in the install-root
             let mut artifact = Artifact::builder()
