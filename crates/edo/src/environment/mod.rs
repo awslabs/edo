@@ -13,7 +13,7 @@ use super::storage::Id;
 use super::storage::Storage;
 use crate::context::Handle;
 use crate::context::Log;
-use crate::storage::ArtifactStageOptions;
+use crate::storage::{ArtifactStageOptions, MediaType};
 use crate::util::{Reader, Writer};
 use arc_handle::arc_handle;
 use async_trait::async_trait;
@@ -59,7 +59,12 @@ pub trait Environment {
 
     async fn write_bytes(&self, path: &Path, buffer: &[u8]) -> EnvResult<()>;
     async fn write_stream(&self, path: &Path, reader: Reader) -> EnvResult<()>;
-    async fn unpack_stream(&self, path: &Path, reader: Reader) -> EnvResult<()>;
+    async fn unpack_stream(
+        &self,
+        path: &Path,
+        media_type: &MediaType,
+        reader: Reader,
+    ) -> EnvResult<()>;
     async fn read_bytes(&self, path: &Path) -> EnvResult<Vec<u8>>;
     async fn read_stream(&self, path: &Path, writer: Writer) -> EnvResult<()>;
     async fn execute(&self, log: &Log, id: &Id, path: &Path, command: &str) -> EnvResult<bool>;
@@ -83,7 +88,8 @@ impl Environment {
                 } else {
                     options.path().to_path_buf()
                 };
-                self.unpack_stream(&path, reader).await?;
+                self.unpack_stream(&path, layer.media_type(), reader)
+                    .await?;
             } else {
                 // We assume path is a directory if we are writing a file we need to pick a filename
                 // we do this by seeing if a filename has been set

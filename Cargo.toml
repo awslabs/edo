@@ -9,6 +9,7 @@ arc-handle           = "1.0"
 assert_cmd           = "2"
 astral-tokio-tar     = "0.6"
 async-compression    = { version = "0.4", features = ["bzip2", "gzip", "lzma", "lz4", "tokio", "xz", "zstd"] }
+async_zip            = { version = "0.0.18", features = ["tokio", "deflate", "bzip2", "lzma", "zstd", "xz"] }
 async-recursion      = "1.1"
 async-trait          = "0.1"
 aws-config           = "1"

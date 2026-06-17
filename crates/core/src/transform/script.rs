@@ -149,8 +149,9 @@ impl TransformImpl for ScriptTransform {
             for layer in artifact.layers() {
                 let reader = ctx.storage().safe_read(layer).await?;
                 match layer.media_type() {
-                    MediaType::Tar(..) => {
-                        env.unpack_stream(build_root, reader).await?;
+                    MediaType::Tar(..) | MediaType::Zip(..) => {
+                        env.unpack_stream(build_root, layer.media_type(), reader)
+                            .await?;
                     }
                     _ => {
                         warn!(

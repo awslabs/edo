@@ -82,7 +82,7 @@ impl Source {
                 reader = Reader::with_decompression(reader, &layer.media_type().compression());
             }
             if layer.media_type().is_archive() {
-                env.unpack_stream(path, reader).await?;
+                env.unpack_stream(path, layer.media_type(), reader).await?;
             } else {
                 env.write_stream(path, reader).await?;
             }

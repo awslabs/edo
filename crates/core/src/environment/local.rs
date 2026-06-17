@@ -3,7 +3,7 @@ use dashmap::DashMap;
 use edo::context::{Context, Element, FromElement, Log};
 use edo::environment::{EnvResult, Environment, EnvironmentImpl, FarmImpl};
 use edo::record;
-use edo::storage::{Id, Storage};
+use edo::storage::{Id, MediaType, Storage};
 use edo::util::{Reader, Writer, cmd_noinput, cmd_noredirect, from_dash};
 use snafu::{ResultExt, ensure};
 use std::path::absolute;
@@ -168,21 +168,34 @@ impl EnvironmentImpl for LocalEnv {
         Ok(())
     }
 
-    async fn unpack_stream(&self, path: &Path, reader: Reader) -> EnvResult<()> {
+    async fn unpack_stream(
+        &self,
+        path: &Path,
+        media_type: &MediaType,
+        reader: Reader,
+    ) -> EnvResult<()> {
         let file_path = self.path.join(path);
         if !file_path.exists() {
             tokio::fs::create_dir_all(&file_path)
                 .await
                 .context(error::CreateDirectorySnafu)?;
         }
-        trace!(component = "environment", type = "local", "unpacking archive into {}", file_path.display());
-        let mut archive = tokio_tar::ArchiveBuilder::new(reader)
-            .set_preserve_permissions(true)
-            .build();
-        archive
-            .unpack(&file_path)
-            .await
-            .context(error::ExtractSnafu)?;
+        match media_type {
+            MediaType::Zip(..) => {
+                trace!(component = "environment", type = "local", "unpacking zip into {}", file_path.display());
+                super::extract_zip_stream(&file_path, reader).await?;
+            }
+            _ => {
+                trace!(component = "environment", type = "local", "unpacking archive into {}", file_path.display());
+                let mut archive = tokio_tar::ArchiveBuilder::new(reader)
+                    .set_preserve_permissions(true)
+                    .build();
+                archive
+                    .unpack(&file_path)
+                    .await
+                    .context(error::ExtractSnafu)?;
+            }
+        }
         Ok(())
     }
 
