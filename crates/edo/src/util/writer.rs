@@ -1,7 +1,7 @@
 use crate::storage::Compression;
 use async_compression::tokio::write::{
-    BzDecoder, BzEncoder, GzipDecoder, GzipEncoder, LzmaDecoder, LzmaEncoder, XzDecoder, XzEncoder,
-    ZstdDecoder, ZstdEncoder,
+    BzDecoder, BzEncoder, GzipDecoder, GzipEncoder, Lz4Decoder, Lz4Encoder, LzmaDecoder,
+    LzmaEncoder, XzDecoder, XzEncoder, ZstdDecoder, ZstdEncoder,
 };
 use parking_lot::Mutex;
 use std::pin::Pin;
@@ -43,7 +43,8 @@ impl Writer {
                 writer: match compression {
                     Compression::Bzip2 => Box::pin(BzEncoder::new(writer)),
                     Compression::Gzip => Box::pin(GzipEncoder::new(writer)),
-                    Compression::Lz => Box::pin(LzmaEncoder::new(writer)),
+                    Compression::Lz4 => Box::pin(Lz4Encoder::new(writer)),
+                    Compression::Lzma => Box::pin(LzmaEncoder::new(writer)),
                     Compression::Xz => Box::pin(XzEncoder::new(writer)),
                     Compression::Zstd => Box::pin(ZstdEncoder::new(writer)),
                     Compression::None => Box::pin(writer),
@@ -67,7 +68,8 @@ impl Writer {
                 writer: match compression {
                     Compression::Bzip2 => Box::pin(BzDecoder::new(writer)),
                     Compression::Gzip => Box::pin(GzipDecoder::new(writer)),
-                    Compression::Lz => Box::pin(LzmaDecoder::new(writer)),
+                    Compression::Lz4 => Box::pin(Lz4Decoder::new(writer)),
+                    Compression::Lzma => Box::pin(LzmaDecoder::new(writer)),
                     Compression::Xz => Box::pin(XzDecoder::new(writer)),
                     Compression::Zstd => Box::pin(ZstdDecoder::new(writer)),
                     Compression::None => Box::pin(writer),

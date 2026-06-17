@@ -1,6 +1,6 @@
 use async_compression::tokio::bufread::{
-    BzDecoder, BzEncoder, GzipDecoder, GzipEncoder, LzmaDecoder, LzmaEncoder, XzDecoder, XzEncoder,
-    ZstdDecoder, ZstdEncoder,
+    BzDecoder, BzEncoder, GzipDecoder, GzipEncoder, Lz4Decoder, Lz4Encoder, LzmaDecoder,
+    LzmaEncoder, XzDecoder, XzEncoder, ZstdDecoder, ZstdEncoder,
 };
 use parking_lot::Mutex;
 use std::pin::Pin;
@@ -43,7 +43,8 @@ impl Reader {
                 reader: match compression {
                     Compression::Bzip2 => Box::pin(BzEncoder::new(buffered)),
                     Compression::Gzip => Box::pin(GzipEncoder::new(buffered)),
-                    Compression::Lz => Box::pin(LzmaEncoder::new(buffered)),
+                    Compression::Lz4 => Box::pin(Lz4Encoder::new(buffered)),
+                    Compression::Lzma => Box::pin(LzmaEncoder::new(buffered)),
                     Compression::Xz => Box::pin(XzEncoder::new(buffered)),
                     Compression::Zstd => Box::pin(ZstdEncoder::new(buffered)),
                     Compression::None => Box::pin(buffered),
@@ -65,7 +66,8 @@ impl Reader {
                 reader: match compression {
                     Compression::Bzip2 => Box::pin(BzDecoder::new(buffered)),
                     Compression::Gzip => Box::pin(GzipDecoder::new(buffered)),
-                    Compression::Lz => Box::pin(LzmaDecoder::new(buffered)),
+                    Compression::Lz4 => Box::pin(Lz4Decoder::new(buffered)),
+                    Compression::Lzma => Box::pin(LzmaDecoder::new(buffered)),
                     Compression::Xz => Box::pin(XzDecoder::new(buffered)),
                     Compression::Zstd => Box::pin(ZstdDecoder::new(buffered)),
                     Compression::None => Box::pin(buffered),

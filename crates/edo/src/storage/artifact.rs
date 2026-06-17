@@ -21,8 +21,10 @@ pub enum Compression {
     Gzip,
     #[serde(rename = ".bz2", alias = ".bzip2", alias = ".bzip")]
     Bzip2,
-    #[serde(rename = ".lz4", alias = ".lzma")]
-    Lz,
+    #[serde(rename = ".lz4")]
+    Lz4,
+    #[serde(rename = ".lzma")]
+    Lzma,
     #[serde(rename = ".xz")]
     Xz,
     #[serde(other, rename = "")]
@@ -55,9 +57,13 @@ impl Compression {
         if bzip.is_match(input) {
             return Ok((split_by(input, &bzip), Compression::Bzip2));
         }
-        let lz = Regex::new(r"[\.\+]{1}(lz4|lzma)$").context(error::RegexSnafu)?;
-        if lz.is_match(input) {
-            return Ok((split_by(input, &lz), Compression::Lz));
+        let lz4 = Regex::new(r"[\.\+]{1}lz4$").context(error::RegexSnafu)?;
+        if lz4.is_match(input) {
+            return Ok((split_by(input, &lz4), Compression::Lz4));
+        }
+        let lzma = Regex::new(r"[\.\+]{1}lzma$").context(error::RegexSnafu)?;
+        if lzma.is_match(input) {
+            return Ok((split_by(input, &lzma), Compression::Lzma));
         }
         let xz = Regex::new(r"[\.\+]{1}xz$").context(error::RegexSnafu)?;
         if xz.is_match(input) {
@@ -73,7 +79,8 @@ impl fmt::Display for Compression {
             Self::Zstd => ".zst",
             Self::Gzip => ".gz",
             Self::Bzip2 => ".bz2",
-            Self::Lz => ".lz4",
+            Self::Lz4 => ".lz4",
+            Self::Lzma => ".lzma",
             Self::Xz => ".xz",
             Self::None => "",
         })
