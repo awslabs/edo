@@ -5,7 +5,7 @@ use async_compression::tokio::write::{
 };
 use parking_lot::Mutex;
 use std::pin::Pin;
-use std::rc::Rc;
+use std::sync::Arc;
 use std::task::Poll;
 use tokio::io::AsyncWrite;
 
@@ -15,14 +15,14 @@ use tokio::io::AsyncWrite;
 /// to obtain the hex-encoded content digest.
 #[derive(Clone)]
 pub struct Writer {
-    inner: Rc<Mutex<Inner>>,
+    inner: Arc<Mutex<Inner>>,
 }
 
 impl Writer {
     /// Wrap an async writer with a target name and start a fresh BLAKE3 hash.
     pub fn new(target: String, writer: impl AsyncWrite + Send + Sync + 'static) -> Self {
         Self {
-            inner: Rc::new(Mutex::new(Inner {
+            inner: Arc::new(Mutex::new(Inner {
                 writer: Box::pin(writer),
                 hash: blake3::Hasher::new(),
                 digest: None,
@@ -39,7 +39,7 @@ impl Writer {
         compression: &Compression,
     ) -> Self {
         Self {
-            inner: Rc::new(Mutex::new(Inner {
+            inner: Arc::new(Mutex::new(Inner {
                 writer: match compression {
                     Compression::Bzip2 => Box::pin(BzEncoder::new(writer)),
                     Compression::Gzip => Box::pin(GzipEncoder::new(writer)),
@@ -63,7 +63,7 @@ impl Writer {
         compression: &Compression,
     ) -> Self {
         Self {
-            inner: Rc::new(Mutex::new(Inner {
+            inner: Arc::new(Mutex::new(Inner {
                 writer: match compression {
                     Compression::Bzip2 => Box::pin(BzDecoder::new(writer)),
                     Compression::Gzip => Box::pin(GzipDecoder::new(writer)),
@@ -107,9 +107,6 @@ impl Writer {
         lock.digest.clone().unwrap_or(digest)
     }
 }
-
-unsafe impl Send for Writer {}
-unsafe impl Sync for Writer {}
 
 struct Inner {
     writer: Pin<Box<dyn AsyncWrite + Send + Sync>>,

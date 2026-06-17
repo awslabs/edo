@@ -4,7 +4,7 @@ use async_compression::tokio::bufread::{
 };
 use parking_lot::Mutex;
 use std::pin::Pin;
-use std::rc::Rc;
+use std::sync::Arc;
 use std::task::Poll;
 use tokio::io::{AsyncRead, AsyncReadExt, BufReader};
 
@@ -17,14 +17,14 @@ use crate::storage::Compression;
 /// consumed to obtain the hex-encoded digest.
 #[derive(Clone)]
 pub struct Reader {
-    inner: Rc<Mutex<Inner>>,
+    inner: Arc<Mutex<Inner>>,
 }
 
 impl Reader {
     /// Wrap an async reader, starting a fresh BLAKE3 hash.
-    pub fn new(reader: impl AsyncRead + 'static) -> Self {
+    pub fn new(reader: impl AsyncRead + Send + 'static) -> Self {
         Self {
-            inner: Rc::new(Mutex::new(Inner {
+            inner: Arc::new(Mutex::new(Inner {
                 reader: Box::pin(reader),
                 hash: blake3::Hasher::new(),
                 pos: 0,
@@ -33,10 +33,13 @@ impl Reader {
     }
 
     /// Wrap an async reader with compression enabled
-    pub fn with_compression(reader: impl AsyncRead + 'static, compression: &Compression) -> Self {
+    pub fn with_compression(
+        reader: impl AsyncRead + Send + 'static,
+        compression: &Compression,
+    ) -> Self {
         let buffered = BufReader::new(reader);
         Self {
-            inner: Rc::new(Mutex::new(Inner {
+            inner: Arc::new(Mutex::new(Inner {
                 reader: match compression {
                     Compression::Bzip2 => Box::pin(BzEncoder::new(buffered)),
                     Compression::Gzip => Box::pin(GzipEncoder::new(buffered)),
@@ -52,10 +55,13 @@ impl Reader {
     }
 
     /// Wrap an async reader with decompression enabled
-    pub fn with_decompression(reader: impl AsyncRead + 'static, compression: &Compression) -> Self {
+    pub fn with_decompression(
+        reader: impl AsyncRead + Send + 'static,
+        compression: &Compression,
+    ) -> Self {
         let buffered = BufReader::new(reader);
         Self {
-            inner: Rc::new(Mutex::new(Inner {
+            inner: Arc::new(Mutex::new(Inner {
                 reader: match compression {
                     Compression::Bzip2 => Box::pin(BzDecoder::new(buffered)),
                     Compression::Gzip => Box::pin(GzipDecoder::new(buffered)),
@@ -79,11 +85,8 @@ impl Reader {
     }
 }
 
-unsafe impl Send for Reader {}
-unsafe impl Sync for Reader {}
-
 struct Inner {
-    reader: Pin<Box<dyn AsyncRead>>,
+    reader: Pin<Box<dyn AsyncRead + Send>>,
     hash: blake3::Hasher,
     pos: usize,
 }
