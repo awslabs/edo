@@ -29,6 +29,17 @@ pub struct Project {
 }
 
 impl Project {
+    pub fn new<P: AsRef<Path>>(path: P) -> Self {
+        Self {
+            project_path: path.as_ref().to_path_buf(),
+            schema: Schema::default(),
+        }
+    }
+
+    pub fn schema_mut(&mut self) -> &mut Schema {
+        &mut self.schema
+    }
+
     /// Computes a stable digest over the schema's `requires` table.
     ///
     /// Used to invalidate `edo.lock.json` when dependency declarations
