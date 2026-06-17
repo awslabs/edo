@@ -76,7 +76,7 @@ impl EnvironmentImpl for LocalEnv {
     }
 
     async fn get_env(&self, key: &str) -> Option<String> {
-        self.env.get(key).map(|x| x.key().clone())
+        self.env.get(key).map(|x| x.value().clone())
     }
 
     async fn setup(&self, log: &Log, _storage: &Storage) -> EnvResult<()> {
