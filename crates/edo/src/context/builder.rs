@@ -160,7 +160,7 @@ impl Project {
             // resolvo runs synchronously off rayon; offload via spawn_blocking.
             let resolved = tokio::task::spawn_blocking(move || resolver.resolve(need_resolution))
                 .await
-                .unwrap()?;
+                .context(error::ResolverJoinSnafu)??;
 
             let mut lock = Lock::new(digest);
 
@@ -170,7 +170,9 @@ impl Project {
                     component = "project",
                     "resolved {addr} to {name}@{version} from vendor {vendor_name}"
                 );
-                let vendor = vendors.get(vendor_name).unwrap();
+                let vendor = vendors
+                    .get(vendor_name)
+                    .context(error::MissingVendorSnafu { name: vendor_name })?;
                 let resolved = vendor.resolve(name, version).await?;
                 lock.content_mut().insert(addr.clone(), resolved.clone());
                 self.schema.add_source(addr, &resolved);
