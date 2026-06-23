@@ -4,7 +4,7 @@
 //! image layouts. [`Storage`] orchestrates multiple [`Backend`] caches (local,
 //! source, build, output) while [`Artifact`], [`Layer`], and [`Id`] describe
 //! the data model. The default [`LocalBackend`] persists blobs on the
-//! filesystem using BLAKE3 digests.
+//! filesystem using SHA256 digests.
 //!
 //! All fallible operations return [`StorageResult`], with failures modelled by
 //! [`StorageError`].
@@ -38,7 +38,7 @@ use tracing::Instrument;
 ///
 /// Orchestrates a local cache, zero-or-more source caches (priority-ordered),
 /// an optional build cache, and an optional output cache. All layer data is
-/// content-addressed by BLAKE3 digest.
+/// content-addressed by SHA256 digest.
 #[derive(Clone)]
 pub struct Storage {
     // We protect the implementation inside an arced rwlock as we do

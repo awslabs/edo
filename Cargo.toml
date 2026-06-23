@@ -29,7 +29,6 @@ aws-sdk-s3           = { version = "1", default-features = false, features = [
 base16               = "0.2"
 base64               = "0.22"
 bimap                = "0.6"
-blake3               = "1.8"
 bon                  = "3.9"
 bytes                = "1.11"
 cfg-if               = "1.0"

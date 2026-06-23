@@ -305,12 +305,12 @@ impl Config {
     }
 }
 
-/// A BLAKE3 content digest identifying a layer's blob.
+/// A SHA256 content digest identifying a layer's blob.
 #[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct LayerDigest(String);
 
 impl LayerDigest {
-    /// Return the raw hex digest string (without the `blake3:` prefix).
+    /// Return the raw hex digest string (without the `sha256:` prefix).
     pub fn digest(&self) -> String {
         self.0.clone()
     }
@@ -318,7 +318,7 @@ impl LayerDigest {
 
 impl<'a> From<&'a str> for LayerDigest {
     fn from(value: &'a str) -> Self {
-        Self(value.strip_prefix("blake3:").unwrap_or(value).to_string())
+        Self(value.strip_prefix("sha256:").unwrap_or(value).to_string())
     }
 }
 
@@ -333,7 +333,7 @@ impl Serialize for LayerDigest {
     where
         S: serde::Serializer,
     {
-        serializer.serialize_str(&format!("blake3:{}", self.0))
+        serializer.serialize_str(&format!("sha256:{}", self.0))
     }
 }
 
@@ -343,8 +343,8 @@ impl<'de> Deserialize<'de> for LayerDigest {
         D: serde::Deserializer<'de>,
     {
         let str = String::deserialize(deserializer)?;
-        if str.starts_with("blake3:") {
-            Ok(Self(str.strip_prefix("blake3:").unwrap().to_string()))
+        if str.starts_with("sha256:") {
+            Ok(Self(str.strip_prefix("sha256:").unwrap().to_string()))
         } else {
             Err(serde::de::Error::custom(
                 "not a valid artifact layer digest",
@@ -355,7 +355,7 @@ impl<'de> Deserialize<'de> for LayerDigest {
 
 /// A single content-addressed blob within an [`Artifact`].
 ///
-/// Each layer has a media type describing its content format, a BLAKE3 digest,
+/// Each layer has a media type describing its content format, a SHA256 digest,
 /// a byte size, and an optional platform constraint. Layers are purely
 /// content-addressed; presentation hints (where to stage the blob) live on
 /// [`Config::path_hints`] so the same blob can be reused across artifacts.

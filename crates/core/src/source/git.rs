@@ -4,6 +4,7 @@ use edo::record;
 use edo::source::{SourceImpl, SourceResult};
 use edo::storage::{Artifact, Compression, Config, Id, LayerOptions, MediaType, Storage};
 use edo::util::cmd_noinput;
+use sha2::{Digest, Sha256};
 use snafu::ResultExt;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -36,7 +37,7 @@ impl SourceImpl for GitSource {
         // Fold `out` into the digest so changing the staging path
         // invalidates the cached manifest. The name is kept stable
         // (no longer embeds `out`) so the human-facing id stays clean.
-        let mut hasher = blake3::Hasher::new();
+        let mut hasher = Sha256::new();
         hasher.update(self.reference.as_bytes());
         hasher.update(
             self.out
@@ -45,7 +46,7 @@ impl SourceImpl for GitSource {
                 .unwrap_or("")
                 .as_bytes(),
         );
-        let digest = base16::encode_lower(hasher.finalize().as_bytes());
+        let digest = base16::encode_lower(hasher.finalize().as_slice());
         let id = Id::builder()
             .name(format!("{}@{}", self.url, self.reference))
             .digest(digest)

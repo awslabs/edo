@@ -29,6 +29,7 @@ use edo::{
     storage::{Artifact, ArtifactStageOptions, Compression, Config, Id, LayerOptions, MediaType},
     transform::{TransformError, TransformImpl, TransformResult, TransformStatus},
 };
+use sha2::{Digest, Sha256};
 use snafu::OptionExt;
 use std::path::{Path, PathBuf};
 
@@ -100,7 +101,7 @@ impl TransformImpl for GoVendorTransform {
     /// Computes a deterministic id from the environment address and the
     /// source's unique id. Changing either invalidates the cached output.
     async fn get_unique_id(&self, _ctx: &Handle) -> TransformResult<Id> {
-        let mut hash = blake3::Hasher::new();
+        let mut hash = Sha256::new();
         hash.update(self.environment.to_string().as_bytes());
         let source_id = self.source.get_unique_id().await?;
         hash.update(source_id.digest().as_bytes());
@@ -110,7 +111,7 @@ impl TransformImpl for GoVendorTransform {
         let digest = hash.finalize();
         let id = Id::builder()
             .name(self.addr.to_id())
-            .digest(digest.to_hex().to_lowercase())
+            .digest(base16::encode_lower(digest.as_slice()))
             .build();
         trace!(subsystem = "transform", component = "go-vendor", id = %id, "calculated id");
         Ok(id.clone())
@@ -153,6 +154,8 @@ impl TransformImpl for GoVendorTransform {
             ArtifactStageOptions::builder()
                 .id(source_id)
                 .path(build_root)
+                .extract(true)
+                .decompress(true)
                 .ignore_artifact_path(true)
                 .build(),
         )

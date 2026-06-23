@@ -93,9 +93,9 @@ impl S3Backend {
     /// Returns the S3 key prefix for blob storage.
     pub fn blob_key(&self) -> PathBuf {
         if let Some(prefix) = self.prefix.as_ref() {
-            prefix.join("blobs/blake3")
+            prefix.join("blobs/sha256")
         } else {
-            PathBuf::from("blobs/blake3")
+            PathBuf::from("blobs/sha256")
         }
     }
 

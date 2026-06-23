@@ -11,6 +11,7 @@ use ocilot::repository::Repository;
 use ocilot::uri::{Reference, RegistryUri, Uri};
 use semver::{Version, VersionReq};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use snafu::{ResultExt, ensure};
 use tokio::io::AsyncReadExt;
 
@@ -73,12 +74,12 @@ impl VendorImpl for ImageVendor {
         );
         let index = index.unwrap();
         // The actual digest that should be used, should be a merkle digest of the manifests
-        let mut hasher = blake3::Hasher::new();
+        let mut hasher = Sha256::new();
         for manifest in index.manifests().iter() {
             hasher.update(manifest.digest().as_bytes());
         }
         let hash_bytes = hasher.finalize();
-        let digest = base16::encode_lower(hash_bytes.as_bytes());
+        let digest = base16::encode_lower(hash_bytes.as_slice());
         Ok(Element::builder()
             .addr(Addr::parse(name)?)
             .kind("image")

@@ -3,6 +3,7 @@ use edo::record;
 use edo::storage::{Layer, LayerOptions};
 use futures::TryStreamExt;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use snafu::{ResultExt, ensure};
 use std::path::PathBuf;
 use tokio_util::io::StreamReader;
@@ -35,11 +36,11 @@ impl FromElement for RemoteSource {
 impl RemoteSource {
     /// Returns the bare hex digest portion of the user-supplied content
     /// reference, used as both the layer digest and the `has_local_blob`
-    /// lookup key. Catalogs strip the `blake3:` prefix consistently;
+    /// lookup key. Catalogs strip the `sha256:` prefix consistently;
     /// match that convention here.
     fn blob_digest(&self) -> &str {
         self.digest
-            .strip_prefix("blake3:")
+            .strip_prefix("sha256:")
             .unwrap_or(self.digest.as_str())
     }
 }
@@ -50,7 +51,7 @@ impl SourceImpl for RemoteSource {
         // Hash the user-supplied content digest together with `out` so a
         // change to `out` invalidates the cached *manifest*, even though
         // the blob itself is still content-addressed by `self.digest`.
-        let mut hasher = blake3::Hasher::new();
+        let mut hasher = Sha256::new();
         hasher.update(self.digest.as_bytes());
         hasher.update(
             self.out
@@ -59,7 +60,7 @@ impl SourceImpl for RemoteSource {
                 .unwrap_or("")
                 .as_bytes(),
         );
-        let manifest_digest = base16::encode_lower(hasher.finalize().as_bytes());
+        let manifest_digest = base16::encode_lower(hasher.finalize().as_slice());
         let id = Id::builder()
             .name(self.url.path().to_string())
             .digest(manifest_digest)
@@ -168,7 +169,7 @@ impl SourceImpl for RemoteSource {
                 // The remote source contract requires the blob's digest
                 // match the user-supplied `ref`. Compare against
                 // `self.digest` directly — the manifest `Id`'s digest is
-                // now `blake3(ref || out)` so it must not be used here.
+                // now `sha256(ref || out)` so it must not be used here.
                 ensure!(
                     layer.digest().digest() == blob_digest,
                     error::DigestSnafu {

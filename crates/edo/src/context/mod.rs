@@ -232,6 +232,11 @@ impl Context {
         Ok(ctx.clone())
     }
 
+    /// Return the context's project directory
+    pub fn project_dir(&self) -> &Path {
+        self.project_dir.as_path()
+    }
+
     /// Adds any project found config nodes to the config
     pub fn add_config(&self, config: &BTreeMap<String, serde_json::Value>) {
         self.config.merge(config);
@@ -466,14 +471,27 @@ impl Context {
     }
 
     /// Sets up environments and executes the build for the given transform address.
+    ///
+    /// The inline canvas is always shut down before this method returns,
+    /// regardless of which phase failed. Without this guarantee an early
+    /// `setup_environments` failure would `?`-propagate past the cleanup
+    /// and leave the tty in raw mode with a frozen canvas overlay —
+    /// the user would see the snafu error chain printed underneath but
+    /// have no functioning prompt or shell.
     pub async fn run(&self, addr: &Addr) -> ContextResult<()> {
-        self.setup_environments().await?;
-        let result = self.scheduler().run(self, addr).await;
-        // Drain the inline canvas before propagating the result so the
-        // user sees the final BuildFinished summary and the terminal is
-        // restored cleanly even on error.
+        let env_setup = self.setup_environments().await;
+        let build_result = if env_setup.is_ok() {
+            self.scheduler().run(self, addr).await
+        } else {
+            // Skip scheduling but still tear the canvas down below.
+            Ok(())
+        };
+        // Drain the inline canvas before propagating any error so the
+        // user sees the final BuildFinished summary (or the env-setup
+        // error chain) on a restored terminal.
         self.console.shutdown().await;
-        result?;
+        env_setup?;
+        build_result?;
         Ok(())
     }
 }

@@ -1183,8 +1183,8 @@ fn draw_log_view(
 /// user can drop into the shell, exit, then choose `shell` again from
 /// the same prompt.
 ///
-/// The inline viewport is fully torn down (raw mode off, alternate
-/// screen left, trailing newline) before the child process runs so the
+/// The inline viewport is fully torn down (raw mode off, viewport rows
+/// erased, trailing newline) before the child process runs so the
 /// shell sees a clean tty (U2.2) instead of overlaying the prompt rows.
 /// On return the caller's terminal is cleared so the prompt redraws
 /// from scratch (U2.3).
@@ -1203,7 +1203,17 @@ async fn run_shell(
     // stream silently emits IO errors forever.
     input.suspend();
     let _ = ct_terminal::disable_raw_mode();
-    let _ = execute!(io::stderr(), LeaveAlternateScreen, cursor::Show,);
+    // The inline viewport never enters the alternate screen — calling
+    // `LeaveAlternateScreen` here is a no-op at best and on some
+    // terminals emits a stray restore that scrolls scrollback. Instead,
+    // clear from the cursor (which ratatui parks at the top of the
+    // canvas after the last frame) to the bottom of the terminal so the
+    // shell does not paint on top of the still-rendered prompt rows
+    // (U2.2). Mirrors `restore_terminal`.
+    {
+        use ratatui::crossterm::terminal::{Clear, ClearType};
+        let _ = execute!(io::stderr(), Clear(ClearType::FromCursorDown), cursor::Show);
+    }
     {
         use std::io::Write as _;
         let mut out = io::stderr();

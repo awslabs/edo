@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use edo::record;
 use ocilot::progress::SharedProgress;
 use ocilot::{index::Index, models::Platform, uri::Uri};
+use sha2::{Digest, Sha256};
 use snafu::ResultExt;
 use snafu::ensure;
 use std::collections::BTreeSet;
@@ -61,12 +62,12 @@ impl SourceImpl for ImageSource {
         // and then handle staging as a filesystem ourself
         let index = Index::fetch(&uri).await.context(error::OciSnafu)?;
         // The actual digest that should be used, should be a merkle digest of the manifests
-        let mut hasher = blake3::Hasher::new();
+        let mut hasher = Sha256::new();
         for manifest in index.manifests().iter() {
             hasher.update(manifest.digest().as_bytes());
         }
         let hash_bytes = hasher.finalize();
-        let digest = base16::encode_lower(hash_bytes.as_bytes());
+        let digest = base16::encode_lower(hash_bytes.as_slice());
         ensure!(
             *id.digest() == digest,
             error::DigestSnafu {
