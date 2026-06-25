@@ -1,12 +1,11 @@
 use async_trait::async_trait;
 use dashmap::DashMap;
 use edo::context::{Addr, Context, FromNode, Log, Node};
-use edo::environment::{Command, EnvResult, Environment, EnvironmentImpl, FarmImpl};
+use edo::environment::{EnvResult, Environment, EnvironmentImpl, FarmImpl};
 use edo::storage::{Id, Storage};
-use edo::util::{Reader, Writer, cmd, cmd_noinput, cmd_noredirect, from_dash};
+use edo::util::{Reader, Writer, cmd_noinput, cmd_noredirect, from_dash};
 use edo::{non_configurable, record};
 use snafu::{ResultExt, ensure};
-use std::io::Cursor;
 use std::path::absolute;
 use std::path::{Path, PathBuf};
 use tokio::fs::File;
@@ -136,7 +135,23 @@ impl EnvironmentImpl for LocalEnv {
         Ok(())
     }
 
-    async fn write(&self, path: &Path, mut reader: Reader) -> EnvResult<()> {
+    async fn write_bytes(&self, path: &Path, buffer: &[u8]) -> EnvResult<()> {
+        let file_path = self.path.join(path);
+        if let Some(parent) = file_path.parent() {
+            if !parent.exists() {
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .context(error::CreateDirectorySnafu)?;
+            }
+        }
+        trace!(component = "environment", type = "local", "writing contents to file at {}", file_path.display());
+        tokio::fs::write(&file_path, buffer)
+            .await
+            .context(error::CreateFileSnafu)?;
+        Ok(())
+    }
+
+    async fn write_stream(&self, path: &Path, mut reader: Reader) -> EnvResult<()> {
         let file_path = self.path.join(path);
         if let Some(parent) = file_path.parent() {
             if !parent.exists() {
@@ -155,7 +170,7 @@ impl EnvironmentImpl for LocalEnv {
         Ok(())
     }
 
-    async fn unpack(&self, path: &Path, reader: Reader) -> EnvResult<()> {
+    async fn unpack_stream(&self, path: &Path, reader: Reader) -> EnvResult<()> {
         let file_path = self.path.join(path);
         if !file_path.exists() {
             tokio::fs::create_dir_all(&file_path)
@@ -164,7 +179,7 @@ impl EnvironmentImpl for LocalEnv {
         }
         trace!(component = "environment", type = "local", "unpacking archive into {}", file_path.display());
         let mut archive = tokio_tar::ArchiveBuilder::new(reader)
-            .set_preserve_permissions(false)
+            .set_preserve_permissions(true)
             .build();
         archive
             .unpack(&file_path)
@@ -173,7 +188,20 @@ impl EnvironmentImpl for LocalEnv {
         Ok(())
     }
 
-    async fn read(&self, path: &Path, mut writer: Writer) -> EnvResult<()> {
+    async fn read_bytes(&self, path: &Path) -> EnvResult<Vec<u8>> {
+        let file_path = self.path.join(path);
+        ensure!(
+            file_path.exists(),
+            error::NotFoundSnafu {
+                path: path.to_path_buf()
+            }
+        );
+        Ok(tokio::fs::read(&file_path)
+            .await
+            .context(error::ReadFileSnafu)?)
+    }
+
+    async fn read_stream(&self, path: &Path, mut writer: Writer) -> EnvResult<()> {
         let file_path = self.path.join(path);
         ensure!(
             file_path.exists(),
@@ -199,7 +227,7 @@ impl EnvironmentImpl for LocalEnv {
         Ok(())
     }
 
-    async fn cmd(&self, log: &Log, id: &Id, path: &Path, cmd: &str) -> EnvResult<bool> {
+    async fn execute(&self, log: &Log, id: &Id, path: &Path, cmd: &str) -> EnvResult<bool> {
         let work_dir = self.path.join(path);
         trace!(component = "environment", type = "local", "running command in {}", work_dir.display());
         async move {
@@ -215,33 +243,6 @@ impl EnvironmentImpl for LocalEnv {
         ))
         .await
         .map_err(|e| e.into())
-    }
-
-    async fn run(&self, log: &Log, id: &Id, path: &Path, command: &Command) -> EnvResult<bool> {
-        let work_dir = self.path.join(path);
-        trace!(component = "environment", type = "local", "running command in {}", work_dir.display());
-        let result = async move {
-            let script = command.to_string();
-            record!(log, "script", "sh");
-            let mut cursor = Cursor::new(script.as_bytes());
-            cmd(
-                &work_dir,
-                log,
-                "sh",
-                Vec::<String>::new(),
-                &mut cursor,
-                &from_dash(&self.env),
-            )
-            .context(error::FailedSnafu)
-        }
-        .instrument(info_span!(
-            target: "local",
-            "execute in environment",
-            id = id.to_string(),
-            log = log.log_name()
-        ))
-        .await?;
-        Ok(result)
     }
 
     fn shell(&self, path: &Path) -> EnvResult<()> {

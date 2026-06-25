@@ -107,7 +107,7 @@ impl TransformImpl for ComposeTransform {
                         //     Compression::Zstd => Box::new(ZstdDecoder::new(BufReader::new(reader))),
                         //     _ => Box::new(BufReader::new(reader)),
                         // };
-                        env.unpack(Path::new("install-root"), reader).await?;
+                        env.unpack_stream(Path::new("install-root"), reader).await?;
                     }
                     value => {
                         warn!(component = "transform", type = "compose", "skipping artifact layer we do not know how to stage: {value}");
@@ -131,7 +131,8 @@ impl TransformImpl for ComposeTransform {
             // A Compose transform combines physically all the child dependents,
             // we should add a Combine transform that just does a layer collection.
             let writer = ctx.storage().safe_start_layer().await?;
-            env.read(Path::new("install-root"), writer.clone()).await?;
+            env.read_stream(Path::new("install-root"), writer.clone())
+                .await?;
             artifact.layers_mut().push(
                 ctx.storage()
                     .safe_finish_layer(&MediaType::Tar(Compression::None), None, &writer)
