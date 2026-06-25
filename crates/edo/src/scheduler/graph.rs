@@ -38,7 +38,7 @@ use async_recursion::async_recursion;
 use bimap::BiHashMap;
 use daggy::{Dag, NodeIndex, Walker, petgraph::visit::IntoNodeReferences};
 use futures::future::try_join_all;
-use snafu::{OptionExt, ResultExt};
+use snafu::{IntoError, OptionExt, ResultExt};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     ops::Index,
@@ -240,12 +240,16 @@ impl Graph {
     /// dispatch), so we don't need ready/ready-not state — just a permit
     /// pool that throttles the network.
     pub async fn fetch(&self, ctx: &Context) -> Result<()> {
-        let mut tasks = Vec::new();
         // Attach the per-run id cache so transforms (script, compose, …)
         // and the per-node loop below all collapse repeated
         // `get_unique_id` calls onto the same memoized result.
         let ctx = ctx.get_handle().with_id_cache(self.id_cache.clone());
         let max_concurrent = self.batch_size;
+        let token = ctx.cancellation();
+        // Wall-clock so the `BuildFinished { ok: false }` event emitted
+        // on a fetch-stage failure carries a meaningful duration even
+        // though the build never reaches `Graph::run`.
+        let fetch_started_at = Instant::now();
 
         // Fetching is network-bound. We don't want to issue thousands of
         // requests in parallel, but unlike execution we also don't need to
@@ -253,16 +257,46 @@ impl Graph {
         // same time as sources for its parent. A semaphore is the simplest
         // way to cap in-flight fetches at `batch_size`.
         let semaphore = Arc::new(Semaphore::new(max_concurrent as usize));
-        for node_ref in self.graph.node_references() {
+        // Carry the addr alongside each `JoinHandle` so a failed task's
+        // address can be surfaced in the terminal `BuildFinished` event
+        // and in the console's `failed` list. `wait` collapses errors
+        // into `Child` and discards positional info; we do our own join
+        // below to preserve it.
+        let mut tasks: Vec<(Addr, JoinHandle<Result<()>>)> = Vec::new();
+        // Loop-level early-exit pathway. We can't use `?` directly on
+        // inline calls (`cached_unique_id`, `find_build`, `needs_prepare`)
+        // because that would skip the terminal `BuildFinished` emit and
+        // also abandon already-spawned tasks. Instead, capture the first
+        // synchronous error and break.
+        let mut sync_error: Option<error::SchedulerError> = None;
+        'outer: for node_ref in self.graph.node_references() {
+            // Cooperative cancellation between iterations. A peer task
+            // that just failed has already flipped the token; honour it
+            // before we issue more cache probes / spawn more downloads.
+            if token.is_cancelled() {
+                break;
+            }
             let node: Arc<Node> = node_ref.1.clone();
-            let transform = ctx.get(&node.addr).context(error::ProjectTransformSnafu {
+            let transform = match ctx.get(&node.addr).context(error::ProjectTransformSnafu {
                 addr: node.addr.clone(),
-            })?;
+            }) {
+                Ok(t) => t,
+                Err(e) => {
+                    sync_error = Some(e);
+                    break 'outer;
+                }
+            };
             // Compute the content-addressed id and stash it on the node so
             // workers in `run` can index into the build cache without
             // recomputing it. Use the memoized helper so a transitive id
             // referenced by multiple parents is hashed exactly once.
-            let id = transform.cached_unique_id(&ctx, &node.addr).await?;
+            let id = match transform.cached_unique_id(&ctx, &node.addr).await {
+                Ok(id) => id,
+                Err(e) => {
+                    sync_error = Some(e.into());
+                    break 'outer;
+                }
+            };
             node.set_id(&id);
 
             // Build cache probe. `find_build(.., true)` requires a *full*
@@ -270,68 +304,173 @@ impl Graph {
             // `cache_hit = true` will let `run`'s pre-pass cascade promote
             // this node and any cache-hit ancestors to Success without
             // ever spawning an environment.
-            if ctx.storage().find_build(&id, true).await?.is_some() {
-                node.set_cache_hit(true);
-                ctx.emit(ConsoleEvent::NodeCacheHit {
-                    addr: node.addr.clone(),
-                    id: id.clone(),
-                });
-                continue;
+            match ctx.storage().find_build(&id, true).await {
+                Ok(Some(_)) => {
+                    node.set_cache_hit(true);
+                    ctx.emit(ConsoleEvent::NodeCacheHit {
+                        addr: node.addr.clone(),
+                        id: id.clone(),
+                    });
+                    continue;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    sync_error = Some(e.into());
+                    break 'outer;
+                }
             }
             ctx.emit(ConsoleEvent::NodeQueued {
                 addr: node.addr.clone(),
                 id: Some(id.clone()),
             });
 
-            // Build-cache miss \u2014 but if the transform reports that its
+            // Build-cache miss — but if the transform reports that its
             // `prepare` step has nothing to do (e.g. every input source is
             // already in the local cache), skip the spawn entirely. We
             // still emit the `Wait` phase so the console state machine
             // matches the post-prepare path.
-            if !transform.needs_prepare(&ctx).await? {
-                ctx.emit(ConsoleEvent::NodePhase {
-                    addr: node.addr.clone(),
-                    phase: Phase::Wait,
-                });
-                continue;
+            match transform.needs_prepare(&ctx).await {
+                Ok(false) => {
+                    ctx.emit(ConsoleEvent::NodePhase {
+                        addr: node.addr.clone(),
+                        phase: Phase::Wait,
+                    });
+                    continue;
+                }
+                Ok(true) => {}
+                Err(e) => {
+                    sync_error = Some(e.into());
+                    break 'outer;
+                }
             }
 
-            let ctx = ctx.clone();
+            let task_ctx = ctx.clone();
             let node_for_task = node.clone();
+            let task_token = token.clone();
+            let addr_for_task = node.addr.clone();
             // Acquire the permit *outside* the spawn so the loop blocks
             // here when we're already at capacity. Owned permits are moved
             // into the task and released on drop.
-            let permit = semaphore
+            let permit = match semaphore
                 .clone()
                 .acquire_owned()
                 .await
                 .ok()
-                .context(error::InfallableSnafu)?;
-            tasks.push(tokio::spawn(async move {
-                let logf = ctx.log().create(format!("{id}").as_str()).await?;
-                logf.set_subject("fetch");
-                ctx.emit(ConsoleEvent::NodePhase {
-                    addr: node_for_task.addr.clone(),
-                    phase: Phase::Fetch,
-                });
-                transform.prepare(&logf, &ctx).await?;
-                // Mark the node as fetched-but-not-yet-running. Without
-                // this, the active-task table would display "FETCH" for
-                // every post-fetch node until a transform worker picks
-                // it up \u2014 which can be tens of seconds with a small
-                // batch_size against a large graph.
-                ctx.emit(ConsoleEvent::NodePhase {
-                    addr: node_for_task.addr.clone(),
-                    phase: Phase::Wait,
-                });
-                drop(logf);
-                // Explicit drop is documentation: the permit returns to
-                // the pool exactly when this task ends.
-                drop(permit);
-                Ok::<(), error::SchedulerError>(())
-            }));
+                .context(error::InfallableSnafu)
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    sync_error = Some(e);
+                    break 'outer;
+                }
+            };
+            tasks.push((
+                addr_for_task.clone(),
+                tokio::spawn(async move {
+                    // Pre-flight: skip work entirely if a peer already failed.
+                    if task_token.is_cancelled() {
+                        drop(permit);
+                        return error::CancelledSnafu.fail();
+                    }
+                    let logf = task_ctx.log().create(format!("{id}").as_str()).await?;
+                    logf.set_subject("fetch");
+                    task_ctx.emit(ConsoleEvent::NodePhase {
+                        addr: node_for_task.addr.clone(),
+                        phase: Phase::Fetch,
+                    });
+                    let prepare_result = transform.prepare(&logf, &task_ctx).await;
+                    // On *any* error in prepare, flip the token so peer
+                    // tasks abort at their next checkpoint. Without this
+                    // a single digest-mismatch on one remote source
+                    // would leave large in-flight downloads running to
+                    // completion and the canvas frozen in FETCH.
+                    if let Err(e) = prepare_result {
+                        task_token.cancel();
+                        return Err(e.into());
+                    }
+                    // Mark the node as fetched-but-not-yet-running. Without
+                    // this, the active-task table would display "FETCH" for
+                    // every post-fetch node until a transform worker picks
+                    // it up — which can be tens of seconds with a small
+                    // batch_size against a large graph.
+                    task_ctx.emit(ConsoleEvent::NodePhase {
+                        addr: node_for_task.addr.clone(),
+                        phase: Phase::Wait,
+                    });
+                    drop(logf);
+                    // Explicit drop is documentation: the permit returns to
+                    // the pool exactly when this task ends.
+                    drop(permit);
+                    Ok::<(), error::SchedulerError>(())
+                }),
+            ));
         }
-        wait(tasks).await?;
+
+        // If a synchronous step errored, flip the token so already-spawned
+        // tasks bail at their next checkpoint, then fall through to the
+        // join+emit path below. We deliberately do not `?`-return here:
+        // the terminal `BuildFinished` event must be emitted before the
+        // error propagates, otherwise the canvas state machine never
+        // transitions to `finished` and `console.shutdown()` paints an
+        // incoherent summary (stale FETCH rows).
+        if sync_error.is_some() {
+            token.cancel();
+        }
+
+        // Join every spawned task and collect per-addr failures. We use
+        // `try_join_all` only on the JoinHandle layer — inner logical
+        // errors come back as `Ok(Err(_))` and are partitioned here.
+        let (addrs, handles): (Vec<_>, Vec<_>) = tasks.into_iter().unzip();
+        let join_outcome = futures::future::join_all(handles).await;
+        let mut failures: Vec<error::SchedulerError> = Vec::new();
+        let mut failed_addrs: Vec<Addr> = Vec::new();
+        for (addr, joined) in addrs.into_iter().zip(join_outcome) {
+            match joined {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    // A real fetch failure. Cancelled peers are noise
+                    // when we already have a root cause; drop them so
+                    // the user-facing aggregate is meaningful.
+                    if !matches!(e, error::SchedulerError::Cancelled) {
+                        failed_addrs.push(addr);
+                        failures.push(e);
+                    }
+                }
+                Err(join_err) => {
+                    failed_addrs.push(addr);
+                    failures.push(error::JoinSnafu.into_error(join_err));
+                }
+            }
+        }
+
+        // Compose the final outcome. Synchronous errors take precedence
+        // (they happen *before* any task gets to run, so they're a
+        // strict root cause); fall through to spawned-task failures, and
+        // finally to cancellation if nothing else explains the exit.
+        let final_error: Option<error::SchedulerError> = if let Some(e) = sync_error {
+            Some(e)
+        } else if !failures.is_empty() {
+            Some(error::ChildSnafu { children: failures }.build())
+        } else if token.is_cancelled() {
+            Some(error::CancelledSnafu.build())
+        } else {
+            None
+        };
+
+        if let Some(e) = final_error {
+            // Drain the canvas with a definitive terminal event before
+            // bubbling up. This is the missing piece that previously
+            // left the TUI stuck on FETCH: `Context::run`'s
+            // `console.shutdown()` runs unconditionally, but without a
+            // `BuildFinished` the state machine never marks the build
+            // finished and the final-summary line is incoherent.
+            ctx.emit(ConsoleEvent::BuildFinished {
+                ok: false,
+                elapsed_ms: duration_ms(fetch_started_at.elapsed()),
+                failed: failed_addrs,
+            });
+            return Err(e);
+        }
         Ok(())
     }
 
@@ -826,11 +965,15 @@ async fn run_transform_lifecycle(
 /// Awaits all join handles, collecting successes or returning aggregated
 /// failures.
 ///
-/// Used by [`Graph::fetch`] to wait on the parallel prepare tasks.
+/// Currently unused: [`Graph::fetch`] inlines its own join+partition loop
+/// so it can pair failures with their `Addr`s for the terminal
+/// `BuildFinished` event. Kept as a building block for future bulk-join
+/// callers; remove if no second user lands.
 /// `JoinError`s (panics or cancellations of the outer task) short-circuit
 /// via `try_join_all` and propagate as [`SchedulerError::Join`]; logical
 /// errors returned by the inner futures are accumulated and surfaced as a
 /// single [`SchedulerError::Child`].
+#[allow(dead_code)]
 async fn wait<I, R>(handles: I) -> Result<Vec<R>>
 where
     R: Clone,
@@ -1243,6 +1386,171 @@ pub(crate) mod tests {
         }
     }
 
+    /// Register a mock transform whose `prepare` immediately returns Err.
+    /// Used to exercise the fetch-stage failure path.
+    pub(crate) fn register_mock_failing_prepare(
+        ctx: &Context,
+        addr_str: &str,
+        deps: &[&str],
+    ) -> MockHandles {
+        let addr = Addr::parse(addr_str).unwrap();
+        let deps_vec: Vec<Addr> = deps
+            .iter()
+            .map(|s| Addr::parse(s).expect("dep addr"))
+            .collect();
+        let env_addr = Addr::parse("//default").unwrap();
+        let digest = format!("{:064x}", fxhash(addr_str));
+        let prepare_called = Arc::new(AtomicUsize::new(0));
+        let stage_called = Arc::new(AtomicUsize::new(0));
+        let transform_called = Arc::new(AtomicUsize::new(0));
+        let max_inflight = Arc::new(AtomicUsize::new(0));
+        let order = Arc::new(std::sync::Mutex::new(Vec::<Addr>::new()));
+
+        let mut m = MockTransformImpl::new();
+        {
+            let env_addr = env_addr.clone();
+            m.expect_environment()
+                .returning(move || Ok(env_addr.clone()));
+        }
+        {
+            let addr = addr.clone();
+            let digest = digest.clone();
+            m.expect_get_unique_id().returning(move |_ctx| {
+                Ok(Id::builder()
+                    .name(addr.to_string())
+                    .digest(digest.clone())
+                    .build())
+            });
+        }
+        m.expect_depends().returning(move || Ok(deps_vec.clone()));
+        m.expect_needs_prepare().returning(|_ctx| Ok(true));
+        {
+            let prepare_called = prepare_called.clone();
+            m.expect_prepare().returning(move |_log, _ctx| {
+                prepare_called.fetch_add(1, AtomicOrdering::SeqCst);
+                Err(crate::transform::TransformError::Implementation {
+                    source: Box::new(std::io::Error::other("mock prepare failure")),
+                })
+            });
+        }
+        m.expect_stage().returning(|_log, _ctx, _env| Ok(()));
+        {
+            let digest_for_status = digest.clone();
+            m.expect_transform().returning(move |_log, _ctx, _env| {
+                TransformStatus::Success(make_artifact(&digest_for_status))
+            });
+        }
+        m.expect_can_shell().return_const(false);
+        m.expect_shell().returning(|_env| Ok(()));
+        ctx.insert_transform_for_test(&addr, Transform::new(m));
+        MockHandles {
+            addr,
+            prepare_called,
+            stage_called,
+            transform_called,
+            max_inflight,
+            order_log: order,
+        }
+    }
+
+    /// Register a mock whose `prepare` polls the context's cancellation
+    /// token in a tight loop, so a peer's failure cancels it promptly.
+    /// `bail_count` is bumped if the cancellation path was taken;
+    /// `completed_count` is bumped only when the (impossibly long) sleep
+    /// ran to the end without observing cancellation.
+    pub(crate) fn register_mock_cancellable_prepare(
+        ctx: &Context,
+        addr_str: &str,
+        bail_count: Arc<AtomicUsize>,
+        completed_count: Arc<AtomicUsize>,
+    ) -> MockHandles {
+        let addr = Addr::parse(addr_str).unwrap();
+        let env_addr = Addr::parse("//default").unwrap();
+        let digest = format!("{:064x}", fxhash(addr_str));
+        let prepare_called = Arc::new(AtomicUsize::new(0));
+        let stage_called = Arc::new(AtomicUsize::new(0));
+        let transform_called = Arc::new(AtomicUsize::new(0));
+        let max_inflight = Arc::new(AtomicUsize::new(0));
+        let order = Arc::new(std::sync::Mutex::new(Vec::<Addr>::new()));
+
+        let mut m = MockTransformImpl::new();
+        {
+            let env_addr = env_addr.clone();
+            m.expect_environment()
+                .returning(move || Ok(env_addr.clone()));
+        }
+        {
+            let addr = addr.clone();
+            let digest = digest.clone();
+            m.expect_get_unique_id().returning(move |_ctx| {
+                Ok(Id::builder()
+                    .name(addr.to_string())
+                    .digest(digest.clone())
+                    .build())
+            });
+        }
+        m.expect_depends().returning(|| Ok(Vec::new()));
+        m.expect_needs_prepare().returning(|_ctx| Ok(true));
+        {
+            let prepare_called = prepare_called.clone();
+            let bail = bail_count.clone();
+            let done = completed_count.clone();
+            m.expect_prepare().returning(move |_log, ctx| {
+                prepare_called.fetch_add(1, AtomicOrdering::SeqCst);
+                let token = ctx.cancellation();
+                let bail = bail.clone();
+                let done = done.clone();
+                // The mock's `prepare` is sync-returning (it's not an
+                // async-trait shim here), so do a brief blocking spin.
+                // 1s is plenty for a sibling task to fail and cancel.
+                let deadline = std::time::Instant::now()
+                    + std::time::Duration::from_secs(1);
+                while std::time::Instant::now() < deadline {
+                    if token.is_cancelled() {
+                        bail.fetch_add(1, AtomicOrdering::SeqCst);
+                        return Err(crate::transform::TransformError::Implementation {
+                            source: Box::new(std::io::Error::other("cancelled")),
+                        });
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                done.fetch_add(1, AtomicOrdering::SeqCst);
+                Ok(())
+            });
+        }
+        m.expect_stage().returning(|_log, _ctx, _env| Ok(()));
+        {
+            let digest_for_status = digest.clone();
+            m.expect_transform().returning(move |_log, _ctx, _env| {
+                TransformStatus::Success(make_artifact(&digest_for_status))
+            });
+        }
+        m.expect_can_shell().return_const(false);
+        m.expect_shell().returning(|_env| Ok(()));
+        ctx.insert_transform_for_test(&addr, Transform::new(m));
+        MockHandles {
+            addr,
+            prepare_called,
+            stage_called,
+            transform_called,
+            max_inflight,
+            order_log: order,
+        }
+    }
+
+    /// Console sink that captures every event into a shared Vec.
+    /// Lets tests assert on the canvas event stream (e.g. that
+    /// `BuildFinished { ok: false }` is emitted on the fetch failure
+    /// path) without standing up a real renderer.
+    pub(crate) struct CaptureSink {
+        pub events: Arc<std::sync::Mutex<Vec<crate::console::ConsoleEvent>>>,
+    }
+    impl crate::console::Sink for CaptureSink {
+        fn handle(&self, event: &crate::console::ConsoleEvent) {
+            self.events.lock().unwrap().push(event.clone());
+        }
+    }
+
     /// Tiny non-cryptographic hash used only to generate stable digest
     /// strings so each mock ends up with a distinct `Id`.
     fn fxhash(s: &str) -> u128 {
@@ -1405,6 +1713,95 @@ pub(crate) mod tests {
             0,
             "prepare must not be called when needs_prepare returned false"
         );
+    }
+
+    /// Regression: a fetch-stage `prepare` failure on one node must
+    ///   1. surface as a `SchedulerError::Child` from `Graph::fetch`,
+    ///   2. emit a terminal `ConsoleEvent::BuildFinished { ok: false }`
+    ///      so the TUI state machine transitions out of "in-progress",
+    ///   3. cancel peer prepare tasks so they don't run to completion.
+    ///
+    /// Without (2) the canvas stayed stuck on FETCH after a remote
+    /// source's digest-mismatch failure (the symptom that prompted this
+    /// test). Without (3) a slow peer download kept the TUI frozen long
+    /// after the real error was known.
+    #[tokio::test]
+    #[serial_test::serial(log_manager)]
+    async fn graph_fetch_failure_emits_build_finished_and_cancels_peers() {
+        let ctx = ctx_or_skip!();
+        ensure_default_farm(&ctx);
+
+        // Capture every console event so we can scan for BuildFinished.
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        ctx.console().add_sink(CaptureSink {
+            events: events.clone(),
+        });
+
+        let bail = Arc::new(AtomicUsize::new(0));
+        let done = Arc::new(AtomicUsize::new(0));
+
+        // One sibling fails fast in prepare; the other spins in prepare
+        // observing the cancellation token. Both are roots — no edges
+        // between them — so the scheduler will spawn them in parallel.
+        let h_fail = register_mock_failing_prepare(&ctx, "//gfail/fail", &[]);
+        let h_slow =
+            register_mock_cancellable_prepare(&ctx, "//gfail/slow", bail.clone(), done.clone());
+
+        // Wrap both in a common root so `add`/`fetch` walk both.
+        // The root itself reports `needs_prepare = false` so it won't
+        // race the failing-sibling task; we only want to expose the
+        // siblings to fetch.
+        let root_handles =
+            register_mock_no_prepare(&ctx, "//gfail/root", &["//gfail/fail", "//gfail/slow"]);
+
+        let mut g = Graph::new(4);
+        g.add(&ctx, &Addr::parse("//gfail/root").unwrap())
+            .await
+            .unwrap();
+        let err = g.fetch(&ctx).await.expect_err("fetch must fail");
+        assert!(
+            matches!(err, error::SchedulerError::Child { .. }),
+            "fetch should surface aggregated child error, got {err:?}",
+        );
+
+        // The peer must NOT have run its prepare to completion. Two
+        // valid post-conditions, both proving cancellation worked:
+        //   - never spawned (loop saw cancellation between iterations); or
+        //   - spawned and bailed via the in-task cancellation check.
+        // Either way, `done` (the "ran to completion" counter) stays 0.
+        assert_eq!(
+            done.load(AtomicOrdering::SeqCst),
+            0,
+            "cancellable prepare must not run to completion after peer failure",
+        );
+        let bail_n = bail.load(AtomicOrdering::SeqCst);
+        let started_n = h_slow.prepare_called.load(AtomicOrdering::SeqCst);
+        assert!(
+            bail_n == started_n,
+            "every started prepare must have bailed via cancellation \
+             (started={started_n}, bailed={bail_n})",
+        );
+
+        // A terminal BuildFinished with ok=false must have been emitted
+        // so the canvas state machine transitions out of "in-progress".
+        let evs = events.lock().unwrap();
+        let final_event = evs.iter().rev().find_map(|ev| match ev {
+            crate::console::ConsoleEvent::BuildFinished { ok, failed, .. } => {
+                Some((*ok, failed.clone()))
+            }
+            _ => None,
+        });
+        let (ok, failed) = final_event.expect("fetch must emit BuildFinished on failure");
+        assert!(!ok, "BuildFinished.ok must be false on fetch failure");
+        // The failing prepare's addr must appear in `failed`. The
+        // cancelled peer is intentionally elided (its `Cancelled`
+        // error is noise relative to the real root cause).
+        assert!(
+            failed.contains(&h_fail.addr),
+            "failed list must include the failing addr; got {failed:?}",
+        );
+        let _ = h_slow.addr;
+        let _ = root_handles.addr;
     }
 
     #[tokio::test]

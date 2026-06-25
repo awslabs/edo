@@ -273,6 +273,27 @@ impl Context {
         )
     }
 
+    /// Creates a read-only [`Handle`] snapshot for use by transforms during execution with an argument override
+    pub fn get_handle_with_args(&self, args: HashMap<String, String>) -> Handle {
+        let mut merged: HashMap<String, String> = self.args.clone();
+        merged.extend(args);
+        Handle::new(
+            self.log.clone(),
+            self.console.clone(),
+            self.config.clone(),
+            self.storage.clone(),
+            self.transforms
+                .iter()
+                .map(|x| (x.key().clone(), x.value().clone()))
+                .collect(),
+            self.farms
+                .iter()
+                .map(|x| (x.key().clone(), x.value().clone()))
+                .collect(),
+            merged,
+        )
+    }
+
     /// Returns a reference to the loaded configuration.
     pub fn config(&self) -> &Config {
         &self.config
