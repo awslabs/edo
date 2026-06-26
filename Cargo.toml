@@ -1,17 +1,17 @@
 [workspace]
 resolver        = "2"
 members         = ["crates/cli", "crates/core", "crates/edo", "tests"]
-exclude         = [".edo/", "examples/", "tests/error_fixtures/", "tests/fixtures/", "tests/net_fixtures/", "tests/net_fixtures"]
+exclude         = [".edo/", "examples/", "tests/error_fixtures/", "tests/fixtures/", "tests/net_fixtures", "tests/net_fixtures/"]
 default-members = ["crates/cli"]
 
 [workspace.dependencies]
 arc-handle           = "1.0"
 assert_cmd           = "2"
 astral-tokio-tar     = "0.6"
-async-compression    = { version = "0.4", features = ["bzip2", "gzip", "lzma", "lz4", "tokio", "xz", "zstd"] }
-async_zip            = { version = "0.0.18", features = ["tokio", "deflate", "bzip2", "lzma", "zstd", "xz"] }
+async-compression    = { version = "0.4", features = ["bzip2", "gzip", "lz4", "lzma", "tokio", "xz", "zstd"] }
 async-recursion      = "1.1"
 async-trait          = "0.1"
+async_zip            = { version = "0.0.18", features = ["bzip2", "deflate", "lzma", "tokio", "xz", "zstd"] }
 aws-config           = "1"
 aws-credential-types = "1"
 aws-sdk-ecr          = { version = "1", default-features = false, features = [
@@ -33,17 +33,17 @@ bon                  = "3.9"
 bytes                = "1.11"
 cfg-if               = "1.0"
 clap                 = { version = "4.6", features = ["derive"] }
+crossterm            = { version = "0.29", features = ["event-stream"] }
 daggy                = "0.9"
 dashmap              = { version = "6.1", features = ["serde"] }
-dialoguer            = "0.12"
 duct                 = "1"
+flume                = "0.12"
 futures              = "0.3"
 futures-util         = "0.3"
 handlebars           = "6.4"
 home                 = "0.5"
 indexmap             = "2.14"
-indicatif            = "0.18"
-jiff                 = "0.2"
+jiff                 = { version = "0.2", features = ["serde"] }
 keyring              = "3.6"
 merkle_hash          = "3.8"
 mockall              = "0.14"
@@ -54,6 +54,7 @@ owo-colors           = { version = "4.3", features = ["supports-colors"] }
 parking_lot          = { version = "0.12", features = ["send_guard"] }
 predicates           = "3"
 rand                 = "0.10"
+ratatui              = { version = "0.30", features = ["scrolling-regions"] }
 rayon                = "1.12"
 regex                = "1.12"
 reqwest              = { version = "0.13", default-features = false, features = ["json", "stream"] }
@@ -70,8 +71,8 @@ tokio                = { version = "1.52", features = ["full", "parking_lot", "r
 tokio-util           = "0.7"
 toml                 = "1"
 tracing              = "0.1"
-tracing-indicatif    = { version = "0.3" }
-tracing-subscriber   = { version = "0.3", features = ["env-filter"] }
+tracing-appender     = "0.2"
+tracing-subscriber   = { version = "0.3", features = ["env-filter", "json"] }
 url                  = { version = "2.5", features = ["serde"] }
 uuid                 = { version = "1", features = ["v7"] }
 which                = "8"

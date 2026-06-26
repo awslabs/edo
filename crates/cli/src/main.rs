@@ -54,8 +54,38 @@ pub struct Args {
     config: Option<PathBuf>,
     #[arg(short, long)]
     storage: Option<PathBuf>,
+    /// Console rendering mode. Retained for backwards-compatible CLI
+    /// invocation but currently a no-op — the new tui has a single
+    /// fixed rendering path. Valid values: auto, full, simple, none.
+    #[arg(long, default_value = "auto")]
+    #[allow(dead_code)]
+    console_mode: String,
+    /// Path to the JSONL build-event log; pass `none` to disable.
+    /// Defaults to `<storage>/events.jsonl`.
+    #[arg(long, default_value = "default")]
+    event_log: String,
     #[clap(subcommand)]
     command: Commands,
+}
+
+impl Args {
+    /// Resolve the user-supplied `--event-log` argument to an absolute
+    /// path (or `None` if disabled).
+    pub fn resolve_event_log(&self) -> Option<PathBuf> {
+        if self.event_log.eq_ignore_ascii_case("none") {
+            return None;
+        }
+        if self.event_log != "default" {
+            return Some(PathBuf::from(&self.event_log));
+        }
+        // Default: <storage>/events.jsonl. When `--storage` is not set,
+        // fall back to ./.edo/events.jsonl.
+        let base = self
+            .storage
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(".edo"));
+        Some(base.join("events.jsonl"))
+    }
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -72,12 +102,29 @@ enum Commands {
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    match args.clone().command {
-        Commands::Checkout(cmd) => cmd.run(args.clone()).await?,
-        Commands::Run(cmd) => cmd.run(args.clone()).await?,
-        Commands::Prune(cmd) => cmd.run(args.clone()).await?,
-        Commands::Update(cmd) => cmd.run(args.clone()).await?,
-        Commands::List(cmd) => cmd.run(args.clone()).await?,
+    // Every subcommand installs the TUI console via `create_context`,
+    // but historically only `Run` also tore it down (via
+    // `Context::run`). The other four (`Checkout`, `Prune`, `Update`,
+    // `List`) exited with raw mode still enabled and the ratatui
+    // inline viewport not unwound, leaving the user's terminal
+    // unusable (no key echo, cursor hidden). Ditto for any error path
+    // out of `Run` before `Context::run()` runs — a failure in
+    // `create_context` or address parsing would bypass the shutdown.
+    //
+    // Guarantee shutdown here at the top level: run the subcommand,
+    // capture its result, then unconditionally drain the console. The
+    // `UI::Drop` impl is a further safety net for panic / cancellation
+    // paths, but this is the primary handoff.
+    let result = match args.clone().command {
+        Commands::Checkout(cmd) => cmd.run(args.clone()).await,
+        Commands::Run(cmd) => cmd.run(args.clone()).await,
+        Commands::Prune(cmd) => cmd.run(args.clone()).await,
+        Commands::Update(cmd) => cmd.run(args.clone()).await,
+        Commands::List(cmd) => cmd.run(args.clone()).await,
+    };
+    if let Some(c) = edo::ui::Console::global() {
+        c.shutdown().await;
     }
+    result?;
     Ok(())
 }

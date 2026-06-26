@@ -1,9 +1,9 @@
 schema-version = "1"
 
 [source.src]
-kind       = "local"
-path       = "go_src"
-out        = "."
+kind = "local"
+path = "go_src"
+out  = "."
 
 [transform.vendor]
 kind   = "go-vendor"

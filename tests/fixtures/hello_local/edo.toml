@@ -1,9 +1,9 @@
 schema-version = "1"
 
 [source.pkg]
-kind       = "local"
-path       = "hello_local/files"
-out        = "."
+kind = "local"
+path = "hello_local/files"
+out  = "."
 
 [transform.emit]
 kind   = "import"

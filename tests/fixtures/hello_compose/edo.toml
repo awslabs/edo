@@ -1,14 +1,14 @@
 schema-version = "1"
 
 [source.left_src]
-kind       = "local"
-path       = "hello_compose/left"
-out        = "."
+kind = "local"
+path = "hello_compose/left"
+out  = "."
 
 [source.right_src]
-kind       = "local"
-path       = "hello_compose/right"
-out        = "."
+kind = "local"
+path = "hello_compose/right"
+out  = "."
 
 [transform.left]
 kind   = "import"

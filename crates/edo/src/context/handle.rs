@@ -129,6 +129,11 @@ impl Handle {
         &self.log
     }
 
+    /// Returns the global tui console, if installed.
+    pub fn console(&self) -> Option<&'static crate::ui::Console> {
+        crate::ui::Console::global()
+    }
+
     /// Returns a reference to the storage backend.
     pub fn storage(&self) -> &Storage {
         &self.storage

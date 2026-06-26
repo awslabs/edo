@@ -48,17 +48,24 @@ impl SourceImpl for GitSource {
         );
         let digest = base16::encode_lower(hasher.finalize().as_slice());
         let id = Id::builder()
-            .name(format!("{}@{}", self.url, self.reference))
+            .name(format!(
+                "{}@{}-{:?}",
+                self.url,
+                self.reference,
+                self.out
+                    .as_ref()
+                    .and_then(|x| x.to_str())
+                    .unwrap_or_default()
+            ))
             .digest(digest)
             .build();
-        trace!(component = "source", type = "git", "calculated id to be {id}");
+        trace!(subsystem = "source", component = "git", id = %id, "calculated id");
         Ok(id)
     }
 
     async fn fetch(&self, log: &Log, storage: &Storage) -> SourceResult<Artifact> {
         let id = self.get_unique_id().await?;
         let id_s = id.to_string();
-        trace!(component = "source", type = "git", "cloning git repository: git clone -b {} {}", self.reference, self.url);
         record!(log, "clone", "git clone -b {} {}", self.reference, self.url);
         async move {
             let temp = tempdir().context(error::TempDirectorySnafu)?;
@@ -122,10 +129,12 @@ impl SourceImpl for GitSource {
             Ok(artifact.clone())
         }
         .instrument(info_span!(
-            "fetching",
-            id = id_s,
-            log = log.log_name(),
-            component = "source"
+            "source-fetch",
+            subsystem = "source",
+            component = "git",
+            id = %id_s,
+            url = %self.url,
+            reference = %self.reference
         ))
         .await
     }

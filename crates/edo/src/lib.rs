@@ -4,6 +4,7 @@ pub mod scheduler;
 pub mod source;
 pub mod storage;
 pub mod transform;
+pub mod ui;
 pub mod util;
 
 #[macro_use]

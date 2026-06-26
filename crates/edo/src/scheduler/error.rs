@@ -1,7 +1,7 @@
 //! Error types for the scheduler subsystem.
 
 use snafu::Snafu;
-use tokio::{sync::mpsc::error::SendError, task::JoinError};
+use tokio::task::JoinError;
 
 use crate::context::Addr;
 
@@ -25,8 +25,6 @@ pub enum SchedulerError {
     },
     #[snafu(display("failed to build execution graph: {source}"))]
     Graph { source: daggy::WouldCycle<String> },
-    #[snafu(display("failed to prompt user: {source}"))]
-    Inquire { source: dialoguer::Error },
     #[snafu(display("FATAL: infallible error occured in scheduler"))]
     Infallable,
     #[snafu(display("io error: {source}"))]
@@ -47,7 +45,7 @@ pub enum SchedulerError {
     ProjectTransform { addr: Addr },
     #[snafu(display("failed to signal task completion: {source}"))]
     Signal {
-        source: SendError<daggy::NodeIndex<u32>>,
+        source: flume::SendError<daggy::NodeIndex<u32>>,
     },
     #[snafu(display("could not await on a result from a non-building node"))]
     State,

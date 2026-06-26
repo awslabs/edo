@@ -73,7 +73,12 @@ impl TransformImpl for ComposeTransform {
             .digest(digest)
             .maybe_arch(self.arch.clone())
             .build();
-        trace!(component = "transform", type = "compose", "id is calculated to be {id}");
+        trace!(
+            subsystem = "transform",
+            component = "compose",
+            id = %id,
+            "calculated id"
+        );
         Ok(id.clone())
     }
 

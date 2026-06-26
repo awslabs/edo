@@ -25,6 +25,7 @@ use super::{
     transform::Transform,
 };
 use crate::storage::{Backend, LocalBackend, Storage};
+use crate::ui;
 use dashmap::DashMap;
 use serde_json::json;
 use snafu::ResultExt;
@@ -43,7 +44,12 @@ pub mod error;
 mod handle;
 mod lock;
 mod log;
-mod logmgr;
+// Widened from private `mod` to `pub(crate)` so `#[cfg(test)]` code in
+// sibling modules (currently `crate::source::tests`) can reach
+// `logmgr::test_support::shared_log_manager`. Non-test callers should
+// keep going through the `LogManager` re-export below rather than
+// touching `logmgr::` directly.
+pub(crate) mod logmgr;
 mod registry;
 mod schema;
 
@@ -70,6 +76,18 @@ pub use logmgr::*;
 pub use registry::*;
 /// Re-exports the typed-schema types ([`Schema`], [`Requirement`]).
 pub use schema::*;
+
+/// Configuration for the build-event console.
+///
+/// Retained as a stub so existing call sites continue to compile during
+/// the migration to the new `tui` module. The new tui has a single
+/// fixed rendering mode and no JSONL sink; this struct's fields are
+/// kept for API compatibility but are otherwise inert.
+#[derive(Clone, Debug, Default)]
+pub struct ConsoleConfig {
+    /// Path to the JSONL event log. Currently unused by the tui.
+    pub event_log: Option<PathBuf>,
+}
 
 /// Convenience alias for `Result<T, ContextError>`.
 pub type ContextResult<T> = std::result::Result<T, error::ContextError>;
@@ -117,6 +135,7 @@ impl Context {
         config: Option<ConfigPath>,
         args: HashMap<String, String>,
         verbosity: LogVerbosity,
+        _console_cfg: ConsoleConfig,
     ) -> ContextResult<Self>
     where
         ProjectPath: AsRef<Path>,
@@ -131,13 +150,52 @@ impl Context {
         if !path.exists() {
             create_dir_all(&path).await.context(error::IoSnafu)?;
         }
+        debug!(
+            subsystem = "context",
+            component = "project",
+            op = "init",
+            "determined project edo target path to be: {path:?}",
+        );
         // Logs should be in a project specific folder, so they
         // do not clash with other project workspaces.
         let log_path = path.join("logs");
         let log = LogManager::init(&log_path, verbosity).await?;
+        // Install the global tui console exactly once per process.
+        // Subsequent `Context::init` calls (e.g. in tests) become a
+        // no-op so the UI task isn't spawned twice. `install` returns
+        // `Err(console)` if the slot is already taken — a second
+        // `Console::new` spawned an App task we now have to unwind. We
+        // shut it down synchronously so its raw-mode toggle doesn't
+        // stomp on the incumbent's viewport.
+        if ui::CONSOLE.get().is_none()
+            && let Err(dup) = ui::Console::new().install()
+        {
+            // Lost the race with a concurrent Context::init. Drain the
+            // App task we spawned so it doesn't linger.
+            trace!(
+                subsystem = "context",
+                component = "project",
+                op = "init",
+                "lost the race with concurrent Context::init"
+            );
+            dup.shutdown().await;
+        }
         // Load the configuration
         let config = Config::load(config).await?;
+        debug!(
+            subsystem = "context",
+            component = "project",
+            op = "init",
+            "loaded edo configuration"
+        );
+
         // Initialize the storage with the default local cache
+        debug!(
+            subsystem = "context",
+            component = "project",
+            op = "init",
+            "initializing edo-local-cache and storage engine"
+        );
         let local_backend_addr = Addr::parse("//edo-local-cache")?;
         let storage = Storage::init(&Backend::new(
             LocalBackend::new(
@@ -245,6 +303,11 @@ impl Context {
         &self.log
     }
 
+    /// Returns the global tui console handle, if installed.
+    pub fn console(&self) -> Option<&'static ui::Console> {
+        ui::Console::global()
+    }
+
     /// Returns a reference to the execution scheduler.
     pub fn scheduler(&self) -> &Scheduler {
         &self.scheduler
@@ -266,9 +329,12 @@ impl Context {
     /// based on the address.
     pub async fn add_cache(&self, addr: &Addr, element: &Element) -> ContextResult<()> {
         debug!(
-            section = "context",
-            component = "context",
-            "adding a storage backend {addr}"
+            subsystem = "context",
+            component = "project",
+            op = "add-cache",
+            addr = %addr,
+            kind = %element.kind,
+            "adding a storage backend"
         );
         let backend = if element.kind == "local" || element.kind == "edo:local" {
             Backend::new(LocalBackend::new(element, self.config()).await?)
@@ -294,10 +360,12 @@ impl Context {
     /// Creates and registers a transform from the given node using the appropriate plugin.
     pub async fn add_transform(&self, element: &Element) -> ContextResult<()> {
         debug!(
-            section = "context",
-            component = "context",
-            "adding a transform {}",
-            element.addr,
+            subsystem = "context",
+            component = "project",
+            op = "add-transform",
+            addr = %element.addr,
+            kind = %element.kind,
+            "adding a transform"
         );
         self.transforms.insert(
             element.addr.clone(),
@@ -324,10 +392,12 @@ impl Context {
     /// Creates and registers an environment farm from the given node using the appropriate plugin.
     pub async fn add_farm(&self, element: &Element) -> ContextResult<()> {
         debug!(
-            section = "context",
-            component = "context",
-            "adding a farm {}",
-            element.addr,
+            subsystem = "context",
+            component = "project",
+            op = "add-farm",
+            addr = %element.addr,
+            kind = %element.kind,
+            "adding a farm"
         );
         // If we get here use the core plugin
         self.farms.insert(
@@ -340,10 +410,12 @@ impl Context {
     /// Creates a source fetcher from the given node using the appropriate plugin.
     pub async fn add_source(&self, element: &Element) -> ContextResult<Source> {
         debug!(
-            section = "context",
-            component = "context",
-            "adding a source {}",
-            element.addr,
+            subsystem = "context",
+            component = "project",
+            op = "add-source",
+            addr = %element.addr,
+            kind = %element.kind,
+            "adding a source"
         );
         let result = self.registry().source(element, self).await?;
         Ok(result)
@@ -351,6 +423,14 @@ impl Context {
 
     /// Creates a dependency vendor from the given node using the appropriate plugin.
     pub async fn add_vendor(&self, element: &Element) -> ContextResult<Vendor> {
+        debug!(
+            subsystem = "context",
+            component = "project",
+            op = "add-vendor",
+            addr = %element.addr,
+            kind = %element.kind,
+            "adding a vendor"
+        );
         let result = self.registry().vendor(element, self).await?;
         Ok(result)
     }
@@ -364,15 +444,59 @@ impl Context {
         // Run the initial setup for environments
         let log = self.log.create("setup").await?;
         log.set_subject("environment-setup");
+
+        // Provenance: surface farm-setup as its own pre-build phase so
+        // the canvas / JSONL log show what's happening between
+        // `ProjectLoaded` and `BuildStarted`. Container farms in
+        // particular can spend significant time here pulling images and
+        // loading them into the runtime; without these events the UI
+        // shows a blank screen for that whole window.
+        let total = self.farms.len();
+        crate::ui_info!(
+            subsystem  = "context",
+            component = "project",
+            op = "setup-environment";
+            "setting up {total} environment(s)"
+        );
+
         for entry in self.farms.iter() {
-            entry
+            let addr = entry.key().clone();
+            let id = addr.to_string();
+            crate::ui_start_task!(
+                subsystem = "context",
+                component = "project",
+                op = "setup-environment";
+                &id,
+                ui::UiTaskStatus::Running,
+                None
+            );
+            let result = entry
                 .setup(&log, self.storage())
                 .instrument(info_span!(
-                    target: "context",
-                    "setting up environment",
-                    addr = entry.key().to_string()
+                    "env-setup",
+                    subsystem = "environment",
+                    addr = %addr
                 ))
-                .await?;
+                .await;
+            let status = if result.is_ok() {
+                ui::UiTaskStatus::Success
+            } else {
+                ui::UiTaskStatus::Failed
+            };
+            crate::ui_update_task!(
+                subsystem = "context",
+                component = "project",
+                op = "setup-environment";
+                &id,
+                status,
+                None
+            );
+            // Emit the phase-end event before propagating the error so
+            // sinks see a balanced started/finished pair even on
+            // failure. The build won't start in this case.
+            if let Err(e) = result {
+                return Err(e.into());
+            }
         }
         Ok(())
     }
@@ -393,6 +517,12 @@ impl Context {
             // Skip scheduling but still tear the canvas down below.
             Ok(())
         };
+        // Drain the inline canvas before propagating any error so the
+        // user sees the final BuildFinished summary (or the env-setup
+        // error chain) on a restored terminal.
+        if let Some(c) = ui::Console::global() {
+            c.shutdown().await;
+        }
         env_setup?;
         build_result?;
         Ok(())
@@ -453,6 +583,7 @@ mod tests {
             None,
             HashMap::new(),
             LogVerbosity::Info,
+            ConsoleConfig::default(),
         )
         .await
         {

@@ -24,11 +24,12 @@ use super::catalog::Catalog;
 /// Reads consult the snapshot directly, avoiding repeated JSON deserialization
 /// of `catalog.json` on hot paths like the scheduler's fetch phase.
 ///
-/// Concurrency model: the snapshot is guarded by a [`tokio::sync::RwLock`]
-/// so the write path can hold the guard across async filesystem operations
-/// (atomic catalog flush, blob deletion). Mutating ops thus serialize with
-/// each other; reads run in parallel with each other and only block when a
-/// write is in progress.
+/// The catalog lock is a [`tokio::sync::RwLock`] rather than a
+/// `parking_lot::RwLock`: mutating methods hold the write guard across an
+/// `await` (the atomic `flush_at` catalog rewrite), so a synchronous
+/// primitive would park a tokio worker thread and — under the default 8
+/// concurrent workers, all of which call `upload_build` on completion —
+/// could starve the TUI task scheduled on that thread.
 #[derive(Debug)]
 pub struct LocalBackend {
     layer_dir: PathBuf,
@@ -173,7 +174,6 @@ impl BackendImpl for LocalBackend {
         // and on-disk flush so concurrent saves cannot race each other and
         // a concurrent `del` cannot remove a blob between our check and
         // our register.
-        let mut guard = self.catalog.write().await;
         for layer in artifact.layers() {
             let blob_path = self.layer_dir.join(layer.digest().digest());
             ensure!(
@@ -185,42 +185,44 @@ impl BackendImpl for LocalBackend {
                 }
             );
         }
+        // Hold the write lock across mutate+flush so concurrent saves
+        // cannot read a stale snapshot and clobber each other's writes.
+        // `tokio::sync::RwLock` guards are held across `await`s
+        // cooperatively — sibling tasks on the same worker thread stay
+        // scheduled.
+        let mut guard = self.catalog.write().await;
         guard.catalog.add(artifact);
-        let path = guard.path.clone();
-        Self::flush_at(&path, &guard.catalog).await?;
+        Self::flush_at(&guard.path.clone(), &guard.catalog).await?;
         Ok(())
     }
 
     async fn del(&self, id: &Id) -> StorageResult<()> {
-        // Hold the write lock across the entire delete: mutate the
-        // catalog, flush it, then remove blob files. Holding the lock
-        // until the blob files are gone closes the TOCTOU window where
-        // a racing `save` could observe the blob via `try_exists`,
-        // proceed past its precondition, and end up registering a
-        // manifest pointing at a digest whose file we are about to
-        // unlink.
-        let mut guard = self.catalog.write().await;
-        if !guard.catalog.has(id) {
-            return Ok(());
-        }
-        let artifact = guard
-            .catalog
-            .get(id)
-            .context(error::NotFoundSnafu { id: id.clone() })?
-            .clone();
-        guard.catalog.del(id);
-        let path = guard.path.clone();
-        Self::flush_at(&path, &guard.catalog).await?;
-        for layer in artifact.layers() {
-            if guard.catalog.count(layer) > 0 {
-                continue;
+        // Hold the write lock across the read-modify-write so concurrent
+        // saves/dels cannot interleave and lose updates.
+        let artifact = {
+            let mut guard = self.catalog.write().await;
+            if !guard.catalog.has(id) {
+                return Ok(());
             }
+            let artifact = guard
+                .catalog
+                .get(id)
+                .context(error::NotFoundSnafu { id: id.clone() })?
+                .clone();
+            guard.catalog.del(id);
+            Self::flush_at(&guard.path.clone(), &guard.catalog).await?;
+            artifact
+        };
+        for layer in artifact.layers() {
             let digest = layer.digest().digest();
-            let blob_path = self.layer_dir.join(&digest);
-            if tokio::fs::try_exists(&blob_path)
-                .await
-                .context(error::RemoveSnafu)?
-            {
+            let blob_path = self.layer_dir.join(digest.clone());
+            // Re-check the blob refcount under the read lock; another
+            // concurrent save may have re-introduced it.
+            let drop_blob = {
+                let guard = self.catalog.read().await;
+                guard.catalog.count(layer) <= 0 && blob_path.exists()
+            };
+            if drop_blob {
                 tokio::fs::remove_file(&blob_path)
                     .await
                     .context(error::RemoveSnafu)?;
@@ -273,21 +275,17 @@ impl BackendImpl for LocalBackend {
         // instant the on-disk file disappears. The lock is held across
         // the (cheap) filesystem removals; no other thread can observe
         // the half-removed state.
-        let mut guard = self.catalog.write().await;
-        guard.catalog = Catalog::default();
-        let path = guard.path.clone();
-        if tokio::fs::try_exists(&path)
-            .await
-            .context(error::RemoveSnafu)?
-        {
+        let path = {
+            let mut guard = self.catalog.write().await;
+            guard.catalog = Catalog::default();
+            guard.path.clone()
+        };
+        if path.exists() {
             tokio::fs::remove_file(&path)
                 .await
                 .context(error::RemoveSnafu)?;
         }
-        if tokio::fs::try_exists(&self.layer_dir)
-            .await
-            .context(error::RemoveSnafu)?
-        {
+        if self.layer_dir.exists() {
             tokio::fs::remove_dir_all(&self.layer_dir)
                 .await
                 .context(error::RemoveSnafu)?;

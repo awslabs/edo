@@ -77,6 +77,13 @@ impl Vfs {
     /// simply narrows the logical cursor so subsequent relative operations
     /// resolve beneath `path`.
     pub async fn entry(&self, path: impl AsRef<Path>) -> Self {
+        trace!(
+            subsystem = "environment",
+            component = "vfs",
+            op = "changedir",
+            "changing directory in environment to {:?}",
+            path.as_ref()
+        );
         Self {
             id: self.id.clone(),
             env: self.env.clone(),
@@ -91,6 +98,12 @@ impl Vfs {
     /// non-zero exit is reported as `Ok(false)`.
     pub async fn try_exists(&self, path: impl AsRef<Path>) -> EnvResult<bool> {
         let path = self.canonicalize(path).await?;
+        trace!(
+            subsystem = "environment",
+            component = "vfs",
+            op = "stat",
+            "checking for existence of {path:?}",
+        );
         self.env
             .execute(
                 &self.log,
@@ -104,6 +117,13 @@ impl Vfs {
     /// Set an environment variable in the underlying [`Environment`] and
     /// record the mutation in the log.
     pub async fn set_env(&self, key: &str, value: &str) -> EnvResult<()> {
+        trace!(
+            subsystem = "environment",
+            component = "vfs",
+            op = "set-env",
+            key = key,
+            "setting environment variable"
+        );
         self.log.record("set-env", key)?;
         self.env.set_env(key, value).await
     }
@@ -111,6 +131,13 @@ impl Vfs {
     /// Read an environment variable from the underlying [`Environment`] and
     /// record the access in the log.
     pub async fn get_env(&self, key: &str) -> EnvResult<Option<String>> {
+        trace!(
+            subsystem = "environment",
+            component = "vfs",
+            op = "get-env",
+            key = key,
+            "getting environment variable"
+        );
         self.log.record("get-env", key)?;
         Ok(self.env.get_env(key).await)
     }
@@ -125,6 +152,12 @@ impl Vfs {
     // tokio::fs::create_dir_all
     pub async fn create_dir(&self, path: impl AsRef<Path>) -> EnvResult<Self> {
         let path = self.canonicalize(path).await?;
+        trace!(
+            subsystem = "environment",
+            component = "vfs",
+            op = "mkdir",
+            "creating directory in environment at {path:?}"
+        );
         if !self
             .env
             .execute(
@@ -148,12 +181,24 @@ impl Vfs {
     // tokio::fs::read
     pub async fn read(&self, path: impl AsRef<Path>) -> EnvResult<Vec<u8>> {
         let path = self.canonicalize(path).await?;
+        trace!(
+            subsystem = "environment",
+            component = "vfs",
+            op = "read",
+            "reading from environment at {path:?}"
+        );
         self.env.read_bytes(&path).await
     }
 
     // tokio::fs::write
     pub async fn write(&self, path: impl AsRef<Path>, buffer: &[u8]) -> EnvResult<()> {
         let path = self.canonicalize(path).await?;
+        trace!(
+            subsystem = "environment",
+            component = "vfs",
+            op = "write",
+            "writing to {path:?} in environment"
+        );
         self.env.write_bytes(&path, buffer).await
     }
 
@@ -164,6 +209,12 @@ impl Vfs {
     // tokio::fs::remove_file
     pub async fn remove_file(&self, path: impl AsRef<Path>) -> EnvResult<()> {
         let path = self.canonicalize(path).await?;
+        trace!(
+            subsystem = "environment",
+            component = "vfs",
+            op = "rm",
+            "removing file at {path:?} from environment"
+        );
         if !self
             .env
             .execute(&self.log, &self.id, &self.path, &format!("rm {path:?}"))
@@ -182,6 +233,12 @@ impl Vfs {
     // tokio::fs::remove_dir_all
     pub async fn remove_dir(&self, path: impl AsRef<Path>) -> EnvResult<()> {
         let path = self.canonicalize(path).await?;
+        trace!(
+            subsystem = "environment",
+            component = "vfs",
+            op = "rmdir",
+            "removing {path:?} recursively from environment"
+        );
         if !self
             .env
             .execute(&self.log, &self.id, &self.path, &format!("rm -r {path:?}"))
@@ -202,6 +259,12 @@ impl Vfs {
     pub async fn copy(&self, from: impl AsRef<Path>, to: impl AsRef<Path>) -> EnvResult<()> {
         let from = self.canonicalize(from).await?;
         let to = self.canonicalize(to).await?;
+        trace!(
+            subsystem = "environment",
+            component = "vfs",
+            op = "copy",
+            "copying recursively {from:?} to {to:?} in environment"
+        );
         if !self
             .env
             .execute(
@@ -226,6 +289,12 @@ impl Vfs {
     pub async fn rename(&self, from: impl AsRef<Path>, to: impl AsRef<Path>) -> EnvResult<()> {
         let from = self.canonicalize(from).await?;
         let to = self.canonicalize(to).await?;
+        trace!(
+            subsystem = "environment",
+            component = "vfs",
+            op = "mv",
+            "moving file or directory {from:?} to {to:?} in environment"
+        );
         if !self
             .env
             .execute(
@@ -253,6 +322,14 @@ impl Vfs {
         A: IntoIterator<Item = I>,
         I: AsRef<str>,
     {
+        trace!(
+            subsystem = "environment",
+            component = "vfs",
+            op = "command",
+            action = action,
+            "executing command in environment: {}",
+            program.as_ref(),
+        );
         if !self
             .env
             .execute(
@@ -288,6 +365,14 @@ impl Vfs {
         I: AsRef<str>,
     {
         // We want to create a temporary file
+        trace!(
+            subsystem = "environment",
+            component = "vfs",
+            op = "command",
+            action = action,
+            "executing command in environment: {}",
+            program.as_ref()
+        );
         let filename = names::Generator::default().next().unwrap();
         let filepath = self.canonicalize(filename).await?;
         if !self

@@ -17,7 +17,7 @@ pub struct Prune {
 
 impl Prune {
     pub async fn run(&self, args: Args) -> Result<()> {
-        let ctx = super::create_context(&args, HashMap::default(), true).await?;
+        let ctx = super::create_context(&args, "<prune>", HashMap::default(), true).await?;
         // Prune the local cache
         if self.all {
             ctx.storage().prune_local_all().await?;

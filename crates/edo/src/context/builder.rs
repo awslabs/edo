@@ -31,6 +31,13 @@ pub struct Project {
 
 impl Project {
     pub fn new<P: AsRef<Path>>(path: P) -> Self {
+        trace!(
+            subsystem = "context",
+            component = "project",
+            op = "init",
+            "initializing project builder at {}",
+            path.as_ref().display()
+        );
         Self {
             project_path: path.as_ref().to_path_buf(),
             schema: Schema::default(),
@@ -81,7 +88,7 @@ impl Project {
             let entry = entry.context(error::IoSnafu)?;
             let path = entry.path();
             if path.is_file() && path.file_name().and_then(|x| x.to_str()) == Some("edo.toml") {
-                debug!(component = "project", "loading project file {path:?}");
+                info!(subsystem = "context", component = "project", op = "load", path = ?path, "loading project file");
                 let toml_text = std::fs::read_to_string(&path).context(error::IoSnafu)?;
                 let mut toml_schema: Schema =
                     toml::from_str(&toml_text).context(error::DeserializeSnafu)?;
@@ -102,20 +109,52 @@ impl Project {
     pub async fn build(&mut self, ctx: &Context, error_on_lock: bool) -> Result<()> {
         // Calculate the digest of the project configuration.
         let digest = self.calculate_digest()?;
+        info!(
+            subsystem = "context",
+            component = "project",
+            op = "resolution",
+            "calculated digest to be {digest}"
+        );
         ctx.add_config(self.schema.get_config());
+
+        // Track caches registered (for the `ProjectLoaded` provenance event)
+        // and whether the lockfile was reused.
+        let mut cache_count = 0usize;
+        let mut locked_reused = false;
 
         // Resolve all storage backends.
         for (name, element) in self.schema.get_source_caches() {
             let addr = Addr::parse(&format!("//edo-source-cache/{name}"))?;
+            debug!(
+                subsystem = "context",
+                component = "project",
+                op = "resolution",
+                "adding source cache {addr}"
+            );
             ctx.add_cache(&addr, element).await?;
+            cache_count += 1;
         }
         if let Some(element) = self.schema.get_build_cache() {
+            debug!(
+                subsystem = "context",
+                component = "project",
+                op = "resolution",
+                "registering build cache"
+            );
             ctx.add_cache(&Addr::parse("//edo-build-cache")?, element)
                 .await?;
+            cache_count += 1;
         }
         if let Some(element) = self.schema.get_output_cache() {
+            debug!(
+                subsystem = "context",
+                component = "project",
+                op = "resolution",
+                "registering output cache"
+            );
             ctx.add_cache(&Addr::parse("//edo-output-cache")?, element)
                 .await?;
+            cache_count += 1;
         }
 
         // Check for an existing lockfile.
@@ -131,16 +170,22 @@ impl Project {
         let lock_file = self.project_path.join("edo.lock.json");
         let mut needs_resolution = true;
         if lock_file.exists() {
+            trace!(
+                subsystem = "context",
+                component = "project",
+                op = "resolution",
+                "existing lock file discovered"
+            );
             let mut file = File::open(&lock_file).context(error::IoSnafu)?;
             let lock: Lock = serde_json::from_reader(&mut file).context(error::SerializeSnafu)?;
             if lock.digest() == digest {
+                locked_reused = true;
                 needs_resolution = false;
-                info!(
+                crate::ui_info!(
                     subsystem = "context",
                     component = "project",
-                    op = "lock-reuse",
-                    digest = %digest,
-                    "no changes detected in project, reusing lock resolution file"
+                    op = "resolution";
+                    "no changes detected in project (digest {digest}), reusing lock resolution file"
                 );
                 // Collect first to release the borrow on `self.schema`
                 // before mutating it via `add_source`.
@@ -155,13 +200,13 @@ impl Project {
             } else if error_on_lock {
                 return error::DependencyChangeSnafu {}.fail();
             } else {
-                info!(
+                crate::ui_info!(
                     subsystem = "context",
                     component = "project",
-                    op = "lock-stale",
-                    old_digest = %lock.digest(),
-                    new_digest = %digest,
-                    "project changed since lockfile was written; re-resolving"
+                    op = "resolution";
+                    "project changed since lockfile was written ({} -> {}); re-resolving",
+                    lock.digest(),
+                    digest
                 );
             }
         }
@@ -173,10 +218,12 @@ impl Project {
             for (addr, element) in self.schema.vendors() {
                 let vendor = ctx.add_vendor(element).await?;
                 vendors.insert(addr.to_string(), vendor.clone());
-                debug!(
-                    section = "context",
+                info!(
+                    subsystem = "context",
                     component = "project",
-                    "register vendor {addr}"
+                    op = "resolution",
+                    addr = %addr,
+                    "register vendor"
                 );
                 resolver.add_vendor(&addr.to_string(), vendor.clone());
             }
@@ -185,9 +232,11 @@ impl Project {
             let mut need_resolution = Vec::new();
             for (addr, requirement) in self.schema.requires() {
                 debug!(
-                    section = "context",
+                    subsystem = "context",
                     component = "project",
-                    "{addr} needs resolution"
+                    op = "resolution",
+                    addr = %addr,
+                    "needs resolution"
                 );
                 let dep = Dependency::new(addr, requirement, ctx).await?;
                 resolver.build_db(dep.name.as_str()).await?;
@@ -195,6 +244,12 @@ impl Project {
             }
 
             // resolvo runs synchronously off rayon; offload via spawn_blocking.
+            trace!(
+                subsystem = "context",
+                component = "project",
+                op = "resolution",
+                "vendored dependency resolution"
+            );
             let resolved = tokio::task::spawn_blocking(move || resolver.resolve(need_resolution))
                 .await
                 .context(error::ResolverJoinSnafu)??;
@@ -202,9 +257,11 @@ impl Project {
             let mut lock = Lock::new(digest);
 
             for (addr, (vendor_name, name, version)) in resolved.iter() {
-                debug!(
-                    section = "context",
+                crate::ui_info!(
+                    subsystem = "context",
                     component = "project",
+                    op = "resolution",
+                    id = addr;
                     "resolved {addr} to {name}@{version} from vendor {vendor_name}"
                 );
                 let vendor = vendors
@@ -228,20 +285,43 @@ impl Project {
 
         for (addr, element) in self.schema.environments() {
             debug!(
-                section = "context",
+                subsystem = "context",
                 component = "project",
-                "adding environment farm {addr}"
+                op = "resolution",
+                addr = %addr,
+                "adding environment farm"
             );
             ctx.add_farm(element).await?;
         }
 
         for (addr, element) in self.schema.transforms() {
             debug!(
-                section = "context",
+                subsystem = "context",
                 component = "project",
-                "adding transform {addr}"
+                op = "resolution",
+                addr = %addr,
+                "adding transform"
             );
             ctx.add_transform(element).await?;
+        }
+
+        // Provenance: emit a typed summary of what got loaded so the canvas
+        // header, JSONL log, and simple sink all have a single record of
+        // project shape. Sequenced after registration so counts reflect
+        // post-resolution state.
+        if let Some(c) = crate::ui::Console::global() {
+            c.emit_summary(
+                self.project_path.as_path(),
+                self.schema.transforms().len(),
+                self.schema.sources().len(),
+                self.schema.environments().len(),
+                locked_reused,
+            )
+            .await;
+            // Vendors and caches are not currently represented in the
+            // tui Summary event; surface them as info diagnostics so
+            // they still appear in the log.
+            let _ = cache_count;
         }
 
         Ok(())
