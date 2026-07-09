@@ -1,6 +1,11 @@
+use crate::storage::Compression;
+use async_compression::tokio::write::{
+    BzDecoder, BzEncoder, GzipDecoder, GzipEncoder, Lz4Decoder, Lz4Encoder, LzmaDecoder,
+    LzmaEncoder, XzDecoder, XzEncoder, ZstdDecoder, ZstdEncoder,
+};
 use parking_lot::Mutex;
 use std::pin::Pin;
-use std::rc::Rc;
+use std::sync::Arc;
 use std::task::Poll;
 use tokio::io::AsyncWrite;
 
@@ -10,15 +15,65 @@ use tokio::io::AsyncWrite;
 /// to obtain the hex-encoded content digest.
 #[derive(Clone)]
 pub struct Writer {
-    inner: Rc<Mutex<Inner>>,
+    inner: Arc<Mutex<Inner>>,
 }
 
 impl Writer {
     /// Wrap an async writer with a target name and start a fresh BLAKE3 hash.
     pub fn new(target: String, writer: impl AsyncWrite + Send + Sync + 'static) -> Self {
         Self {
-            inner: Rc::new(Mutex::new(Inner {
+            inner: Arc::new(Mutex::new(Inner {
                 writer: Box::pin(writer),
+                hash: blake3::Hasher::new(),
+                digest: None,
+                size: 0,
+                target,
+            })),
+        }
+    }
+
+    /// Wrap an async writer with compression enabled
+    pub fn with_compression(
+        target: String,
+        writer: impl AsyncWrite + Send + Sync + 'static,
+        compression: &Compression,
+    ) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(Inner {
+                writer: match compression {
+                    Compression::Bzip2 => Box::pin(BzEncoder::new(writer)),
+                    Compression::Gzip => Box::pin(GzipEncoder::new(writer)),
+                    Compression::Lz4 => Box::pin(Lz4Encoder::new(writer)),
+                    Compression::Lzma => Box::pin(LzmaEncoder::new(writer)),
+                    Compression::Xz => Box::pin(XzEncoder::new(writer)),
+                    Compression::Zstd => Box::pin(ZstdEncoder::new(writer)),
+                    Compression::None => Box::pin(writer),
+                },
+                hash: blake3::Hasher::new(),
+                digest: None,
+                size: 0,
+                target,
+            })),
+        }
+    }
+
+    /// Wrap an async writer with compression enabled
+    pub fn with_decompression(
+        target: String,
+        writer: impl AsyncWrite + Send + Sync + 'static,
+        compression: &Compression,
+    ) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(Inner {
+                writer: match compression {
+                    Compression::Bzip2 => Box::pin(BzDecoder::new(writer)),
+                    Compression::Gzip => Box::pin(GzipDecoder::new(writer)),
+                    Compression::Lz4 => Box::pin(Lz4Decoder::new(writer)),
+                    Compression::Lzma => Box::pin(LzmaDecoder::new(writer)),
+                    Compression::Xz => Box::pin(XzDecoder::new(writer)),
+                    Compression::Zstd => Box::pin(ZstdDecoder::new(writer)),
+                    Compression::None => Box::pin(writer),
+                },
                 hash: blake3::Hasher::new(),
                 digest: None,
                 size: 0,
@@ -54,9 +109,6 @@ impl Writer {
         lock.digest.clone().unwrap_or(digest)
     }
 }
-
-unsafe impl Send for Writer {}
-unsafe impl Sync for Writer {}
 
 struct Inner {
     writer: Pin<Box<dyn AsyncWrite + Send + Sync>>,

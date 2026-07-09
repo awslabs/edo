@@ -8,11 +8,10 @@ use aws_sdk_s3::{
 use edo::{
     context::{Addr, Config, FromNodeNoContext, Node},
     non_configurable_no_context,
-    storage::{Artifact, BackendImpl, Id, Layer, MediaType, StorageResult},
+    storage::{Artifact, BackendImpl, Id, Layer, LayerOptions, StorageResult},
     util::{Reader, Writer},
 };
-use ocilot::models::Platform;
-use snafu::{OptionExt, ResultExt};
+use snafu::{IntoError, OptionExt, ResultExt};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -130,17 +129,29 @@ impl S3Backend {
             .send()
             .await
             .context(error::GetSnafu)?;
-        let bytes = response.body.collect().await.unwrap();
-        let catalog: Catalog =
-            serde_json::from_slice(bytes.to_vec().as_slice()).context(error::DeserializeSnafu)?;
-        Ok(catalog)
+        let bytes = response
+            .body
+            .collect()
+            .await
+            .map_err(|e| error::ReadBodySnafu.into_error(Box::new(e)))?;
+        serde_json::from_slice::<Catalog>(bytes.to_vec().as_slice())
+            .context(error::DeserializeSnafu)
+            .map_err(Into::into)
     }
 
-    /// Waits for any existing lock file to be released before proceeding.
+    /// Polls until the catalog lock object is gone.
+    ///
+    /// S3 has no native compare-and-swap on object creation, so concurrent
+    /// writers cannot use this to *guarantee* serialized access; the lock
+    /// object is a best-effort hint to back off when another writer is
+    /// known to be in progress. Returns `LockTimeout` once the retry
+    /// budget is exhausted so the caller does not silently trample a
+    /// peer's in-flight write — the previous behaviour of "warn and
+    /// proceed anyway" was racy and could lose updates.
     pub async fn wait_for_lock(&self) -> StorageResult<()> {
+        const MAX_ATTEMPTS: u32 = 5;
         let mut interval = tokio::time::interval(Duration::from_secs(1));
-        let mut attempts = 1;
-        loop {
+        for attempt in 1..=MAX_ATTEMPTS {
             interval.tick().await;
             if self
                 .client
@@ -151,15 +162,22 @@ impl S3Backend {
                 .await
                 .is_err()
             {
-                break;
-            } else if attempts >= 5 {
-                warn!(
-                    "lock file did not disappear after 5seconds, s3 bucket may have stale lock file at {}.lock",
-                    self.catalog_key
-                );
-                break;
+                return Ok(());
             }
-            attempts += 1;
+            if attempt == MAX_ATTEMPTS {
+                error!(
+                    subsystem = "storage",
+                    component = "s3",
+                    catalog_key = %self.catalog_key,
+                    "lock object {}.lock did not clear after {MAX_ATTEMPTS} attempts; failing",
+                    self.catalog_key,
+                );
+                return Err(error::LockTimeoutSnafu {
+                    key: format!("{}.lock", self.catalog_key),
+                }
+                .build()
+                .into());
+            }
         }
         Ok(())
     }
@@ -329,23 +347,13 @@ impl BackendImpl for S3Backend {
         ))
     }
 
-    async fn finish_layer(
-        &self,
-        media_type: &MediaType,
-        platform: Option<Platform>,
-        writer: &Writer,
-    ) -> StorageResult<Layer> {
+    async fn finish_layer(&self, writer: &Writer, options: &LayerOptions) -> StorageResult<Layer> {
         // The writer will contain the temporary file name to use
         let tmp_path = std::env::temp_dir().join(writer.target());
         // Now we want to calculate the digest
         let digest = writer.finish().await;
         let target_path = self.blob_key().join(digest.clone());
-        let layer = Layer::builder()
-            .digest(digest.clone())
-            .media_type(media_type.clone())
-            .size(writer.size())
-            .maybe_platform(platform)
-            .build();
+        let layer = options.create(digest, writer.size());
 
         let mut file = tokio::fs::File::open(&tmp_path)
             .await
@@ -428,5 +436,42 @@ impl BackendImpl for S3Backend {
             .await
             .context(error::TempSnafu)?;
         Ok(layer)
+    }
+
+    async fn has_blob(&self, digest: &str) -> StorageResult<bool> {
+        // The catalog is the source of truth for what this backend has
+        // committed. Mirrors `has` for ids — we deliberately avoid a
+        // round-trip HEAD on the blob key because S3 list-after-write is
+        // strongly consistent and the catalog is updated under the same
+        // best-effort lock as the blob put.
+        let catalog = self.load().await?;
+        Ok(catalog.has_blob(digest))
+    }
+
+    async fn blob_size(&self, digest: &str) -> StorageResult<Option<u64>> {
+        let key = self.blob_key().join(digest);
+        let key_str = key.to_str().unwrap().to_string();
+        match self
+            .client
+            .head_object()
+            .bucket(self.bucket.clone())
+            .key(&key_str)
+            .send()
+            .await
+        {
+            Ok(resp) => Ok(resp.content_length().map(|n| n.max(0) as u64)),
+            Err(e) => {
+                // Map a 404 to `None` so callers can distinguish "absent"
+                // from "transport/auth failure". `into_service_error`
+                // collapses any non-service variants into a panic, so we
+                // first peel the service error out manually.
+                if let aws_sdk_s3::error::SdkError::ServiceError(ref svc) = e
+                    && svc.err().is_not_found()
+                {
+                    return Ok(None);
+                }
+                Err(error::CheckSnafu.into_error(e).into())
+            }
+        }
     }
 }

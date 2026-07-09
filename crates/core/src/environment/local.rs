@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use edo::context::{Addr, Context, FromNode, Log, Node};
 use edo::environment::{EnvResult, Environment, EnvironmentImpl, FarmImpl};
-use edo::storage::{Id, Storage};
+use edo::storage::{Id, MediaType, Storage};
 use edo::util::{Reader, Writer, cmd_noinput, cmd_noredirect, from_dash};
 use edo::{non_configurable, record};
 use snafu::{ResultExt, ensure};
@@ -78,7 +78,7 @@ impl EnvironmentImpl for LocalEnv {
     }
 
     async fn get_env(&self, key: &str) -> Option<String> {
-        self.env.get(key).map(|x| x.key().clone())
+        self.env.get(key).map(|x| x.value().clone())
     }
 
     async fn setup(&self, log: &Log, _storage: &Storage) -> EnvResult<()> {
@@ -137,12 +137,12 @@ impl EnvironmentImpl for LocalEnv {
 
     async fn write_bytes(&self, path: &Path, buffer: &[u8]) -> EnvResult<()> {
         let file_path = self.path.join(path);
-        if let Some(parent) = file_path.parent() {
-            if !parent.exists() {
-                tokio::fs::create_dir_all(parent)
-                    .await
-                    .context(error::CreateDirectorySnafu)?;
-            }
+        if let Some(parent) = file_path.parent()
+            && !parent.exists()
+        {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .context(error::CreateDirectorySnafu)?;
         }
         trace!(component = "environment", type = "local", "writing contents to file at {}", file_path.display());
         tokio::fs::write(&file_path, buffer)
@@ -153,12 +153,12 @@ impl EnvironmentImpl for LocalEnv {
 
     async fn write_stream(&self, path: &Path, mut reader: Reader) -> EnvResult<()> {
         let file_path = self.path.join(path);
-        if let Some(parent) = file_path.parent() {
-            if !parent.exists() {
-                tokio::fs::create_dir_all(parent)
-                    .await
-                    .context(error::CreateDirectorySnafu)?;
-            }
+        if let Some(parent) = file_path.parent()
+            && !parent.exists()
+        {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .context(error::CreateDirectorySnafu)?;
         }
         trace!(component = "environment", type = "local", "writing contents to file at {}", file_path.display());
         let mut file = File::create(&file_path)
@@ -170,21 +170,34 @@ impl EnvironmentImpl for LocalEnv {
         Ok(())
     }
 
-    async fn unpack_stream(&self, path: &Path, reader: Reader) -> EnvResult<()> {
+    async fn unpack_stream(
+        &self,
+        path: &Path,
+        media_type: &MediaType,
+        reader: Reader,
+    ) -> EnvResult<()> {
         let file_path = self.path.join(path);
         if !file_path.exists() {
             tokio::fs::create_dir_all(&file_path)
                 .await
                 .context(error::CreateDirectorySnafu)?;
         }
-        trace!(component = "environment", type = "local", "unpacking archive into {}", file_path.display());
-        let mut archive = tokio_tar::ArchiveBuilder::new(reader)
-            .set_preserve_permissions(true)
-            .build();
-        archive
-            .unpack(&file_path)
-            .await
-            .context(error::ExtractSnafu)?;
+        match media_type {
+            MediaType::Zip(..) => {
+                trace!(component = "environment", type = "local", "unpacking zip into {}", file_path.display());
+                super::extract_zip_stream(&file_path, reader).await?;
+            }
+            _ => {
+                trace!(component = "environment", type = "local", "unpacking archive into {}", file_path.display());
+                let mut archive = tokio_tar::ArchiveBuilder::new(reader)
+                    .set_preserve_permissions(true)
+                    .build();
+                archive
+                    .unpack(&file_path)
+                    .await
+                    .context(error::ExtractSnafu)?;
+            }
+        }
         Ok(())
     }
 
