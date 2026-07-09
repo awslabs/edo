@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use edo::{
     context::{Addr, Context, FromNode, Handle, Log, Node, non_configurable},
     environment::Environment,
-    storage::{Artifact, Compression, Config, Id, MediaType},
+    storage::{Artifact, ArtifactStageOptions, Compression, Config, Id, LayerOptions, MediaType},
     transform::{TransformImpl, TransformResult, TransformStatus},
 };
 use snafu::OptionExt;
@@ -84,7 +84,8 @@ impl TransformImpl for ComposeTransform {
     }
 
     async fn stage(&self, _log: &Log, ctx: &Handle, env: &Environment) -> TransformResult<()> {
-        env.create_dir(Path::new("install-root")).await?;
+        let install_root = Path::new("install-root");
+        env.create_dir(install_root).await?;
 
         // Stage all the dependencies
         for dep in self.depends().await? {
@@ -92,28 +93,15 @@ impl TransformImpl for ComposeTransform {
                 .get(&dep)
                 .context(error::NotFoundSnafu { addr: dep.clone() })?;
             let id = t.get_unique_id(ctx).await?;
-            // TODO: We need to find a more portable way to do this than just assuming archives
             trace!(component = "transform", type = "compose", "staging dependencies {dep} with id {id} into install-root");
-            let artifact = ctx.storage().safe_open(&id).await?;
-            for layer in artifact.layers() {
-                let reader = ctx.storage().safe_read(layer).await?;
-                match layer.media_type() {
-                    MediaType::Tar(..) => {
-                        // let reader: Box<dyn AsyncRead> = match compression {
-                        //     Compression::Bzip2 => Box::new(BzDecoder::new(BufReader::new(reader))),
-                        //     Compression::Gzip => Box::new(GzipDecoder::new(BufReader::new(reader))),
-                        //     Compression::Lz => Box::new(LzmaDecoder::new(BufReader::new(reader))),
-                        //     Compression::Xz => Box::new(XzDecoder::new(BufReader::new(reader))),
-                        //     Compression::Zstd => Box::new(ZstdDecoder::new(BufReader::new(reader))),
-                        //     _ => Box::new(BufReader::new(reader)),
-                        // };
-                        env.unpack_stream(Path::new("install-root"), reader).await?;
-                    }
-                    value => {
-                        warn!(component = "transform", type = "compose", "skipping artifact layer we do not know how to stage: {value}");
-                    }
-                }
-            }
+            env.stage(
+                ctx,
+                ArtifactStageOptions::builder()
+                    .id(id)
+                    .path(install_root)
+                    .build(),
+            )
+            .await?;
         }
         Ok(())
     }
@@ -135,7 +123,12 @@ impl TransformImpl for ComposeTransform {
                 .await?;
             artifact.layers_mut().push(
                 ctx.storage()
-                    .safe_finish_layer(&MediaType::Tar(Compression::None), None, &writer)
+                    .safe_finish_layer(
+                        &writer,
+                        &LayerOptions::builder()
+                            .media_type(MediaType::Tar(Compression::None))
+                            .build(),
+                    )
                     .await?,
             );
             ctx.storage().safe_save(&artifact).await?;

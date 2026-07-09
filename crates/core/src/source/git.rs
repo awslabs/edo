@@ -1,13 +1,12 @@
 use async_trait::async_trait;
 use edo::context::{Addr, Context, FromNode, Log, Node, non_configurable};
-use edo::environment::Environment;
 use edo::record;
 use edo::source::{SourceImpl, SourceResult};
-use edo::storage::{Artifact, Compression, Config, Id, MediaType, Storage};
+use edo::storage::{Artifact, Compression, Config, Id, LayerOptions, MediaType, Storage};
 use edo::util::cmd_noinput;
 use snafu::{OptionExt, ResultExt};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use tempfile::tempdir;
 use tokio::io::AsyncWriteExt;
 use tracing::Instrument;
@@ -16,7 +15,7 @@ use tracing::Instrument;
 pub struct GitSource {
     url: String,
     reference: String,
-    out: PathBuf,
+    out: Option<PathBuf>,
 }
 
 #[async_trait]
@@ -24,7 +23,7 @@ impl FromNode for GitSource {
     type Error = error::Error;
 
     async fn from_node(_addr: &Addr, node: &Node, _: &Context) -> Result<Self, error::Error> {
-        node.validate_keys(&["url", "ref", "out"])?;
+        node.validate_keys(&["url", "ref"])?;
         let url = node
             .get("url")
             .unwrap()
@@ -43,16 +42,12 @@ impl FromNode for GitSource {
             })?;
         let out = node
             .get("out")
-            .unwrap()
-            .as_string()
-            .context(error::FieldSnafu {
-                field: "out",
-                type_: "string",
-            })?;
+            .and_then(|x| x.as_string())
+            .map(PathBuf::from);
         Ok(Self {
             url,
             reference,
-            out: PathBuf::from(out),
+            out,
         })
     }
 }
@@ -62,9 +57,22 @@ non_configurable!(GitSource, error::Error);
 #[async_trait]
 impl SourceImpl for GitSource {
     async fn get_unique_id(&self) -> SourceResult<Id> {
+        // Fold `out` into the digest so changing the staging path
+        // invalidates the cached manifest. The name is kept stable
+        // (no longer embeds `out`) so the human-facing id stays clean.
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(self.reference.as_bytes());
+        hasher.update(
+            self.out
+                .as_ref()
+                .and_then(|p| p.to_str())
+                .unwrap_or("")
+                .as_bytes(),
+        );
+        let digest = base16::encode_lower(hasher.finalize().as_bytes());
         let id = Id::builder()
             .name(format!("{}@{}", self.url, self.reference))
-            .digest(base16::encode_lower(self.reference.as_bytes()))
+            .digest(digest)
             .build();
         trace!(component = "source", type = "git", "calculated id to be {id}");
         Ok(id)
@@ -115,11 +123,23 @@ impl SourceImpl for GitSource {
             writer.flush().await.context(error::ArchiveSnafu)?;
             archive.finish().await.context(error::ArchiveSnafu)?;
             // Now we can add the the layer to the artifact
-            artifact.layers_mut().push(
-                storage
-                    .safe_finish_layer(&MediaType::Tar(Compression::None), None, &writer)
-                    .await?,
-            );
+            let layer = storage
+                .safe_finish_layer(
+                    &writer,
+                    &LayerOptions::builder()
+                        .media_type(MediaType::Tar(Compression::None))
+                        .build(),
+                )
+                .await?;
+            // Record `out` as the artifact-level staging hint keyed by
+            // the layer's digest. See `Config::path_hints`.
+            if let Some(hint) = self.out.clone() {
+                artifact
+                    .config_mut()
+                    .path_hints_mut()
+                    .insert(layer.digest().digest(), hint);
+            }
+            artifact.layers_mut().push(layer);
             // Now save the artifact itself
             storage.safe_save(&artifact).await?;
             Ok(artifact.clone())
@@ -131,31 +151,6 @@ impl SourceImpl for GitSource {
             component = "source"
         ))
         .await
-    }
-
-    async fn stage(
-        &self,
-        log: &Log,
-        storage: &Storage,
-        env: &Environment,
-        path: &Path,
-    ) -> SourceResult<()> {
-        let out_path = path.join(self.out.clone());
-        trace!(component = "source", type = "git", "staging into {}", out_path.display());
-        // We want to open the artifact manifest first
-        let id = self.get_unique_id().await?;
-        record!(
-            log,
-            "unpack",
-            "unpacking git repository ({id}) into {out_path:?}"
-        );
-        let artifact = storage.safe_open(&id).await?;
-        // There should only be 1 layer that is our target
-        let reader = storage
-            .safe_read(artifact.layers().first().unwrap())
-            .await?;
-        env.unpack_stream(&out_path, reader).await?;
-        Ok(())
     }
 }
 
