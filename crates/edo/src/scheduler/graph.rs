@@ -37,8 +37,7 @@
 use async_recursion::async_recursion;
 use bimap::BiHashMap;
 use daggy::{Dag, NodeIndex, Walker, petgraph::visit::IntoNodeReferences};
-use futures::future::try_join_all;
-use snafu::{OptionExt, ResultExt};
+use snafu::{IntoError, OptionExt, ResultExt};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     ops::Index,
@@ -47,7 +46,7 @@ use std::{
 };
 use tempfile::TempDir;
 use tokio::sync::{Mutex, Semaphore, mpsc::channel};
-use tokio::task::{JoinError, JoinHandle};
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
@@ -231,71 +230,142 @@ impl Graph {
     /// dispatch), so we don't need ready/ready-not state — just a permit
     /// pool that throttles the network.
     pub async fn fetch(&self, ctx: &Context) -> Result<()> {
-        let mut tasks = Vec::new();
         // Share transform and source ids across hashing, preparation, and execution.
         let ctx = ctx.get_handle().with_id_cache(self.id_cache.clone());
         let max_concurrent = self.batch_size;
+        let token = ctx.cancellation();
 
-        // Fetching is network-bound. We don't want to issue thousands of
-        // requests in parallel, but unlike execution we also don't need to
-        // respect topological order — sources for a child can pull at the
-        // same time as sources for its parent. A semaphore is the simplest
-        // way to cap in-flight fetches at `batch_size`.
+        // Bound concurrent preparation without imposing dependency order.
         let semaphore = Arc::new(Semaphore::new(max_concurrent as usize));
-        for node_ref in self.graph.node_references() {
+        let mut tasks: Vec<(Addr, JoinHandle<Result<()>>)> = Vec::new();
+        // Defer errors until all spawned tasks have been joined.
+        let mut sync_error: Option<error::SchedulerError> = None;
+        'outer: for node_ref in self.graph.node_references() {
+            if token.is_cancelled() {
+                break;
+            }
             let node: Arc<Node> = node_ref.1.clone();
-            let transform = ctx.get(&node.addr).context(error::ProjectTransformSnafu {
+            let transform = match ctx.get(&node.addr).context(error::ProjectTransformSnafu {
                 addr: node.addr.clone(),
-            })?;
-            // Compute the content-addressed id and stash it on the node so
-            // workers in `run` can index into the build cache without
-            // recomputing it. Use the memoized helper so a transitive id
-            // referenced by multiple parents is hashed exactly once.
-            let id = ctx.unique_id_of(&node.addr).await?;
+            }) {
+                Ok(t) => t,
+                Err(e) => {
+                    sync_error = Some(e);
+                    break 'outer;
+                }
+            };
+            // Reuse the memoized id during execution.
+            let id = match ctx.unique_id_of(&node.addr).await {
+                Ok(id) => id,
+                Err(e) => {
+                    sync_error = Some(e.into());
+                    break 'outer;
+                }
+            };
             node.set_id(&id);
 
-            // Build cache probe. `find_build(.., true)` requires a *full*
-            // artifact (all layers present) — partial hits do not count.
-            // `cache_hit = true` will let `run`'s pre-pass cascade promote
-            // this node and any cache-hit ancestors to Success without
-            // ever spawning an environment.
-            if ctx.storage().find_build(&id, true).await?.is_some() {
-                info!("skipped fetch for built entry {}", node.addr);
-                node.set_cache_hit(true);
-                continue;
+            // Only complete artifacts qualify as build-cache hits.
+            match ctx.storage().find_build(&id, true).await {
+                Ok(Some(_)) => {
+                    info!("skipped fetch for built entry {}", node.addr);
+                    node.set_cache_hit(true);
+                    continue;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    sync_error = Some(e.into());
+                    break 'outer;
+                }
             }
 
-            // Build-cache miss — but if the transform reports that its
-            // `prepare` step has nothing to do (e.g. every input source is
-            // already in the local cache), skip the spawn entirely.
-            if !transform.needs_prepare(&ctx).await? {
-                continue;
+            match transform.needs_prepare(&ctx).await {
+                Ok(false) => continue,
+                Ok(true) => {}
+                Err(e) => {
+                    sync_error = Some(e.into());
+                    break 'outer;
+                }
             }
 
-            let ctx = ctx.clone();
-            let node_for_task = node.clone();
-            // Acquire the permit *outside* the spawn so the loop blocks
-            // here when we're already at capacity. Owned permits are moved
-            // into the task and released on drop.
-            let permit = semaphore
+            let task_ctx = ctx.clone();
+            let task_token = token.clone();
+            let addr_for_task = node.addr.clone();
+            // Apply backpressure before spawning.
+            let permit = match semaphore
                 .clone()
                 .acquire_owned()
                 .await
                 .ok()
-                .context(error::InfallableSnafu)?;
-            tasks.push(tokio::spawn(async move {
-                let logf = ctx.log().create(format!("{id}").as_str()).await?;
-                logf.set_subject("fetch");
-                transform.prepare(&logf, &ctx).await?;
-                info!("pulled sources and artifacts for {}", node_for_task.addr);
-                drop(logf);
-                // Explicit drop is documentation: the permit returns to
-                // the pool exactly when this task ends.
-                drop(permit);
-                Ok::<(), error::SchedulerError>(())
-            }));
+                .context(error::InfallableSnafu)
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    sync_error = Some(e);
+                    break 'outer;
+                }
+            };
+            tasks.push((
+                addr_for_task.clone(),
+                tokio::spawn(async move {
+                    if task_token.is_cancelled() {
+                        drop(permit);
+                        return error::CancelledSnafu.fail();
+                    }
+                    let result: Result<()> = async {
+                        let logf = task_ctx.log().create(format!("{id}").as_str()).await?;
+                        logf.set_subject("fetch");
+                        transform.prepare(&logf, &task_ctx).await?;
+                        info!("pulled sources and artifacts for {}", addr_for_task);
+                        Ok(())
+                    }
+                    .await;
+                    if result.is_err() {
+                        task_token.cancel();
+                    }
+                    drop(permit);
+                    result
+                }),
+            ));
         }
-        wait(tasks).await?;
+
+        if sync_error.is_some() {
+            token.cancel();
+        }
+
+        // Join all tasks, including failed and cancelled peers.
+        let (addrs, handles): (Vec<_>, Vec<_>) = tasks.into_iter().unzip();
+        let join_outcome = futures::future::join_all(handles).await;
+        let mut failures: Vec<error::SchedulerError> = Vec::new();
+        for (addr, joined) in addrs.into_iter().zip(join_outcome) {
+            match joined {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    // Exclude peer cancellation from root-cause errors.
+                    if !matches!(e, error::SchedulerError::Cancelled) {
+                        error!(%addr, error = %e, "fetch failed");
+                        failures.push(e);
+                    }
+                }
+                Err(join_err) => {
+                    error!(%addr, error = %join_err, "fetch task failed");
+                    failures.push(error::JoinSnafu.into_error(join_err));
+                }
+            }
+        }
+
+        let final_error: Option<error::SchedulerError> = if let Some(e) = sync_error {
+            Some(e)
+        } else if !failures.is_empty() {
+            Some(error::ChildSnafu { children: failures }.build())
+        } else if token.is_cancelled() {
+            Some(error::CancelledSnafu.build())
+        } else {
+            None
+        };
+
+        if let Some(e) = final_error {
+            return Err(e);
+        }
         Ok(())
     }
 
@@ -698,36 +768,6 @@ async fn run_transform_lifecycle(
     }
 }
 
-/// Awaits all join handles, collecting successes or returning aggregated
-/// failures.
-///
-/// Used by [`Graph::fetch`] to wait on the parallel prepare tasks.
-/// `JoinError`s (panics or cancellations of the outer task) short-circuit
-/// via `try_join_all` and propagate as [`SchedulerError::Join`]; logical
-/// errors returned by the inner futures are accumulated and surfaced as a
-/// single [`SchedulerError::Child`].
-async fn wait<I, R>(handles: I) -> Result<Vec<R>>
-where
-    R: Clone,
-    I: IntoIterator,
-    I::Item: Future<Output = std::result::Result<Result<R>, JoinError>>,
-{
-    let result = try_join_all(handles).await;
-    let mut success = Vec::new();
-    let mut failures = Vec::new();
-    for entry in result.context(error::JoinSnafu)? {
-        match entry {
-            Ok(result) => success.push(result),
-            Err(e) => failures.push(e),
-        }
-    }
-    if !failures.is_empty() {
-        error::ChildSnafu { children: failures }.fail()
-    } else {
-        Ok(success)
-    }
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
     //! Integration-style tests for [`Graph`].
@@ -744,12 +784,13 @@ pub(crate) mod tests {
     use crate::storage::{Artifact as StorageArtifact, Config as ArtifactConfig, Id, MediaType};
     use crate::transform::{MockTransformImpl, Transform, TransformStatus};
     use futures::FutureExt;
+    use sha2::{Digest, Sha256};
     use std::collections::HashMap;
     use std::path::Path;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use tempfile::TempDir;
-    use tokio::sync::OnceCell;
+    use tokio::sync::{Notify, OnceCell};
 
     // ── context bootstrapping (mirrors context/mod.rs pattern) ──────────────
 
@@ -1037,6 +1078,238 @@ pub(crate) mod tests {
         }
     }
 
+    /// Register a transform that reports no preparation work.
+    pub(crate) fn register_mock_no_prepare(
+        ctx: &Context,
+        addr_str: &str,
+        deps: &[&str],
+    ) -> MockHandles {
+        let addr = Addr::parse(addr_str).unwrap();
+        let deps_vec: Vec<Addr> = deps
+            .iter()
+            .map(|s| Addr::parse(s).expect("dep addr"))
+            .collect();
+        let env_addr = Addr::parse("//default").unwrap();
+        let digest = format!("{:064x}", fxhash(addr_str));
+        let prepare_called = Arc::new(AtomicUsize::new(0));
+        let stage_called = Arc::new(AtomicUsize::new(0));
+        let transform_called = Arc::new(AtomicUsize::new(0));
+        let max_inflight = Arc::new(AtomicUsize::new(0));
+        let order = Arc::new(std::sync::Mutex::new(Vec::<Addr>::new()));
+
+        let mut m = MockTransformImpl::new();
+        {
+            let env_addr = env_addr.clone();
+            m.expect_environment()
+                .returning(move || Ok(env_addr.clone()));
+        }
+        {
+            let addr = addr.clone();
+            let digest = digest.clone();
+            m.expect_get_unique_id().returning(move |_ctx| {
+                Ok(Id::builder()
+                    .name(addr.to_string())
+                    .digest(digest.clone())
+                    .build())
+            });
+        }
+        m.expect_depends().returning(move || Ok(deps_vec.clone()));
+        m.expect_needs_prepare().returning(|_ctx| Ok(false));
+        {
+            let prepare_called = prepare_called.clone();
+            m.expect_prepare().returning(move |_log, _ctx| {
+                prepare_called.fetch_add(1, AtomicOrdering::SeqCst);
+                Ok(())
+            });
+        }
+        {
+            let stage_called = stage_called.clone();
+            m.expect_stage().returning(move |_log, _ctx, _env| {
+                stage_called.fetch_add(1, AtomicOrdering::SeqCst);
+                Ok(())
+            });
+        }
+        {
+            let transform_called = transform_called.clone();
+            let digest_for_status = digest.clone();
+            m.expect_transform().returning(move |_log, _ctx, _env| {
+                transform_called.fetch_add(1, AtomicOrdering::SeqCst);
+                TransformStatus::Success(make_artifact(&digest_for_status))
+            });
+        }
+        m.expect_can_shell().return_const(false);
+        m.expect_shell().returning(|_env| Ok(()));
+        ctx.insert_transform_for_test(&addr, Transform::new(m));
+        MockHandles {
+            addr,
+            prepare_called,
+            stage_called,
+            transform_called,
+            max_inflight,
+            order_log: order,
+        }
+    }
+
+    /// Register a transform that fails during preparation.
+    pub(crate) fn register_mock_failing_prepare(
+        ctx: &Context,
+        addr_str: &str,
+        deps: &[&str],
+        peer_started: Arc<Notify>,
+    ) -> MockHandles {
+        let addr = Addr::parse(addr_str).unwrap();
+        let deps_vec: Vec<Addr> = deps
+            .iter()
+            .map(|s| Addr::parse(s).expect("dep addr"))
+            .collect();
+        let env_addr = Addr::parse("//default").unwrap();
+        let digest = format!("{:064x}", fxhash(addr_str));
+        let prepare_called = Arc::new(AtomicUsize::new(0));
+        let stage_called = Arc::new(AtomicUsize::new(0));
+        let transform_called = Arc::new(AtomicUsize::new(0));
+        let max_inflight = Arc::new(AtomicUsize::new(0));
+        let order = Arc::new(std::sync::Mutex::new(Vec::<Addr>::new()));
+
+        let mut m = MockTransformImpl::new();
+        {
+            let env_addr = env_addr.clone();
+            m.expect_environment()
+                .returning(move || Ok(env_addr.clone()));
+        }
+        {
+            let addr = addr.clone();
+            let digest = digest.clone();
+            m.expect_get_unique_id().returning(move |_ctx| {
+                Ok(Id::builder()
+                    .name(addr.to_string())
+                    .digest(digest.clone())
+                    .build())
+            });
+        }
+        m.expect_depends().returning(move || Ok(deps_vec.clone()));
+        m.expect_needs_prepare().returning(|_ctx| Ok(true));
+        {
+            let prepare_called = prepare_called.clone();
+            m.expect_prepare().returning(move |_log, _ctx| {
+                prepare_called.fetch_add(1, AtomicOrdering::SeqCst);
+                // Adapt the synchronous mock callback without stalling Tokio workers.
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(async {
+                        tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            peer_started.notified(),
+                        )
+                        .await
+                        .expect("peer must enter prepare before failure");
+                    });
+                });
+                Err(crate::transform::TransformError::Implementation {
+                    source: Box::new(std::io::Error::other("mock prepare failure")),
+                })
+            });
+        }
+        m.expect_stage().returning(|_log, _ctx, _env| Ok(()));
+        {
+            let digest_for_status = digest.clone();
+            m.expect_transform().returning(move |_log, _ctx, _env| {
+                TransformStatus::Success(make_artifact(&digest_for_status))
+            });
+        }
+        m.expect_can_shell().return_const(false);
+        m.expect_shell().returning(|_env| Ok(()));
+        ctx.insert_transform_for_test(&addr, Transform::new(m));
+        MockHandles {
+            addr,
+            prepare_called,
+            stage_called,
+            transform_called,
+            max_inflight,
+            order_log: order,
+        }
+    }
+
+    /// Register preparation that awaits cancellation and tracks its outcome.
+    pub(crate) fn register_mock_cancellable_prepare(
+        ctx: &Context,
+        addr_str: &str,
+        bail_count: Arc<AtomicUsize>,
+        completed_count: Arc<AtomicUsize>,
+        started: Arc<Notify>,
+    ) -> MockHandles {
+        let addr = Addr::parse(addr_str).unwrap();
+        let env_addr = Addr::parse("//default").unwrap();
+        let digest = format!("{:064x}", fxhash(addr_str));
+        let prepare_called = Arc::new(AtomicUsize::new(0));
+        let stage_called = Arc::new(AtomicUsize::new(0));
+        let transform_called = Arc::new(AtomicUsize::new(0));
+        let max_inflight = Arc::new(AtomicUsize::new(0));
+        let order = Arc::new(std::sync::Mutex::new(Vec::<Addr>::new()));
+
+        let mut m = MockTransformImpl::new();
+        {
+            let env_addr = env_addr.clone();
+            m.expect_environment()
+                .returning(move || Ok(env_addr.clone()));
+        }
+        {
+            let addr = addr.clone();
+            let digest = digest.clone();
+            m.expect_get_unique_id().returning(move |_ctx| {
+                Ok(Id::builder()
+                    .name(addr.to_string())
+                    .digest(digest.clone())
+                    .build())
+            });
+        }
+        m.expect_depends().returning(|| Ok(Vec::new()));
+        m.expect_needs_prepare().returning(|_ctx| Ok(true));
+        {
+            let prepare_called = prepare_called.clone();
+            let bail = bail_count.clone();
+            let done = completed_count.clone();
+            m.expect_prepare().returning(move |_log, ctx| {
+                prepare_called.fetch_add(1, AtomicOrdering::SeqCst);
+                let token = ctx.cancellation();
+                started.notify_one();
+                // Adapt the synchronous mock callback without stalling Tokio workers.
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(async {
+                        tokio::select! {
+                            _ = token.cancelled() => {
+                                bail.fetch_add(1, AtomicOrdering::SeqCst);
+                                Err(crate::transform::TransformError::Implementation {
+                                    source: Box::new(std::io::Error::other("cancelled")),
+                                })
+                            }
+                            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                                done.fetch_add(1, AtomicOrdering::SeqCst);
+                                Ok(())
+                            }
+                        }
+                    })
+                })
+            });
+        }
+        m.expect_stage().returning(|_log, _ctx, _env| Ok(()));
+        {
+            let digest_for_status = digest.clone();
+            m.expect_transform().returning(move |_log, _ctx, _env| {
+                TransformStatus::Success(make_artifact(&digest_for_status))
+            });
+        }
+        m.expect_can_shell().return_const(false);
+        m.expect_shell().returning(|_env| Ok(()));
+        ctx.insert_transform_for_test(&addr, Transform::new(m));
+        MockHandles {
+            addr,
+            prepare_called,
+            stage_called,
+            transform_called,
+            max_inflight,
+            order_log: order,
+        }
+    }
+
     /// Tiny non-cryptographic hash used only to generate stable digest
     /// strings so each mock ends up with a distinct `Id`.
     fn fxhash(s: &str) -> u128 {
@@ -1179,6 +1452,106 @@ pub(crate) mod tests {
 
     #[tokio::test]
     #[serial_test::serial(log_manager)]
+    async fn graph_fetch_skips_prepare_when_needs_prepare_false() {
+        let ctx = ctx_or_skip!();
+        ensure_default_farm(&ctx);
+        let h_a = register_mock_no_prepare(&ctx, "//gfnp/a", &[]);
+
+        let mut g = Graph::new(4);
+        g.add(&ctx, &Addr::parse("//gfnp/a").unwrap())
+            .await
+            .unwrap();
+        g.fetch(&ctx).await.expect("fetch");
+
+        assert_eq!(
+            h_a.prepare_called.load(AtomicOrdering::SeqCst),
+            0,
+            "prepare must not be called when needs_prepare returned false"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial(log_manager)]
+    async fn graph_fetch_failure_cancels_peers() {
+        let ctx = ctx_or_skip!();
+        ensure_default_farm(&ctx);
+
+        let bail = Arc::new(AtomicUsize::new(0));
+        let done = Arc::new(AtomicUsize::new(0));
+
+        let started = Arc::new(Notify::new());
+        let h_fail = register_mock_failing_prepare(&ctx, "//gfail/fail", &[], started.clone());
+        let h_slow = register_mock_cancellable_prepare(
+            &ctx,
+            "//gfail/slow",
+            bail.clone(),
+            done.clone(),
+            started,
+        );
+
+        register_mock_no_prepare(&ctx, "//gfail/root", &["//gfail/fail", "//gfail/slow"]);
+        register_mock_no_prepare(&ctx, "//gfail/reversed", &["//gfail/slow", "//gfail/fail"]);
+
+        for root in ["//gfail/root", "//gfail/reversed"] {
+            let mut g = Graph::new(4);
+            g.add(&ctx, &Addr::parse(root).unwrap()).await.unwrap();
+            let err = g.fetch(&ctx).await.expect_err("fetch must fail");
+            assert!(
+                matches!(err, error::SchedulerError::Child { .. }),
+                "fetch should surface aggregated child error, got {err:?}",
+            );
+        }
+
+        assert_eq!(h_fail.prepare_called.load(AtomicOrdering::SeqCst), 2);
+        assert_eq!(h_slow.prepare_called.load(AtomicOrdering::SeqCst), 2);
+        assert_eq!(bail.load(AtomicOrdering::SeqCst), 2);
+        assert_eq!(done.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(log_manager)]
+    async fn graph_fetch_log_failure_cancels_queued_tasks() {
+        let ctx = ctx_or_skip!();
+        let first = Addr::parse("//glogfail/first").unwrap();
+        let second = Addr::parse("//glogfail/second").unwrap();
+        for addr in [&first, &second] {
+            let mut mock = MockTransformImpl::new();
+            mock.expect_depends().returning(|| Ok(Vec::new()));
+            let name = addr.to_id();
+            mock.expect_get_unique_id().returning(move |_| {
+                Ok(Id::builder()
+                    .name(name.clone())
+                    .digest("a".repeat(64))
+                    .build())
+            });
+            mock.expect_needs_prepare().returning(|_| Ok(true));
+            mock.expect_prepare().never();
+            ctx.insert_transform_for_test(addr, Transform::new(mock));
+        }
+        register_mock_no_prepare(
+            &ctx,
+            "//glogfail/root",
+            &["//glogfail/first", "//glogfail/second"],
+        );
+
+        let log = ctx.log().create("glogfail-probe").await.unwrap();
+        let id = Id::builder()
+            .name(first.to_id())
+            .digest("a".repeat(64))
+            .build();
+        let blocked_path = log.path().parent().unwrap().join(format!("{id}.log"));
+        tokio::fs::create_dir(&blocked_path).await.unwrap();
+        let mut g = Graph::new(1);
+        g.add(&ctx, &Addr::parse("//glogfail/root").unwrap())
+            .await
+            .unwrap();
+        let result = g.fetch(&ctx).await;
+        tokio::fs::remove_dir(&blocked_path).await.unwrap();
+        assert!(matches!(result, Err(error::SchedulerError::Child { .. })));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(log_manager)]
     async fn graph_skips_prepare_but_executes_node_with_fetch_id() {
         let ctx = ctx_or_skip!();
         ensure_default_farm(&ctx);
@@ -1251,7 +1624,7 @@ pub(crate) mod tests {
                 .times(1)
                 .returning(move |handle| {
                     count.fetch_add(1, AtomicOrdering::SeqCst);
-                    let mut hash = blake3::Hasher::new();
+                    let mut hash = Sha256::new();
                     hash.update(name.as_bytes());
                     for dep in &deps {
                         let id = handle.unique_id_of(dep).now_or_never().unwrap()?;
@@ -1259,7 +1632,7 @@ pub(crate) mod tests {
                     }
                     Ok(Id::builder()
                         .name(addr.to_id())
-                        .digest(hash.finalize().to_hex().to_string())
+                        .digest(base16::encode_lower(hash.finalize().as_slice()))
                         .build())
                 });
             mock.expect_needs_prepare().returning(|_| Ok(false));

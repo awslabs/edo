@@ -7,6 +7,7 @@ use edo::storage::{
 };
 use edo::transform::{TransformImpl, TransformResult, TransformStatus};
 use indexmap::IndexMap;
+use sha2::{Digest, Sha256};
 use snafu::OptionExt;
 use std::path::Path;
 
@@ -55,14 +56,14 @@ impl TransformImpl for ImportTransform {
     }
 
     async fn get_unique_id(&self, ctx: &Handle) -> TransformResult<Id> {
-        let mut hash = blake3::Hasher::new();
+        let mut hash = Sha256::new();
         for source_list in self.sources.values() {
             for source in source_list {
                 hash.update(source.cached_unique_id(ctx).await?.digest().as_bytes());
             }
         }
         let hash_bytes = hash.finalize();
-        let digest = base16::encode_lower(hash_bytes.as_bytes());
+        let digest = base16::encode_lower(hash_bytes.as_slice());
         let id = Id::builder()
             .name(
                 self.addr

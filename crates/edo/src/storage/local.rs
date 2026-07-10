@@ -17,7 +17,7 @@ use super::catalog::Catalog;
 
 /// Local filesystem storage backend.
 ///
-/// Layers are stored as individual blobs under `blobs/blake3/<digest>` and
+/// Layers are stored as individual blobs under `blobs/sha256/<digest>` and
 /// manifests are tracked in a JSON catalog file. The shared blob layout means
 /// copy operations are metadata-only.
 ///
@@ -118,7 +118,7 @@ impl LocalBackend {
         }
         let catalog_file = path.join("catalog.json");
         let lock_file = path.join("catalog.lock");
-        let layer_dir = path.join("blobs/blake3");
+        let layer_dir = path.join("blobs/sha256");
         if !layer_dir.exists() {
             tokio::fs::create_dir_all(&layer_dir)
                 .await
@@ -580,14 +580,15 @@ mod tests {
 
     #[tokio::test]
     async fn save_persists_across_reload() {
+        const D: &str = "1111111111111111111111111111111111111111111111111111111111111111";
         let dir = TempDir::new().expect("tempdir");
         {
             let b = LocalBackend::new_(dir.path()).await.expect("new local");
-            b.save(&artifact("foo", "111")).await.expect("save");
+            b.save(&artifact("foo", D)).await.expect("save");
         }
         // Re-open the same directory and confirm the manifest is loaded.
         let b = LocalBackend::new_(dir.path()).await.expect("reopen");
-        let id = artifact("foo", "111").config().id().clone();
+        let id = artifact("foo", D).config().id().clone();
         assert!(b.has(&id).await.expect("has"));
     }
 
@@ -604,11 +605,13 @@ mod tests {
         let a = LocalBackend::new_(dir.path()).await.expect("open a");
         let b = LocalBackend::new_(dir.path()).await.expect("open b");
 
-        let id_a = artifact("alpha", "aaa").config().id().clone();
-        let id_b = artifact("beta", "bbb").config().id().clone();
+        let digest_a = "a".repeat(64);
+        let digest_b = "b".repeat(64);
+        let id_a = artifact("alpha", &digest_a).config().id().clone();
+        let id_b = artifact("beta", &digest_b).config().id().clone();
 
-        a.save(&artifact("alpha", "aaa")).await.expect("save a");
-        b.save(&artifact("beta", "bbb")).await.expect("save b");
+        a.save(&artifact("alpha", &digest_a)).await.expect("save a");
+        b.save(&artifact("beta", &digest_b)).await.expect("save b");
 
         // Re-open cleanly and confirm both manifests are present on disk.
         let fresh = LocalBackend::new_(dir.path()).await.expect("reopen");

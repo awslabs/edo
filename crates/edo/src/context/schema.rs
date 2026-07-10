@@ -30,7 +30,7 @@ pub struct Requirement {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
-enum SchemaVersion {
+pub enum SchemaVersion {
     #[default]
     #[serde(rename = "1")]
     V1,
@@ -41,13 +41,13 @@ enum SchemaVersion {
 ///
 /// Internal-only: callers go through [`Schema`] accessors
 /// (`get_source_caches`, `get_build_cache`, `get_output_cache`).
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, bon::Builder)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Cache {
+pub struct Cache {
     #[serde(default)]
     source: BTreeMap<String, Element>,
-    #[serde(default)]
-    build: Option<Element>,
+    #[serde(default, rename = "build")]
+    build_cache: Option<Element>,
     #[serde(default)]
     output: Option<Element>,
 }
@@ -59,24 +59,31 @@ pub(crate) struct Cache {
 /// [`Schema::with_namespace`] when stitching multiple `edo.toml` files
 /// together (one per directory) and [`Schema::resolve_sources`] before
 /// handing elements to the plugin layer.
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, bon::Builder)]
 #[serde(deny_unknown_fields)]
 pub struct Schema {
     #[serde(rename = "schema-version")]
     schema_version: SchemaVersion,
     #[serde(default)]
+    #[builder(default)]
     config: BTreeMap<String, serde_json::Value>,
     #[serde(default)]
+    #[builder(default)]
     cache: Cache,
     #[serde(default)]
+    #[builder(default)]
     environment: BTreeMap<Addr, Element>,
     #[serde(default)]
+    #[builder(default)]
     source: BTreeMap<Addr, Element>,
     #[serde(default)]
+    #[builder(default)]
     transform: BTreeMap<Addr, Element>,
     #[serde(default)]
+    #[builder(default)]
     vendor: BTreeMap<Addr, Element>,
     #[serde(default)]
+    #[builder(default)]
     requires: BTreeMap<Addr, Requirement>,
 }
 
@@ -89,7 +96,7 @@ impl Schema {
             // `Context::add_cache`.
             cache.addr = Addr::parse(&format!("//edo-source-cache/{name}")).unwrap();
         }
-        if let Some(cache) = self.cache.build.as_mut() {
+        if let Some(cache) = self.cache.build_cache.as_mut() {
             // The build cache is always //edo-build-cache
             cache.addr = Addr::parse("//edo-build-cache").unwrap();
         }
@@ -145,7 +152,7 @@ impl Schema {
             self.cache.source.insert(key.clone(), value.clone());
         }
         if let Some(element) = right.get_build_cache() {
-            self.cache.build = Some(element.clone());
+            self.cache.build_cache = Some(element.clone());
         }
         if let Some(element) = right.get_output_cache() {
             self.cache.output = Some(element.clone());
@@ -197,7 +204,7 @@ impl Schema {
 
     /// Build cache backend, if `[cache.build]` is set.
     pub fn get_build_cache(&self) -> Option<&Element> {
-        self.cache.build.as_ref()
+        self.cache.build_cache.as_ref()
     }
 
     /// Output cache backend, if `[cache.output]` is set.
