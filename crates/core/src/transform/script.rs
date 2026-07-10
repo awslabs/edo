@@ -13,6 +13,7 @@ use async_trait::async_trait;
 use handlebars::Handlebars;
 use indexmap::IndexMap;
 use ocilot::models::Platform;
+use sha2::{Digest, Sha256};
 use snafu::{OptionExt, ResultExt};
 
 #[derive(serde::Deserialize, Debug, Clone)]
@@ -88,7 +89,7 @@ impl TransformImpl for ScriptTransform {
     async fn get_unique_id(&self, ctx: &Handle) -> TransformResult<Id> {
         // Digest will be a merkle hash of:
         // all sources digest + script contents
-        let mut hash = blake3::Hasher::new();
+        let mut hash = Sha256::new();
         let mut depends = self.options.depends.clone();
         depends.sort();
         for depend in depends.iter() {
@@ -112,7 +113,7 @@ impl TransformImpl for ScriptTransform {
         let script = self.options.commands.join("\n");
         hash.update(script.as_bytes());
         let hash_bytes = hash.finalize();
-        let digest = base16::encode_lower(hash_bytes.as_bytes());
+        let digest = base16::encode_lower(hash_bytes.as_slice());
         let id = Id::builder()
             .name(self.addr.to_id())
             .digest(digest)

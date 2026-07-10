@@ -170,6 +170,11 @@ impl Context {
         Ok(ctx.clone())
     }
 
+    /// Return the context's project directory
+    pub fn project_dir(&self) -> &Path {
+        self.project_dir.as_path()
+    }
+
     /// Adds any project found config nodes to the config
     pub fn add_config(&self, config: &BTreeMap<String, serde_json::Value>) {
         self.config.merge(config);
@@ -202,6 +207,26 @@ impl Context {
                 .map(|x| (x.key().clone(), x.value().clone()))
                 .collect(),
             self.args.clone(),
+        )
+    }
+
+    /// Creates a read-only [`Handle`] snapshot for use by transforms during execution with an argument override
+    pub fn get_handle_with_args(&self, args: HashMap<String, String>) -> Handle {
+        let mut merged: HashMap<String, String> = self.args.clone();
+        merged.extend(args);
+        Handle::new(
+            self.log.clone(),
+            self.config.clone(),
+            self.storage.clone(),
+            self.transforms
+                .iter()
+                .map(|x| (x.key().clone(), x.value().clone()))
+                .collect(),
+            self.farms
+                .iter()
+                .map(|x| (x.key().clone(), x.value().clone()))
+                .collect(),
+            merged,
         )
     }
 
@@ -353,9 +378,23 @@ impl Context {
     }
 
     /// Sets up environments and executes the build for the given transform address.
+    ///
+    /// The inline canvas is always shut down before this method returns,
+    /// regardless of which phase failed. Without this guarantee an early
+    /// `setup_environments` failure would `?`-propagate past the cleanup
+    /// and leave the tty in raw mode with a frozen canvas overlay —
+    /// the user would see the snafu error chain printed underneath but
+    /// have no functioning prompt or shell.
     pub async fn run(&self, addr: &Addr) -> ContextResult<()> {
-        self.setup_environments().await?;
-        self.scheduler().run(self, addr).await?;
+        let env_setup = self.setup_environments().await;
+        let build_result = if env_setup.is_ok() {
+            self.scheduler().run(self, addr).await
+        } else {
+            // Skip scheduling but still tear the canvas down below.
+            Ok(())
+        };
+        env_setup?;
+        build_result?;
         Ok(())
     }
 }

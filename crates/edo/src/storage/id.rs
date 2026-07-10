@@ -1,12 +1,35 @@
 use super::error;
 use bon::Builder;
+use regex::Regex;
 use semver::Version;
 use serde::{Deserialize, Serialize};
-use snafu::ResultExt;
-use std::{fmt, str::FromStr};
+use snafu::{OptionExt, ResultExt};
+use std::{fmt, str::FromStr, sync::LazyLock};
 
 const UNSUPPORTED_CHARS: &[char] = &['@', ':', '.', '-', '/'];
 const UNSUPPORTED_PREFIX: &[&str] = &["http://", "https://"];
+static ID_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?x)
+        ^
+        (?P<name>[A-Za-z0-9_]+)
+        (?:\.(?P<arch>[A-Za-z0-9_]+))?
+        (?:@(?P<version>
+            (?:0|[1-9]\d*)                                    # major
+            \.(?:0|[1-9]\d*)                                  # .minor
+            \.(?:0|[1-9]\d*)                                  # .patch
+            (?:-                                              # -prerelease
+              (?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)
+              (?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*
+            )?
+            (?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?          # +build
+        ))?
+        :(?P<digest>[0-9a-f]{64})
+        $
+    ",
+    )
+    .unwrap()
+});
 
 /// The human-readable name portion of an artifact [`Id`].
 ///
@@ -54,14 +77,12 @@ impl fmt::Display for Name {
 /// The unique identifier for an artifact in storage.
 ///
 /// Composed of a [`Name`], an optional package name, an optional semver
-/// version, an optional architecture tag, and a BLAKE3 content digest.
-/// Serializes to the format `[<package>+]<name>[-<version>][.<arch>]-<digest>`.
+/// version, an optional architecture tag, and a SHA256 content digest.
+/// Serializes to the format `<name>[.arch][@<version>]:<digest>`.
 #[derive(Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Debug, Builder)]
 pub struct Id {
     #[builder(into)]
     name: Name,
-    #[builder(into)]
-    package: Option<Name>,
     #[builder(into)]
     version: Option<Version>,
     #[builder(into)]
@@ -75,12 +96,7 @@ impl Id {
         self.name.clone().to_string()
     }
 
-    /// Return the optional package name as a string.
-    pub fn package(&self) -> Option<String> {
-        self.package.clone().map(|x| x.to_string())
-    }
-
-    /// Return a reference to the BLAKE3 hex digest.
+    /// Return a reference to the SHA256 hex digest.
     pub fn digest(&self) -> &String {
         &self.digest
     }
@@ -114,18 +130,14 @@ impl Id {
     /// to identify multiple versions of an artifact from a transform
     pub fn prefix(&self) -> String {
         let mut prefix = String::default();
-        if let Some(package) = self.package() {
-            prefix += package.as_str();
-            prefix += "+";
-        }
         prefix += self.name().as_str();
-        if let Some(version) = self.version() {
-            prefix += "-";
-            prefix += version.to_string().as_str();
-        }
         if let Some(arch) = self.arch() {
             prefix += ".";
             prefix += arch.as_str();
+        }
+        if let Some(version) = self.version() {
+            prefix += "@";
+            prefix += version.to_string().as_str();
         }
         prefix
     }
@@ -135,71 +147,43 @@ impl FromStr for Id {
     type Err = super::error::StorageError;
 
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        let (package, s) = if s.contains('+') {
-            let (left, right) = s.split_once('+').unwrap();
-            (Some(left.into()), right)
-        } else {
-            (None, s)
-        };
-        let segments = s.split("-").collect::<Vec<_>>();
+        let caps = ID_REGEX.captures(s).context(error::IdSnafu {
+            reason: format!("'{s}' is not a valid artifact id"),
+        })?;
 
-        if segments.len() == 2 {
-            let (name, arch) = if segments[0].contains(".") {
-                segments[0]
-                    .split_once(".")
-                    .map(|(x, y)| (x, Some(y)))
-                    .unwrap()
-            } else {
-                (segments[0], None)
-            };
-            Ok(Self {
-                name: name.into(),
-                package,
-                version: None,
-                arch: arch.map(|x| x.into()),
-                digest: segments[1].into(),
-            })
-        } else if segments.len() == 3 {
-            let (version, arch) = if segments[1].contains(".") {
-                segments[0]
-                    .split_once(".")
-                    .map(|(x, y)| (x, Some(y)))
-                    .unwrap()
-            } else {
-                (segments[0], None)
-            };
-            Ok(Self {
-                name: segments[0].into(),
-                package,
-                version: Some(Version::parse(version).context(error::SemverSnafu)?),
-                arch: arch.map(|x| x.into()),
-                digest: segments[1].into(),
-            })
-        } else {
-            error::IdSnafu {
-                reason: format!("'{}' is not a valid artifact id", s),
-            }
-            .fail()
-        }
+        // Required groups: unwrap is safe because the regex matched.
+        let name = caps.name("name").unwrap().as_str();
+        let digest = caps.name("digest").unwrap().as_str();
+
+        // Optional groups: `.name()` returns Option<Match<'_>>.
+        let arch = caps.name("arch").map(|m| m.as_str().to_string());
+        let version = caps
+            .name("version")
+            .map(|m| Version::parse(m.as_str()))
+            .transpose()
+            .context(error::SemverSnafu)?;
+
+        Ok(Self {
+            name: name.into(),
+            version,
+            arch,
+            digest: digest.to_string(),
+        })
     }
 }
 
 impl fmt::Display for Id {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if let Some(package) = self.package() {
-            f.write_str(package.as_str())?;
-            f.write_str("+")?;
-        }
         f.write_str(self.name().as_str())?;
-        if let Some(version) = self.version() {
-            f.write_str("-")?;
-            f.write_str(version.to_string().as_str())?;
-        }
         if let Some(arch) = self.arch() {
             f.write_str(".")?;
             f.write_str(arch.as_str())?;
         }
-        f.write_str("-")?;
+        if let Some(version) = self.version() {
+            f.write_str("@")?;
+            f.write_str(version.to_string().as_str())?;
+        }
+        f.write_str(":")?;
         f.write_str(self.digest())
     }
 }
