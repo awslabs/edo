@@ -3,6 +3,7 @@ use async_compression::tokio::bufread::{
     LzmaEncoder, XzDecoder, XzEncoder, ZstdDecoder, ZstdEncoder,
 };
 use parking_lot::Mutex;
+use sha2::{Digest, Sha256};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::Poll;
@@ -10,7 +11,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, BufReader};
 
 use crate::storage::Compression;
 
-/// An async reader wrapper that computes a BLAKE3 hash of all bytes read.
+/// An async reader wrapper that computes a SHA256 hash of all bytes read.
 ///
 /// Implements both [`AsyncRead`] and [`std::io::Read`] (blocking via the
 /// current tokio runtime). Use [`Reader::finish`] after all data has been
@@ -21,12 +22,12 @@ pub struct Reader {
 }
 
 impl Reader {
-    /// Wrap an async reader, starting a fresh BLAKE3 hash.
+    /// Wrap an async reader, starting a fresh SHA256 hash.
     pub fn new(reader: impl AsyncRead + Send + 'static) -> Self {
         Self {
             inner: Arc::new(Mutex::new(Inner {
                 reader: Box::pin(reader),
-                hash: blake3::Hasher::new(),
+                hash: Sha256::new(),
                 pos: 0,
             })),
         }
@@ -49,7 +50,7 @@ impl Reader {
                     Compression::Zstd => Box::pin(ZstdEncoder::new(buffered)),
                     Compression::None => Box::pin(buffered),
                 },
-                hash: blake3::Hasher::new(),
+                hash: Sha256::new(),
                 pos: 0,
             })),
         }
@@ -72,24 +73,24 @@ impl Reader {
                     Compression::Zstd => Box::pin(ZstdDecoder::new(buffered)),
                     Compression::None => Box::pin(buffered),
                 },
-                hash: blake3::Hasher::new(),
+                hash: Sha256::new(),
                 pos: 0,
             })),
         }
     }
 
-    /// Finalize the hash and return the hex-encoded BLAKE3 digest of all bytes read so far.
+    /// Finalize the hash and return the hex-encoded SHA256 digest of all bytes read so far.
     pub fn finish(&self) -> String {
         let lock = self.inner.lock();
-        let hash = lock.hash.finalize();
+        let hash = lock.hash.clone().finalize();
 
-        base16::encode_lower(hash.as_bytes())
+        base16::encode_lower(hash.as_slice())
     }
 }
 
 struct Inner {
     reader: Pin<Box<dyn AsyncRead + Send>>,
-    hash: blake3::Hasher,
+    hash: Sha256,
     pos: usize,
 }
 

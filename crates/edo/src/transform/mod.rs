@@ -37,8 +37,6 @@ pub trait Transform {
     async fn get_unique_id(&self, ctx: &Handle) -> TransformResult<Id>;
     /// Returns addresses of all transforms this one depends on.
     async fn depends(&self) -> TransformResult<Vec<Addr>>;
-    /// Reports whether this transform needs its `prepare` step to run.
-    ///
     /// The scheduler's fetch phase calls this *after* a build-cache miss
     /// to decide whether spawning a per-node prepare task is worthwhile.
     /// Returning `false` lets the scheduler skip the spawn entirely —

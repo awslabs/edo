@@ -17,7 +17,6 @@ aws-config         = { workspace = true }
 aws-sdk-s3         = { workspace = true }
 base16             = { workspace = true }
 bimap              = { workspace = true }
-blake3             = { workspace = true }
 bon                = { workspace = true }
 daggy              = { workspace = true }
 dashmap            = { workspace = true }
@@ -43,6 +42,7 @@ schemars           = { workspace = true, features = ["semver1"] }
 semver             = { workspace = true }
 serde              = { workspace = true }
 serde_json         = { workspace = true }
+sha2               = { workspace = true }
 snafu              = { workspace = true }
 tempfile           = { workspace = true }
 tokio              = { workspace = true }

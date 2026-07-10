@@ -4,6 +4,7 @@ use edo::record;
 use edo::source::{SourceImpl, SourceResult};
 use edo::storage::{Artifact, Compression, Config, Id, LayerOptions, MediaType, Storage};
 use merkle_hash::MerkleTree;
+use sha2::{Digest, Sha256};
 use snafu::ResultExt;
 use std::path::{PathBuf, absolute};
 use tokio::{fs::File, io::AsyncWriteExt};
@@ -48,10 +49,10 @@ impl SourceImpl for LocalSource {
         // Fold `out` into the manifest digest so `out` changes invalidate
         // the cached manifest. The blob itself is still derived purely
         // from the file content; only the *manifest* id changes.
-        let mut hasher = blake3::Hasher::new();
+        let mut hasher = Sha256::new();
         hasher.update(hash.as_slice());
         hasher.update(&out_bytes(self.out.as_ref()));
-        let digest = base16::encode_lower(hasher.finalize().as_bytes());
+        let digest = base16::encode_lower(hasher.finalize().as_slice());
 
         let id = Id::builder()
             .name(

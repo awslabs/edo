@@ -22,6 +22,7 @@ use edo::{
     storage::{Artifact, ArtifactStageOptions, Compression, Config, Id, LayerOptions, MediaType},
     transform::{TransformError, TransformImpl, TransformResult, TransformStatus},
 };
+use sha2::{Digest, Sha256};
 use snafu::OptionExt;
 use std::{collections::BTreeMap, path::Path};
 use std::{collections::VecDeque, path::PathBuf};
@@ -105,7 +106,7 @@ impl TransformImpl for CargoVendorTransform {
     /// unique ids of every input source. Changing any source (or the
     /// environment) invalidates the cached output.
     async fn get_unique_id(&self, _ctx: &Handle) -> TransformResult<Id> {
-        let mut hash = blake3::Hasher::new();
+        let mut hash = Sha256::new();
         hash.update(self.environment.to_string().as_bytes());
         for source in self.sources.values() {
             let source_id = source.get_unique_id().await?;
@@ -124,7 +125,7 @@ impl TransformImpl for CargoVendorTransform {
         let digest = hash.finalize();
         let id = Id::builder()
             .name(self.addr.to_id())
-            .digest(digest.to_hex().to_lowercase())
+            .digest(base16::encode_lower(digest.as_slice()))
             .build();
         trace!(subsystem = "transform", component = "cargo-vendor", id = %id, "calculated id");
         Ok(id.clone())
@@ -180,6 +181,8 @@ impl TransformImpl for CargoVendorTransform {
                 ArtifactStageOptions::builder()
                     .id(id)
                     .path(dir)
+                    .extract(true)
+                    .decompress(true)
                     .ignore_artifact_path(true)
                     .build(),
             )

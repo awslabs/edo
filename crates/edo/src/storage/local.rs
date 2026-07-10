@@ -15,7 +15,7 @@ use super::catalog::Catalog;
 
 /// Local filesystem storage backend.
 ///
-/// Layers are stored as individual blobs under `blobs/blake3/<digest>` and
+/// Layers are stored as individual blobs under `blobs/sha256/<digest>` and
 /// manifests are tracked in a JSON catalog file. The shared blob layout means
 /// copy operations are metadata-only.
 ///
@@ -84,7 +84,7 @@ impl LocalBackend {
                 .context(error::NewSnafu)?;
         }
         let catalog_file = path.join("catalog.json");
-        let layer_dir = path.join("blobs/blake3");
+        let layer_dir = path.join("blobs/sha256");
         if !layer_dir.exists() {
             tokio::fs::create_dir_all(&layer_dir)
                 .await
@@ -467,14 +467,19 @@ mod tests {
 
     #[tokio::test]
     async fn save_persists_across_reload() {
+        // The reload path goes through `serde_json::from_slice` for the
+        // catalog, which deserializes `Id`s via `FromStr`. That parser
+        // requires a 64-hex SHA256 digest, so this test cannot use a
+        // short placeholder digest.
+        const D: &str = "1111111111111111111111111111111111111111111111111111111111111111";
         let dir = TempDir::new().expect("tempdir");
         {
             let b = LocalBackend::new_(dir.path()).await.expect("new local");
-            b.save(&artifact("foo", "111")).await.expect("save");
+            b.save(&artifact("foo", D)).await.expect("save");
         }
         // Re-open the same directory and confirm the manifest is loaded.
         let b = LocalBackend::new_(dir.path()).await.expect("reopen");
-        let id = artifact("foo", "111").config().id().clone();
+        let id = artifact("foo", D).config().id().clone();
         assert!(b.has(&id).await.expect("has"));
     }
 }
