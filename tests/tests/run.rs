@@ -116,7 +116,7 @@ depends = ["build"]
             assert_eq!(
                 manifests
                     .keys()
-                    .filter(|id| id.starts_with(&format!("{name}.{arch}-")))
+                    .filter(|id| id.starts_with(&format!("{name}.{arch}:")))
                     .count(),
                 1
             );
@@ -129,7 +129,7 @@ depends = ["build"]
         let arch = id
             .strip_prefix("hello_script_build.")
             .unwrap()
-            .split('-')
+            .split(':')
             .next()
             .unwrap();
         assert_eq!(manifest["layers"][0]["platform"]["architecture"], arch);

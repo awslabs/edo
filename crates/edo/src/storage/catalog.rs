@@ -188,9 +188,11 @@ mod tests {
 
     #[test]
     fn round_trips_through_serde() {
+        const D1: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+        const D2: &str = "2222222222222222222222222222222222222222222222222222222222222222";
         let mut c = Catalog::default();
-        c.add(&artifact("foo", "111", &["aaa"]));
-        c.add(&artifact("bar", "222", &["bbb", "ccc"]));
+        c.add(&artifact("foo", D1, &["aaa"]));
+        c.add(&artifact("bar", D2, &["bbb", "ccc"]));
         let bytes = serde_json::to_vec(&c).expect("serialize");
         let back: Catalog = serde_json::from_slice(&bytes).expect("deserialize");
         assert_eq!(back.list_all().len(), 2);

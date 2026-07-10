@@ -17,16 +17,7 @@ pub fn local_storage_root(storage: &Path) -> PathBuf {
     storage.join("storage")
 }
 
-/// Returns `path_hints` (artifact-level table introduced when path hints
-/// were lifted off `Layer`) for every manifest whose id starts with the
-/// given `<prefix>-`.
-///
-/// The prefix is matched against `Id::name`, not the full `name-digest`
-/// string, so e.g. `"files"` matches `"files-abc"` even though `Id`s
-/// embed both name and digest.
-///
-/// Used to verify that two runs of the same source with different `out`
-/// values produced two distinct manifests carrying their respective hints.
+/// Returns path hints for manifests whose ids start with `<prefix>:`.
 pub fn read_path_hints_by_prefix(storage: &Path, prefix: &str) -> Vec<BTreeMap<String, String>> {
     let path = local_storage_root(storage).join("catalog.json");
     let raw =
@@ -38,7 +29,7 @@ pub fn read_path_hints_by_prefix(storage: &Path, prefix: &str) -> Vec<BTreeMap<S
         .expect("catalog.manifests is an object");
     manifests
         .iter()
-        .filter(|(k, _)| k.starts_with(&format!("{prefix}-")))
+        .filter(|(k, _)| k.starts_with(&format!("{prefix}:")))
         .map(|(_, manifest)| {
             manifest
                 .get("config")
@@ -54,18 +45,9 @@ pub fn read_path_hints_by_prefix(storage: &Path, prefix: &str) -> Vec<BTreeMap<S
         .collect()
 }
 
-/// Counts the number of blob files under `<storage>/storage/blobs/blake3`.
-///
-/// Filters to filenames matching the BLAKE3 digest format (64 hex chars)
-/// so leftover `.tmp` files from in-flight or aborted writes do not cause
-/// flaky assertions on regression tests that count blobs.
-///
-/// The remote-source blob-reuse fix should produce **exactly one** blob
-/// for the same `ref` even after `out` changes; the local/git equivalents
-/// are allowed to grow because they are not content-addressed at the
-/// source level.
+/// Counts SHA256-named blobs, excluding temporary files.
 pub fn count_blobs(storage: &Path) -> usize {
-    let dir = local_storage_root(storage).join("blobs").join("blake3");
+    let dir = local_storage_root(storage).join("blobs").join("sha256");
     std::fs::read_dir(&dir)
         .unwrap_or_else(|e| panic!("read blob dir {}: {e}", dir.display()))
         .filter_map(|r| r.ok())

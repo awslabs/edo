@@ -170,6 +170,11 @@ impl Context {
         Ok(ctx.clone())
     }
 
+    /// Return the context's project directory
+    pub fn project_dir(&self) -> &Path {
+        self.project_dir.as_path()
+    }
+
     /// Adds any project found config nodes to the config
     pub fn add_config(&self, config: &BTreeMap<String, serde_json::Value>) {
         self.config.merge(config);
@@ -202,6 +207,26 @@ impl Context {
                 .map(|x| (x.key().clone(), x.value().clone()))
                 .collect(),
             self.args.clone(),
+        )
+    }
+
+    /// Creates a read-only [`Handle`] snapshot for use by transforms during execution with an argument override
+    pub fn get_handle_with_args(&self, args: HashMap<String, String>) -> Handle {
+        let mut merged: HashMap<String, String> = self.args.clone();
+        merged.extend(args);
+        Handle::new(
+            self.log.clone(),
+            self.config.clone(),
+            self.storage.clone(),
+            self.transforms
+                .iter()
+                .map(|x| (x.key().clone(), x.value().clone()))
+                .collect(),
+            self.farms
+                .iter()
+                .map(|x| (x.key().clone(), x.value().clone()))
+                .collect(),
+            merged,
         )
     }
 

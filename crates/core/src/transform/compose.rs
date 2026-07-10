@@ -5,6 +5,7 @@ use edo::{
     storage::{Artifact, ArtifactStageOptions, Compression, Config, Id, LayerOptions, MediaType},
     transform::{TransformImpl, TransformResult, TransformStatus},
 };
+use sha2::{Digest, Sha256};
 use std::path::Path;
 
 #[derive(serde::Deserialize, Debug, Clone)]
@@ -50,7 +51,7 @@ impl TransformImpl for ComposeTransform {
     }
 
     async fn get_unique_id(&self, ctx: &Handle) -> TransformResult<Id> {
-        let mut hash = blake3::Hasher::new();
+        let mut hash = Sha256::new();
         let mut depend = self.depends.clone();
         depend.sort();
         for depend in depend.iter() {
@@ -58,7 +59,7 @@ impl TransformImpl for ComposeTransform {
             hash.update(id.digest().as_bytes());
         }
         let hash_bytes = hash.finalize();
-        let digest = base16::encode_lower(hash_bytes.as_bytes());
+        let digest = base16::encode_lower(hash_bytes.as_slice());
 
         let id = Id::builder()
             .name(self.addr.to_id())
