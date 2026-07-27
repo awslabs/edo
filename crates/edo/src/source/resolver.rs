@@ -114,34 +114,44 @@ impl Resolver {
     /// Must be called for every package name that appears in a dependency graph
     /// before calling [`Resolver::resolve`].
     pub async fn build_db(&self, name: &str) -> Result<()> {
-        for entry in self.vendors.iter() {
-            let vendor_name = entry.key();
-            let vendor = entry.value();
+        // Snapshot the vendor list to a plain `Vec` so we don't hold a
+        // DashMap iterator guard across `.await` (get_options can block
+        // on network) or across the `name_to_vs` writes below (which
+        // would risk a same-shard read+write deadlock inside DashMap).
+        let vendors: Vec<(String, Vendor)> = self
+            .vendors
+            .iter()
+            .map(|e| (e.key().clone(), e.value().clone()))
+            .collect();
+        for (vendor_name, vendor) in vendors {
             let version_set = vendor.get_options(name).await?;
             let name_id = self.pool.intern_package_name(name.to_string());
             let mut edo_versions = Vec::new();
             for version in version_set {
-                let edo_version = EdoVersion::new(vendor_name, &version);
+                let edo_version = EdoVersion::new(&vendor_name, &version);
                 self.pool.intern_solvable(name_id, edo_version.clone());
                 edo_versions.push(edo_version.clone());
             }
             let vsid = self
                 .pool
                 .intern_version_set(name_id, EdoVersionSet::new(edo_versions.as_slice()));
-            if let Some(entry) = self.name_to_vs.get(&name_id) {
-                let union_id = match entry.value() {
-                    Set::Union(union_id) => {
-                        let vs_union = self.pool.resolve_version_set_union(*union_id);
-                        self.pool.intern_version_set_union(vsid, vs_union)
-                    }
-                    Set::Single(vs_id) => self
-                        .pool
-                        .intern_version_set_union(vsid, [*vs_id].iter().cloned()),
-                };
-                self.name_to_vs.insert(name_id, Set::Union(union_id));
-            } else {
-                self.name_to_vs.insert(name_id, Set::Single(vsid));
-            }
+            // Compute the next `Set` value with the read guard released
+            // before writing back: DashMap uses a sharded RwLock, and
+            // holding a read guard on a shard while calling `insert`
+            // that lands on the same shard will deadlock.
+            let existing = self.name_to_vs.get(&name_id).map(|e| e.value().clone());
+            let next = match existing {
+                Some(Set::Union(union_id)) => {
+                    let vs_union = self.pool.resolve_version_set_union(union_id);
+                    Set::Union(self.pool.intern_version_set_union(vsid, vs_union))
+                }
+                Some(Set::Single(vs_id)) => Set::Union(
+                    self.pool
+                        .intern_version_set_union(vsid, [vs_id].iter().cloned()),
+                ),
+                None => Set::Single(vsid),
+            };
+            self.name_to_vs.insert(name_id, next);
         }
         Ok(())
     }
@@ -211,6 +221,9 @@ impl Resolver {
 }
 
 impl Interner for Resolver {
+    type NameId = NameId;
+    type SolvableId = SolvableId;
+
     fn display_solvable(&self, solvable: SolvableId) -> impl fmt::Display + '_ {
         let solvable = self.pool.resolve_solvable(solvable);
         format!(
@@ -308,10 +321,15 @@ impl DependencyProvider for Resolver {
         _solver: &resolvo::SolverCache<Self>,
         solvables: &mut [SolvableId],
     ) {
+        // resolvo iterates candidates from front to back and prefers the
+        // first satisfying assignment, so put the highest version first.
+        // Sorting ascending here would make the solver pick the lowest
+        // matching version for constraints like `>=14` (`14.0.0`) instead
+        // of the newest available (`14.9.0`).
         solvables.sort_by(|x, y| {
             let left = self.pool.resolve_solvable(*x);
             let right = self.pool.resolve_solvable(*y);
-            left.record.version().cmp(&right.record.version())
+            right.record.version().cmp(&left.record.version())
         });
     }
 
@@ -372,5 +390,156 @@ impl DependencyProvider for Resolver {
         }
 
         dependencies
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{Vendor, VendorImpl};
+    use super::*;
+    use crate::context::{Addr, Element};
+    use crate::source::SourceResult;
+    use async_trait::async_trait;
+    use semver::{Version, VersionReq};
+    use std::collections::{HashMap, HashSet};
+
+    /// A hand-rolled `VendorImpl` for resolver tests: exposes a fixed set
+    /// of versions and a fixed dependency map without touching the network.
+    ///
+    /// Mirrors the shape of the mock in `super::tests` — we can't use
+    /// mockall here because `Vendor` is an `arc_handle` trait and mocks
+    /// don't cross the `arc_handle` boundary cleanly.
+    struct FakeVendor {
+        versions: HashSet<Version>,
+        deps: HashMap<Version, HashMap<String, VersionReq>>,
+    }
+
+    #[async_trait]
+    impl VendorImpl for FakeVendor {
+        async fn get_options(&self, _name: &str) -> SourceResult<HashSet<Version>> {
+            Ok(self.versions.clone())
+        }
+
+        async fn resolve(&self, name: &str, _version: &Version) -> SourceResult<Element> {
+            Ok(Element::builder()
+                .addr(Addr::parse(name)?)
+                .kind("test")
+                .config(std::collections::BTreeMap::new())
+                .build())
+        }
+
+        async fn get_dependencies(
+            &self,
+            _name: &str,
+            version: &Version,
+        ) -> SourceResult<Option<HashMap<String, VersionReq>>> {
+            Ok(self.deps.get(version).cloned())
+        }
+    }
+
+    fn ver(s: &str) -> Version {
+        Version::parse(s).unwrap()
+    }
+
+    fn req(s: &str) -> VersionReq {
+        VersionReq::parse(s).unwrap()
+    }
+
+    /// `>=14` must resolve to the highest available version (14.9.0),
+    /// not the lowest (14.0.0). `sort_candidates` orders solvables
+    /// descending so resolvo picks the newest satisfying version first.
+    #[tokio::test]
+    async fn resolves_to_highest_matching_version() {
+        let vendor = Vendor::new(FakeVendor {
+            versions: HashSet::from_iter([
+                ver("14.0.0"),
+                ver("14.5.0"),
+                ver("14.9.0"),
+                ver("13.0.0"),
+                ver("15.0.0"),
+            ]),
+            deps: HashMap::new(),
+        });
+        let mut resolver = Resolver::default();
+        resolver.add_vendor("//vendor/test", vendor);
+        resolver.build_db("kit").await.expect("build_db");
+
+        let addr = Addr::parse("//kits/kit").unwrap();
+        let dep = Dependency {
+            addr: addr.clone(),
+            kind: "kit-image".to_string(),
+            name: "kit".to_string(),
+            version: req(">=14"),
+            vendor: Some("//vendor/test".to_string()),
+        };
+        let result = tokio::task::spawn_blocking(move || resolver.resolve(vec![dep]))
+            .await
+            .expect("join")
+            .expect("resolve");
+        let (_, _, v) = result.get(&addr).expect("found addr");
+        assert_eq!(*v, ver("15.0.0"), "resolver must prefer highest version");
+    }
+
+    /// When a kit's transitive SDK requirement (surfaced via
+    /// `get_dependencies`) conflicts with the project's SDK requirement,
+    /// resolution must fail rather than silently drop the constraint or
+    /// pick a version that violates it.
+    #[tokio::test]
+    async fn conflicting_transitive_sdk_requirement_fails_resolution() {
+        // Kit vendor: two versions, both pinning SDK to 0.76.0.
+        let kit_vendor = Vendor::new(FakeVendor {
+            versions: HashSet::from_iter([ver("14.0.0"), ver("14.9.0")]),
+            deps: HashMap::from([
+                (
+                    ver("14.0.0"),
+                    HashMap::from([("sdk".to_string(), req("=0.72.0"))]),
+                ),
+                (
+                    ver("14.9.0"),
+                    HashMap::from([("sdk".to_string(), req("=0.76.0"))]),
+                ),
+            ]),
+        });
+        // SDK vendor: publishes 0.72.0, 0.76.0, and 0.77.0.
+        let sdk_vendor = Vendor::new(FakeVendor {
+            versions: HashSet::from_iter([ver("0.72.0"), ver("0.76.0"), ver("0.77.0")]),
+            deps: HashMap::new(),
+        });
+        let mut resolver = Resolver::default();
+        resolver.add_vendor("//vendor/kits", kit_vendor);
+        resolver.add_vendor("//vendor/sdk", sdk_vendor);
+        resolver.build_db("kit").await.expect("build_db kit");
+        resolver.build_db("sdk").await.expect("build_db sdk");
+
+        let kit_addr = Addr::parse("//kits/kit").unwrap();
+        let sdk_addr = Addr::parse("//sdk").unwrap();
+        let requires = vec![
+            Dependency {
+                addr: kit_addr,
+                kind: "kit-image".to_string(),
+                name: "kit".to_string(),
+                version: req(">=14"),
+                vendor: Some("//vendor/kits".to_string()),
+            },
+            Dependency {
+                addr: sdk_addr,
+                kind: "image".to_string(),
+                name: "sdk".to_string(),
+                version: req("=0.77.0"),
+                vendor: Some("//vendor/sdk".to_string()),
+            },
+        ];
+        let err = tokio::task::spawn_blocking(move || resolver.resolve(requires))
+            .await
+            .expect("join")
+            .expect_err("expected resolution to fail");
+        // Error variant is `Resolution { reason: .. }`; we just care that
+        // the resolver refused the solution rather than picking a kit
+        // whose SDK constraint contradicts the project's SDK pin.
+        let msg = err.to_string();
+        assert!(
+            msg.contains("resolution") || msg.contains("Resolution") || msg.contains("sdk"),
+            "unexpected error: {msg}"
+        );
     }
 }
