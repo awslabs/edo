@@ -8,16 +8,21 @@ use edo::storage::{Id, MediaType, Storage};
 use edo::util::{
     Reader, Writer, cmd_collect_out, cmd_noinput, cmd_noredirect, cmd_nulled, from_dash,
 };
+use regex::Regex;
 use snafu::ResultExt;
 use snafu::{OptionExt, ensure};
 use std::collections::HashMap;
 use std::env;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::fs::{File, create_dir_all, remove_file};
 use tracing::Instrument;
 use uuid::Uuid;
 use which::which;
+
+const SHA256_EXTRACT: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new("sha256:([a-fA-F0-9]{64})").unwrap());
 
 /// Configuration for the container runtime (e.g. which CLI binary to use).
 ///
@@ -197,48 +202,46 @@ impl FarmImpl for ContainerFarm {
         drop(archive);
 
         let artifact_id = artifact.config().id().to_string();
-        async move {
-            // Now we can load the image into the runtime using docker load then tag it accordingly
-            record!(log, "load_image", "{:?} load -i {path:?}", cli);
-            let output = cmd_collect_out(
-                ".",
-                log,
-                cli,
-                ["load", "-i", path.to_str().unwrap()],
-                &HashMap::new(),
-            )
-            .context(error::RuntimeSnafu)?;
-            // The return will be the image digest
-            let string = String::from_utf8_lossy(output.as_slice());
-            let string = string
-                .strip_prefix("Loaded image: sha256:")
-                .unwrap_or(string.as_ref());
-            record!(log, "tag_image", "{:?} tag {} {name}", cli, string.trim());
-            cmd_noinput(
-                ".",
-                log,
-                cli,
-                ["tag", string.trim(), name.as_str()],
-                &HashMap::new(),
-            )
-            .context(error::RuntimeSnafu)?;
-            edo::ui_info!(
-                subsystem = "environment",
-                component = "container",
-                op = "image-load",
-                id = artifact_id;
-                "image loaded into container runtime"
-            );
-            remove_file(&path).await.context(error::IoSnafu)?;
-            Ok(())
-        }
-        .instrument(info_span!(
-            "container-load-image",
+        // Now we can load the image into the runtime using docker load then tag it accordingly
+        record!(log, "load_image", "{:?} load -i {path:?}", cli);
+        let output = cmd_collect_out(
+            ".",
+            log,
+            cli,
+            ["load", "-i", path.to_str().unwrap()],
+            &HashMap::new(),
+        )
+        .context(error::RuntimeSnafu)?;
+        // The return will be the image digest
+        let string = String::from_utf8_lossy(output.as_slice());
+        // Use regex to extract the sha256 digest of the image
+        let digest = SHA256_EXTRACT
+            .captures(&string)
+            .and_then(|x| x.get(0))
+            .context(error::LoadNoDigestSnafu {
+                output: string.clone(),
+            })?;
+
+        let digest = digest.as_str();
+        record!(log, "tag_image", "{:?} tag {} {name}", cli, digest);
+        let tag_success = cmd_noinput(
+            ".",
+            log,
+            cli,
+            ["tag", digest, name.as_str()],
+            &HashMap::new(),
+        )
+        .context(error::RuntimeSnafu)?;
+        ensure!(tag_success, error::TagFailedSnafu { digest, tag: name });
+        edo::ui_info!(
             subsystem = "environment",
             component = "container",
-            id = %artifact.config().id()
-        ))
-        .await
+            op = "image-load",
+            id = artifact_id;
+            "image loaded into container runtime"
+        );
+        remove_file(&path).await.context(error::IoSnafu)?;
+        Ok(())
     }
 
     async fn create(&self, _log: &Log, path: &Path) -> EnvResult<Environment> {
@@ -350,74 +353,66 @@ impl EnvironmentImpl for Container {
         if self.running.load(Ordering::SeqCst) {
             return Ok(());
         }
-        async move {
-            let cli = self.config.cli.as_ref().unwrap();
-            let mut args = vec![
-                "run".to_string(),
-                "-it".to_string(),
-                "-d".to_string(),
-                "--security-opt".to_string(),
-                "label=disable".to_string(),
-                "--tmpfs".to_string(),
-                "/tmp".to_string(),
-            ];
-            if !self.config.network {
-                args.push("--network=none".to_string());
-            }
-            // Heavy builds (Kubernetes' Go toolchain, parallel rpmbuild, etc.)
-            // can blow past the rootless default `pids.max` and fail with
-            // `fork/exec ...: resource temporarily unavailable`. Default to
-            // unlimited; honour an explicit override if the user set one.
-            if let Some(limit) = self.config.pids_limit {
-                args.push("--pids-limit".to_string());
-                args.push(limit.to_string());
-            }
-            for ulimit in &self.config.ulimits {
-                args.push("--ulimit".to_string());
-                args.push(ulimit.clone());
-            }
-            if self.user == "root" {
-                args.push("--mount".to_string());
-                args.push(format!(
-                    "src={},dst=/root,type=bind",
-                    std::path::absolute(self.path.clone()).unwrap().display()
-                ));
-                args.push("-u".into());
-                args.push("0:0".into());
-            } else {
-                let home_path = format!("/home/{}", self.user);
-                args.push("--mount".into());
-                args.push(format!(
-                    "src={},dst={home_path},type=bind",
-                    std::path::absolute(self.path.clone()).unwrap().display()
-                ));
-            }
-            if !self.env.is_empty() {
-                args.push("--env".into());
-                let env_list = self
-                    .env
-                    .iter()
-                    .map(|x| format!("{}={}", x.key(), x.value()))
-                    .collect::<Vec<_>>()
-                    .join(",");
-                args.push(env_list);
-            }
-            args.push("--name".into());
-            args.push(self.name.clone());
-            args.push(self.tag.clone());
-            args.push("sh".into());
-            record!(log, "launch", "{:?} {}", cli, args.join(" "));
-            edo::util::cmd_noinput(".", log, cli, args, &from_dash(&self.env))
-                .context(error::RuntimeSnafu)?;
-            self.running.store(true, Ordering::SeqCst);
-            Ok::<(), error::Error>(())
+        let cli = self.config.cli.as_ref().unwrap();
+        let mut args = vec![
+            "run".to_string(),
+            "-it".to_string(),
+            "-d".to_string(),
+            "--security-opt".to_string(),
+            "label=disable".to_string(),
+            "--tmpfs".to_string(),
+            "/tmp".to_string(),
+        ];
+        if !self.config.network {
+            args.push("--network=none".to_string());
         }
-        .instrument(info_span!(
-            "container-up",
-            subsystem = "environment",
-            component = "container"
-        ))
-        .await?;
+        // Heavy builds (Kubernetes' Go toolchain, parallel rpmbuild, etc.)
+        // can blow past the rootless default `pids.max` and fail with
+        // `fork/exec ...: resource temporarily unavailable`. Default to
+        // unlimited; honour an explicit override if the user set one.
+        if let Some(limit) = self.config.pids_limit {
+            args.push("--pids-limit".to_string());
+            args.push(limit.to_string());
+        }
+        for ulimit in &self.config.ulimits {
+            args.push("--ulimit".to_string());
+            args.push(ulimit.clone());
+        }
+        if self.user == "root" {
+            args.push("--mount".to_string());
+            args.push(format!(
+                "src={},dst=/root,type=bind",
+                std::path::absolute(self.path.clone()).unwrap().display()
+            ));
+            args.push("-u".into());
+            args.push("0:0".into());
+        } else {
+            let home_path = format!("/home/{}", self.user);
+            args.push("--mount".into());
+            args.push(format!(
+                "src={},dst={home_path},type=bind",
+                std::path::absolute(self.path.clone()).unwrap().display()
+            ));
+        }
+        if !self.env.is_empty() {
+            args.push("--env".into());
+            let env_list = self
+                .env
+                .iter()
+                .map(|x| format!("{}={}", x.key(), x.value()))
+                .collect::<Vec<_>>()
+                .join(",");
+            args.push(env_list);
+        }
+        args.push("--name".into());
+        args.push(self.name.clone());
+        args.push(self.tag.clone());
+        args.push("sh".into());
+        record!(log, "launch", "{:?} {}", cli, args.join(" "));
+        let launch_success = edo::util::cmd_noinput(".", log, cli, args, &from_dash(&self.env))
+            .context(error::RuntimeSnafu)?;
+        ensure!(launch_success, error::LaunchFailedSnafu);
+        self.running.store(true, Ordering::SeqCst);
         Ok(())
     }
 
@@ -427,7 +422,7 @@ impl EnvironmentImpl for Container {
         }
         let cli = self.config.cli.as_ref().unwrap();
         record!(log, "stop", "{:?} kill {}", cli, self.name);
-        edo::util::cmd_noinput(
+        let kill_status = edo::util::cmd_noinput(
             ".",
             log,
             cli,
@@ -435,8 +430,14 @@ impl EnvironmentImpl for Container {
             &from_dash(&self.env),
         )
         .context(error::RuntimeSnafu)?;
+        ensure!(
+            kill_status,
+            error::StopFailedSnafu {
+                container: self.name.clone()
+            }
+        );
         record!(log, "clean", "{:?} rm {}", cli, self.name);
-        edo::util::cmd_noinput(
+        let rm_status = edo::util::cmd_noinput(
             ".",
             log,
             cli,
@@ -444,6 +445,12 @@ impl EnvironmentImpl for Container {
             &from_dash(&self.env),
         )
         .context(error::RuntimeSnafu)?;
+        ensure!(
+            rm_status,
+            error::RemoveFailedSnafu {
+                container: self.name.clone()
+            }
+        );
         self.running.store(false, Ordering::SeqCst);
         // No spindown needed for a finch environment
         Ok(())
@@ -641,6 +648,8 @@ impl EnvironmentImpl for Container {
         args.push(self.name.clone());
         let mut run_args = args.clone();
         run_args.push("sh".into());
+        // Note: we explicitly ignore the cmd status here because the user can influence the return/exit code of this process when
+        // exiting the spawned shell
         cmd_noredirect(".", cli, run_args, &from_dash(&self.env)).context(error::RuntimeSnafu)?;
         Ok(())
     }
@@ -654,45 +663,36 @@ impl EnvironmentImpl for Container {
             path = %work_dir.display(),
             "running command"
         );
-        async move {
-            let cli = self.config.cli.as_ref().unwrap();
-            let mut args = vec![
-                "exec".to_string(),
-                "-i".to_string(),
-                "--workdir".to_string(),
-                format!("{}", work_dir.display()),
-            ];
-            if self.user == "root" {
-                args.push("-u".into());
-                args.push("0:0".into());
-            }
-            if !self.env.is_empty() {
-                args.push("--env".into());
-                let env_list = self
-                    .env
-                    .iter()
-                    .map(|x| format!("{}={}", x.key(), x.value()))
-                    .collect::<Vec<_>>()
-                    .join(",");
-                args.push(env_list);
-            }
-            args.push(self.name.clone());
-            let mut run_args = args.clone();
-            run_args.push("sh".into());
-            run_args.push("-c".into());
-            run_args.push(cmd.into());
-            record!(log, "exec", "{:?} {}", cli, run_args.join(" "));
-            edo::util::cmd_noinput(".", log, cli, run_args, &from_dash(&self.env))
-                .context(error::RuntimeSnafu)
+        let cli = self.config.cli.as_ref().unwrap();
+        let mut args = vec![
+            "exec".to_string(),
+            "-i".to_string(),
+            "--workdir".to_string(),
+            format!("{}", work_dir.display()),
+        ];
+        if self.user == "root" {
+            args.push("-u".into());
+            args.push("0:0".into());
         }
-        .instrument(info_span!(
-            "container-exec",
-            subsystem = "environment",
-            component = "container",
-            id = %id
-        ))
-        .await
-        .map_err(|e| e.into())
+        if !self.env.is_empty() {
+            args.push("--env".into());
+            let env_list = self
+                .env
+                .iter()
+                .map(|x| format!("{}={}", x.key(), x.value()))
+                .collect::<Vec<_>>()
+                .join(",");
+            args.push(env_list);
+        }
+        args.push(self.name.clone());
+        let mut run_args = args.clone();
+        run_args.push("sh".into());
+        run_args.push("-c".into());
+        run_args.push(cmd.into());
+        record!(log, "exec", "{:?} {}", cli, run_args.join(" "));
+        let status = edo::util::cmd_noinput(".", log, cli, run_args, &from_dash(&self.env))
+            .context(error::RuntimeSnafu)?;
+        Ok(status)
     }
 }
 
@@ -725,8 +725,12 @@ pub mod error {
         Extract { source: std::io::Error },
         #[snafu(display("io error occured setting up container environment: {source}"))]
         Io { source: std::io::Error },
+        #[snafu(display("container runtime failed to launch container"))]
+        LaunchFailed,
         #[snafu(display("failed to load oci image into container runtime: {source}"))]
         Load { source: std::io::Error },
+        #[snafu(display("container runtime image load did not return a digest: {output}"))]
+        LoadNoDigest { output: String },
         #[snafu(display(
             "no supported container runtime was found, make sure one of podman, finch or docker is available"
         ))]
@@ -737,6 +741,8 @@ pub mod error {
         NotFound { path: PathBuf },
         #[snafu(display("failed to read file: {source}"))]
         ReadFile { source: std::io::Error },
+        #[snafu(display("container runtime failed to remove container {container}"))]
+        RemoveFailed { container: String },
         #[snafu(display("failed to execute runtime: {source}"))]
         Runtime { source: std::io::Error },
         #[snafu(display("{source}"))]
@@ -744,11 +750,15 @@ pub mod error {
             #[snafu(source(from(edo::source::SourceError, Box::new)))]
             source: Box<edo::source::SourceError>,
         },
+        #[snafu(display("container runtime failed to stop container {container}"))]
+        StopFailed { container: String },
         #[snafu(display("{source}"))]
         Storage {
             #[snafu(source(from(edo::storage::StorageError, Box::new)))]
             source: Box<edo::storage::StorageError>,
         },
+        #[snafu(display("failed to tag image with digest {digest} as {tag}"))]
+        TagFailed { digest: String, tag: String },
         #[snafu(display("artifact does not have an image tag in its metadata"))]
         TagMissing,
         #[snafu(display("failed to create workspace directory: {source}"))]

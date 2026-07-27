@@ -5,7 +5,7 @@ use edo::source::{SourceImpl, SourceResult};
 use edo::storage::{Artifact, Compression, Config, Id, LayerOptions, MediaType, Storage};
 use edo::util::cmd_noinput;
 use sha2::{Digest, Sha256};
-use snafu::ResultExt;
+use snafu::{ResultExt, ensure};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use tempfile::tempdir;
@@ -65,78 +65,73 @@ impl SourceImpl for GitSource {
 
     async fn fetch(&self, log: &Log, storage: &Storage) -> SourceResult<Artifact> {
         let id = self.get_unique_id().await?;
-        let id_s = id.to_string();
         record!(log, "clone", "git clone -b {} {}", self.reference, self.url);
-        async move {
-            let temp = tempdir().context(error::TempDirectorySnafu)?;
-            cmd_noinput(
-                ".",
-                log,
-                "git",
-                vec![
-                    "clone".into(),
-                    "-b".into(),
-                    self.reference.clone(),
-                    self.url.clone(),
-                    temp.path().to_string_lossy().to_string(),
-                ],
-                &HashMap::new(),
+        let temp = tempdir().context(error::TempDirectorySnafu)?;
+        let clone_status = cmd_noinput(
+            ".",
+            log,
+            "git",
+            vec![
+                "clone".into(),
+                "-b".into(),
+                self.reference.clone(),
+                self.url.clone(),
+                temp.path().to_string_lossy().to_string(),
+            ],
+            &HashMap::new(),
+        )
+        .context(error::GitSnafu)?;
+        ensure!(
+            clone_status,
+            error::CloneFailedSnafu {
+                url: self.url.clone(),
+                ref_: self.reference.clone(),
+            },
+        );
+        // Make our initial artifact manifest
+        let mut artifact = Artifact::builder()
+            .media_type(MediaType::Manifest)
+            .config(
+                Config::builder()
+                    .metadata(serde_json::json!({
+                        "repository": self.url,
+                        "reference": self.reference
+                    }))
+                    .id(id.clone())
+                    .build(),
             )
-            .context(error::GitSnafu)?;
-            // Make our initial artifact manifest
-            let mut artifact = Artifact::builder()
-                .media_type(MediaType::Manifest)
-                .config(
-                    Config::builder()
-                        .metadata(serde_json::json!({
-                            "repository": self.url,
-                            "reference": self.reference
-                        }))
-                        .id(id.clone())
-                        .build(),
-                )
-                .build();
+            .build();
 
-            // Now we want to open a single layer which we will archive the source
-            let mut writer = storage.safe_start_layer().await?;
-            let mut archive = tokio_tar::Builder::new(writer.clone());
-            archive
-                .append_dir_all(".", temp.path())
-                .await
-                .context(error::ArchiveSnafu)?;
-            writer.flush().await.context(error::ArchiveSnafu)?;
-            archive.finish().await.context(error::ArchiveSnafu)?;
-            // Now we can add the the layer to the artifact
-            let layer = storage
-                .safe_finish_layer(
-                    &writer,
-                    &LayerOptions::builder()
-                        .media_type(MediaType::Tar(Compression::None))
-                        .build(),
-                )
-                .await?;
-            // Record `out` as the artifact-level staging hint keyed by
-            // the layer's digest. See `Config::path_hints`.
-            if let Some(hint) = self.out.clone() {
-                artifact
-                    .config_mut()
-                    .path_hints_mut()
-                    .insert(layer.digest().digest(), hint);
-            }
-            artifact.layers_mut().push(layer);
-            // Now save the artifact itself
-            storage.safe_save(&artifact).await?;
-            Ok(artifact.clone())
+        // Now we want to open a single layer which we will archive the source
+        let mut writer = storage.safe_start_layer().await?;
+        let mut archive = tokio_tar::Builder::new(writer.clone());
+        archive
+            .append_dir_all(".", temp.path())
+            .await
+            .context(error::ArchiveSnafu)?;
+        writer.flush().await.context(error::ArchiveSnafu)?;
+        archive.finish().await.context(error::ArchiveSnafu)?;
+        // Now we can add the the layer to the artifact
+        let layer = storage
+            .safe_finish_layer(
+                &writer,
+                &LayerOptions::builder()
+                    .media_type(MediaType::Tar(Compression::None))
+                    .build(),
+            )
+            .await?;
+        // Record `out` as the artifact-level staging hint keyed by
+        // the layer's digest. See `Config::path_hints`.
+        if let Some(hint) = self.out.clone() {
+            artifact
+                .config_mut()
+                .path_hints_mut()
+                .insert(layer.digest().digest(), hint);
         }
-        .instrument(info_span!(
-            "source-fetch",
-            subsystem = "source",
-            component = "git",
-            id = %id_s,
-            url = %self.url,
-            reference = %self.reference
-        ))
-        .await
+        artifact.layers_mut().push(layer);
+        // Now save the artifact itself
+        storage.safe_save(&artifact).await?;
+        Ok(artifact.clone())
     }
 }
 
@@ -152,6 +147,8 @@ pub mod error {
     pub enum Error {
         #[snafu(display("failed to archive git repository: {source}"))]
         Archive { source: std::io::Error },
+        #[snafu(display("failed to clone git repository at {url} with {ref_}"))]
+        CloneFailed { url: String, ref_: String },
         #[snafu(display("invalid git source definition for {addr}: {source}"))]
         Invalid {
             addr: Addr,
