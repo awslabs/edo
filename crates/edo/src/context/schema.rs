@@ -24,6 +24,12 @@ pub struct Requirement {
     pub kind: String,
     /// Semver constraint the resolved version must satisfy.
     pub at: VersionReq,
+    /// Optional vendor name constraining which registry this requirement
+    /// may be resolved from. When set, the resolver only considers
+    /// candidates produced by the named vendor; when `None`, any vendor
+    /// providing a matching version is eligible.
+    #[serde(default)]
+    pub vendor: Option<String>,
 }
 
 /// Groups the three cache categories — source, build, output — under the
@@ -212,6 +218,14 @@ impl Schema {
     /// Source definitions keyed by address.
     pub fn sources(&self) -> &BTreeMap<Addr, Element> {
         &self.source
+    }
+
+    /// Insert a `[cache.source.<name>]` element into the schema. When a
+    /// cache with the same name already exists this is a no-op, so
+    /// programmatic emitters can safely defer to an `edo.toml` overlay
+    /// when the user has customised the backend.
+    pub fn add_source_cache(&mut self, name: &str, element: Element) {
+        self.cache.source.entry(name.to_string()).or_insert(element);
     }
 
     /// Inserts a resolved source element. Used by the lockfile / resolver
