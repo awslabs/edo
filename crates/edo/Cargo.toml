@@ -9,12 +9,9 @@ version    = "0.1.0"
 
 [dependencies]
 arc-handle         = { workspace = true }
-astral-tokio-tar   = { workspace = true }
 async-compression  = { workspace = true }
 async-recursion    = { workspace = true }
 async-trait        = { workspace = true }
-aws-config         = { workspace = true }
-aws-sdk-s3         = { workspace = true }
 base16             = { workspace = true }
 bimap              = { workspace = true }
 bon                = { workspace = true }
@@ -28,7 +25,6 @@ handlebars         = { workspace = true }
 home               = { workspace = true }
 indexmap           = { workspace = true }
 jiff               = { workspace = true }
-merkle_hash        = { workspace = true }
 names              = { workspace = true }
 ocilot             = { workspace = true }
 os_pipe            = { workspace = true }
@@ -36,9 +32,7 @@ parking_lot        = { workspace = true }
 rand               = { workspace = true }
 ratatui            = { workspace = true }
 regex              = { workspace = true }
-reqwest            = { workspace = true }
 resolvo            = { workspace = true }
-schemars           = { workspace = true, features = ["semver1"] }
 semver             = { workspace = true }
 serde              = { workspace = true }
 serde_json         = { workspace = true }
@@ -51,9 +45,7 @@ toml               = { workspace = true }
 tracing            = { workspace = true }
 tracing-appender   = { workspace = true }
 tracing-subscriber = { workspace = true }
-url                = { workspace = true }
 uuid               = { workspace = true }
-which              = { workspace = true }
 
 [dev-dependencies]
 mockall     = { workspace = true }
