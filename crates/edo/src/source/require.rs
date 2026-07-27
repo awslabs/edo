@@ -55,7 +55,7 @@ impl Dependency {
             kind: requirement.kind.clone(),
             name,
             version: requirement.at.clone(),
-            vendor: None,
+            vendor: requirement.vendor.clone(),
         })
     }
 }
