@@ -1603,12 +1603,9 @@ name = "edo"
 version = "0.1.0"
 dependencies = [
  "arc-handle",
- "astral-tokio-tar",
  "async-compression",
  "async-recursion",
  "async-trait",
- "aws-config",
- "aws-sdk-s3",
  "base16",
  "bimap",
  "bon",
@@ -1623,7 +1620,6 @@ dependencies = [
  "indexmap",
  "indicatif",
  "jiff",
- "merkle_hash",
  "mockall",
  "names",
  "ocilot",
@@ -1631,7 +1627,6 @@ dependencies = [
  "owo-colors",
  "parking_lot 0.13.0",
  "regex",
- "reqwest",
  "resolvo",
  "rustix",
  "semver",
@@ -1647,9 +1642,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
- "url",
  "uuid",
- "which",
 ]
 
 [[package]]
@@ -1658,7 +1651,6 @@ version = "0.1.0"
 dependencies = [
  "astral-tokio-tar",
  "async-compression",
- "bon",
  "clap",
  "edo",
  "edo-core",
@@ -1666,7 +1658,6 @@ dependencies = [
  "snafu",
  "tokio",
  "tokio-util",
- "tracing",
 ]
 
 [[package]]
@@ -1795,7 +1786,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4190,7 +4181,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
