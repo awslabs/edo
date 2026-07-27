@@ -313,19 +313,10 @@ impl EnvironmentImpl for LocalEnv {
             path = %work_dir.display(),
             "running command"
         );
-        async move {
-            record!(log, "exec", "sh -c {cmd}");
-            cmd_noinput(&work_dir, log, "sh", ["-c", cmd], &from_dash(&self.env))
-                .context(error::FailedSnafu)
-        }
-        .instrument(info_span!(
-            "local-exec",
-            subsystem = "environment",
-            component = "local",
-            id = %id
-        ))
-        .await
-        .map_err(|e| e.into())
+        record!(log, "exec", "sh -c {cmd}");
+        let status = cmd_noinput(&work_dir, log, "sh", ["-c", cmd], &from_dash(&self.env))
+            .context(error::FailedSnafu)?;
+        Ok(status)
     }
 
     fn shell(&self, path: &Path) -> EnvResult<()> {

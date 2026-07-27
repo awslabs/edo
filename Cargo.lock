@@ -1841,6 +1841,7 @@ dependencies = [
  "merkle_hash",
  "names",
  "ocilot",
+ "regex",
  "reqwest",
  "semver",
  "serde",
