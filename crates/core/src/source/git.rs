@@ -5,12 +5,11 @@ use edo::source::{SourceImpl, SourceResult};
 use edo::storage::{Artifact, Compression, Config, Id, LayerOptions, MediaType, Storage};
 use edo::util::cmd_noinput;
 use sha2::{Digest, Sha256};
-use snafu::ResultExt;
+use snafu::{ResultExt, ensure};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use tempfile::tempdir;
 use tokio::io::AsyncWriteExt;
-use tracing::Instrument;
 
 /// A source that clones a Git repository at a specific reference.
 #[derive(serde::Deserialize, Debug, Clone)]
@@ -50,76 +49,73 @@ impl SourceImpl for GitSource {
         Ok(id)
     }
 
+    #[tracing::instrument(name = "source-fetch", skip_all, fields(url = %self.url, reference = %self.reference, id))]
     async fn fetch(&self, log: &Log, storage: &Storage) -> SourceResult<Artifact> {
         let id = self.get_unique_id().await?;
-        let id_s = id.to_string();
+        tracing::Span::current().record("id", tracing::field::display(&id));
         record!(log, "clone", "git clone -b {} {}", self.reference, self.url);
-        async move {
-            let temp = tempdir().context(error::TempDirectorySnafu)?;
-            cmd_noinput(
-                ".",
-                log,
-                "git",
-                vec![
-                    "clone".into(),
-                    "-b".into(),
-                    self.reference.clone(),
-                    self.url.clone(),
-                    temp.path().to_string_lossy().to_string(),
-                ],
-                &HashMap::new(),
+        let temp = tempdir().context(error::TempDirectorySnafu)?;
+        let clone_status = cmd_noinput(
+            ".",
+            log,
+            "git",
+            vec![
+                "clone".into(),
+                "-b".into(),
+                self.reference.clone(),
+                self.url.clone(),
+                temp.path().to_string_lossy().to_string(),
+            ],
+            &HashMap::new(),
+        )
+        .context(error::GitSnafu)?;
+        ensure!(
+            clone_status,
+            error::CloneFailedSnafu {
+                url: self.url.clone(),
+                ref_: self.reference.clone(),
+            },
+        );
+        let mut artifact = Artifact::builder()
+            .media_type(MediaType::Manifest)
+            .config(
+                Config::builder()
+                    .metadata(serde_json::json!({
+                        "repository": self.url,
+                        "reference": self.reference
+                    }))
+                    .id(id.clone())
+                    .build(),
             )
-            .context(error::GitSnafu)?;
-            let mut artifact = Artifact::builder()
-                .media_type(MediaType::Manifest)
-                .config(
-                    Config::builder()
-                        .metadata(serde_json::json!({
-                            "repository": self.url,
-                            "reference": self.reference
-                        }))
-                        .id(id.clone())
-                        .build(),
-                )
-                .build();
+            .build();
 
-            // Archive the checkout as a single layer.
-            let mut writer = storage.safe_start_layer().await?;
-            let mut archive = tokio_tar::Builder::new(writer.clone());
-            archive
-                .append_dir_all(".", temp.path())
-                .await
-                .context(error::ArchiveSnafu)?;
-            writer.flush().await.context(error::ArchiveSnafu)?;
-            archive.finish().await.context(error::ArchiveSnafu)?;
-            let layer = storage
-                .safe_finish_layer(
-                    &writer,
-                    &LayerOptions::builder()
-                        .media_type(MediaType::Tar(Compression::None))
-                        .build(),
-                )
-                .await?;
-            // Associate the staging path with the layer digest.
-            if let Some(hint) = self.out.clone() {
-                artifact
-                    .config_mut()
-                    .path_hints_mut()
-                    .insert(layer.digest().digest(), hint);
-            }
-            artifact.layers_mut().push(layer);
-            storage.safe_save(&artifact).await?;
-            Ok(artifact.clone())
+        // Archive the checkout as a single layer.
+        let mut writer = storage.safe_start_layer().await?;
+        let mut archive = tokio_tar::Builder::new(writer.clone());
+        archive
+            .append_dir_all(".", temp.path())
+            .await
+            .context(error::ArchiveSnafu)?;
+        writer.flush().await.context(error::ArchiveSnafu)?;
+        archive.finish().await.context(error::ArchiveSnafu)?;
+        let layer = storage
+            .safe_finish_layer(
+                &writer,
+                &LayerOptions::builder()
+                    .media_type(MediaType::Tar(Compression::None))
+                    .build(),
+            )
+            .await?;
+        // Associate the staging path with the layer digest.
+        if let Some(hint) = self.out.clone() {
+            artifact
+                .config_mut()
+                .path_hints_mut()
+                .insert(layer.digest().digest(), hint);
         }
-        .instrument(info_span!(
-            "source-fetch",
-            subsystem = "source",
-            component = "git",
-            id = %id_s,
-            url = %self.url,
-            reference = %self.reference
-        ))
-        .await
+        artifact.layers_mut().push(layer);
+        storage.safe_save(&artifact).await?;
+        Ok(artifact.clone())
     }
 }
 
@@ -187,6 +183,8 @@ pub mod error {
     pub enum Error {
         #[snafu(display("failed to archive git repository: {source}"))]
         Archive { source: std::io::Error },
+        #[snafu(display("failed to clone git repository at {url} with {ref_}"))]
+        CloneFailed { url: String, ref_: String },
         #[snafu(display("failed to invoke git cli: {source}"))]
         Git { source: std::io::Error },
         #[snafu(transparent)]

@@ -10,7 +10,6 @@ use std::path::absolute;
 use std::path::{Path, PathBuf};
 use tokio::fs::File;
 use tokio::fs::create_dir_all;
-use tracing::Instrument;
 
 /// A farm that creates local (host-native) build environments.
 #[derive(Default)]
@@ -303,6 +302,7 @@ impl EnvironmentImpl for LocalEnv {
         Ok(())
     }
 
+    #[tracing::instrument(name = "local-exec", skip_all, fields(id = %id))]
     async fn execute(&self, log: &Log, id: &Id, path: &Path, cmd: &str) -> EnvResult<bool> {
         let work_dir = self.path.join(path);
         trace!(
@@ -312,19 +312,10 @@ impl EnvironmentImpl for LocalEnv {
             path = %work_dir.display(),
             "running command"
         );
-        async move {
-            record!(log, "exec", "sh -c {cmd}");
-            cmd_noinput(&work_dir, log, "sh", ["-c", cmd], &from_dash(&self.env))
-                .context(error::FailedSnafu)
-        }
-        .instrument(info_span!(
-            "local-exec",
-            subsystem = "environment",
-            component = "local",
-            id = %id
-        ))
-        .await
-        .map_err(|e| e.into())
+        record!(log, "exec", "sh -c {cmd}");
+        let status = cmd_noinput(&work_dir, log, "sh", ["-c", cmd], &from_dash(&self.env))
+            .context(error::FailedSnafu)?;
+        Ok(status)
     }
 
     fn shell(&self, path: &Path) -> EnvResult<()> {
