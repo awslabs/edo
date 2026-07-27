@@ -587,6 +587,102 @@ mod tests {
         );
     }
 
+    /// Session commands (`update`, `list`, `prune`) never emit a
+    /// `StartBuild` and don't drive tasks. The statusline must be
+    /// blank in that state — rendering `0/0 //<target>` there was
+    /// noise that visually collided with any error diagnostic that
+    /// happened to fire on the same line.
+    #[test]
+    fn statusline_is_blank_before_any_build_activity() {
+        use crate::ui::store::State;
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut s = State::default();
+        // A Header without an `addr` (the shape emitted by the CLI
+        // for update/list/prune after this fix) is the only action
+        // to have been folded into state.
+        s.apply(&Action::Header {
+            tool: "edo-ref".to_string(),
+            version: semver::Version::new(0, 1, 0),
+            addr: None,
+            args: vec![],
+            started_at: Timestamp::now(),
+        });
+        let backend = TestBackend::new(80, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render::draw_frame(&s, frame))
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        // Statusline slot is the top two rows (Layout::Length(2)).
+        for y in 0..2 {
+            let mut row = String::new();
+            for x in 0..80 {
+                row.push_str(buf[(x, y)].symbol());
+            }
+            assert!(
+                row.trim().is_empty(),
+                "statusline row {y} must be blank before StartBuild, got {row:?}"
+            );
+        }
+    }
+
+    /// Once a `StartBuild` has arrived the statusline shows the
+    /// standard progress line even at 0/0.
+    #[test]
+    fn statusline_renders_after_start_build() {
+        use crate::ui::store::State;
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut s = State::default();
+        s.apply(&Action::StartBuild {
+            addr: Addr::parse("//project/target").unwrap(),
+            total: 3,
+        });
+        let backend = TestBackend::new(80, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render::draw_frame(&s, frame))
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let mut row0 = String::new();
+        for x in 0..80 {
+            row0.push_str(buf[(x, 0)].symbol());
+        }
+        assert!(
+            row0.contains("0/3") && row0.contains("//project/target"),
+            "expected progress line after StartBuild, got {row0:?}"
+        );
+    }
+
+    /// The header emitted by session commands must not carry a
+    /// synthetic `target:` row. Regression test for the CLI change
+    /// that switched `create_context`'s `target` parameter to
+    /// `Option<&str>`.
+    #[test]
+    fn header_without_addr_omits_target_row() {
+        let action = Action::Header {
+            tool: "edo-ref".to_string(),
+            version: semver::Version::new(0, 1, 0),
+            addr: None,
+            args: vec![],
+            started_at: Timestamp::now(),
+        };
+        let lines = action.to_lines_width(u16::MAX);
+        let text: Vec<String> = lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
+            .collect();
+        assert!(
+            text.iter().all(|l| !l.starts_with("target:")),
+            "header without an addr must not emit a target: row; got {text:?}"
+        );
+    }
+
     // -------------------------------------------------------------------------
     // Acceptance-criteria tests (AC1, AC2, AC3, AC4, AC5, AC6)
     // -------------------------------------------------------------------------

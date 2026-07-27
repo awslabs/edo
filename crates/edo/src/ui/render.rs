@@ -98,6 +98,23 @@ pub(crate) fn render_statusline(state: &State, frame: &mut Frame, area: Rect) {
         return;
     }
 
+    // No build has started (and none has finished): render an empty
+    // statusline instead of a misleading `0/0 <target>` progress row.
+    // Session commands like `update`, `list`, and `prune` never emit
+    // `StartBuild` / `StartTask` / `BuildFinish`, so their state stays
+    // at defaults; showing a "0/0" progress indicator alongside those
+    // commands' diagnostics is noise at best and, when the command
+    // then errors out, visually splices the error text onto the
+    // progress line.
+    if !state.done
+        && state.total == 0
+        && state.finished == 0
+        && state.in_flight == 0
+        && state.waiting == 0
+    {
+        return;
+    }
+
     let total = state.total.max(state.finished);
     let root = state
         .addr

@@ -21,7 +21,7 @@ use crate::Result;
 
 pub async fn create_context(
     args: &Args,
-    target: &str,
+    target: Option<&str>,
     variables: HashMap<String, String>,
     locked: bool,
 ) -> Result<Context> {
@@ -47,9 +47,16 @@ pub async fn create_context(
     // log and the canvas header both record which `edo` produced this
     // session, what the user asked for, and when. Sequenced ahead of
     // project loading and the scheduler's start-build event.
+    //
+    // `target` is `Some(addr)` only for commands that operate on a
+    // specific transform (`run`, `checkout`). Session commands like
+    // `update`, `list`, and `prune` have no build target; passing
+    // `None` here keeps the `target:` line out of the header instead
+    // of surfacing a synthetic `//<update>` placeholder that isn't a
+    // real address.
     let version = semver::Version::parse(env!("CARGO_PKG_VERSION"))
         .unwrap_or_else(|_| semver::Version::new(0, 0, 0));
-    let target_addr = Addr::parse(target).ok();
+    let target_addr = target.and_then(|t| Addr::parse(t).ok());
     let args_vec: Vec<(String, String)> = variables.into_iter().collect();
     if let Some(c) = edo::ui::Console::global() {
         c.emit_header("edo-ref", &version, target_addr, args_vec)
