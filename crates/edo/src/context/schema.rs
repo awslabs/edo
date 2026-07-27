@@ -25,7 +25,10 @@ pub struct Requirement {
     pub kind: String,
     /// Semver constraint the resolved version must satisfy.
     pub at: VersionReq,
-    /// Optional vendor address restricting dependency resolution.
+    /// Optional absolute vendor address (`//…`) restricting resolution.
+    ///
+    /// This address is not rerooted for subprojects. When absent, any
+    /// vendor providing a matching version is eligible.
     pub vendor: Option<String>,
 }
 
@@ -228,6 +231,20 @@ impl Schema {
         &self.source
     }
 
+    /// Inserts a source cache rooted at `//edo-source-cache/<name>`.
+    ///
+    /// Leaves an existing cache with the same name unchanged.
+    pub fn add_source_cache(&mut self, name: &str, mut element: Element) {
+        self.cache
+            .source
+            .entry(name.to_string())
+            .or_insert_with(|| {
+                element.addr = Addr::parse(&format!("//edo-source-cache/{name}"))
+                    .expect("source cache names form valid addresses");
+                element
+            });
+    }
+
     /// Inserts a resolved source element. Used by the lockfile / resolver
     /// path to fold vendor-provided sources back into the schema before
     /// [`Schema::resolve_sources`] runs.
@@ -266,6 +283,30 @@ mod tests {
     //! to lock down the deserialization shape.
     use super::*;
     use crate::context::{SourceMap, error};
+
+    #[test]
+    fn test_add_source_cache_normalizes_address_and_preserves_existing() {
+        let mut schema = Schema::default();
+        let cache = Element::builder()
+            .addr(addr("//wrong"))
+            .kind("local")
+            .config(BTreeMap::new())
+            .build();
+        schema.add_source_cache("downloads", cache);
+        let inserted = &schema.get_source_caches()["downloads"];
+        assert_eq!(inserted.addr, addr("//edo-source-cache/downloads"));
+        assert_eq!(inserted.kind, "local");
+
+        let replacement = Element::builder()
+            .addr(addr("//other"))
+            .kind("s3")
+            .config(BTreeMap::new())
+            .build();
+        schema.add_source_cache("downloads", replacement);
+        let retained = &schema.get_source_caches()["downloads"];
+        assert_eq!(retained.addr, addr("//edo-source-cache/downloads"));
+        assert_eq!(retained.kind, "local");
+    }
 
     fn addr(s: &str) -> Addr {
         Addr::parse(s).unwrap()
