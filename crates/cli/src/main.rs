@@ -102,6 +102,44 @@ enum Commands {
 async fn main() -> Result<()> {
     let args = Args::parse();
 
+    // SIGINT (Ctrl+C) belt-and-braces handler. Two reasons this exists
+    // on top of the TUI's own keyboard Ctrl+C handling:
+    //
+    //   1. Plain mode (stderr not a TTY, e.g. piped to a file) never
+    //      puts the terminal into raw mode and never sees a KeyEvent
+    //      for Ctrl+C. Without a signal handler, the OS would
+    //      SIGINT-kill the process and skip `Console::shutdown()`
+    //      — losing any final BuildFinished summary.
+    //
+    //   2. Between process start and `Context::init`, no Console
+    //      exists yet, so nothing can translate a keystroke. A hard
+    //      SIGINT during, say, `Config::load` would exit cleanly, but
+    //      once raw mode is on we've narrowed the "Ctrl+C works" window
+    //      to the App loop only. This handler restores blanket
+    //      coverage.
+    //
+    // Behaviour:
+    //   - First Ctrl+C: flip the Console's cancellation token if a
+    //     Console is installed (the scheduler observes it and unwinds
+    //     with a real BuildFinished). If no Console yet, just note it
+    //     and let the next one hard-exit.
+    //   - Second Ctrl+C: hard-exit with code 130 so the user always has
+    //     an escape hatch, even if a worker is stuck in a syscall.
+    tokio::spawn(async {
+        // First Ctrl+C: cooperative cancel.
+        if tokio::signal::ctrl_c().await.is_err() {
+            return;
+        }
+        if let Some(c) = edo::ui::Console::global() {
+            c.cancellation().cancel();
+        }
+        // Second Ctrl+C: hard exit. 130 = 128 + SIGINT(2), the shell
+        // convention.
+        if tokio::signal::ctrl_c().await.is_ok() {
+            std::process::exit(130);
+        }
+    });
+
     // Every subcommand installs the TUI console via `create_context`,
     // but historically only `Run` also tore it down (via
     // `Context::run`). The other four (`Checkout`, `Prune`, `Update`,

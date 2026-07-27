@@ -532,7 +532,12 @@ impl Graph {
             // `console.shutdown()` runs unconditionally, but without a
             // `BuildFinished` the state machine never marks the build
             // finished and the final-summary line is incoherent.
-            ctx.cancellation();
+            //
+            // Also flip the session-wide cancellation switch so any
+            // downstream stage (Graph::run, in-flight prompts, the
+            // caller's outer task) short-circuits instead of waiting
+            // for the doomed run to unwind through timeouts.
+            ctx.cancellation().cancel();
             let _ = (fetch_started_at, &failed_addrs);
             crate::ui_finish_build!();
             return Err(e);

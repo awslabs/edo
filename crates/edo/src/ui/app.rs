@@ -38,6 +38,7 @@ use ratatui::{
 };
 use snafu::ResultExt;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use super::{
     PromptChoice, PromptEnvelope, Result,
@@ -171,12 +172,19 @@ pub struct App {
     /// `maybe_flush_under_load` to guarantee a minimum redraw cadence
     /// even when the frame ticker is starved by the biased action arm.
     last_flush: Instant,
+    /// Session-wide cancellation switch cloned from
+    /// [`Console::cancellation`](super::Console::cancellation). Ctrl+C
+    /// (in interactive mode where raw mode swallows SIGINT) and an
+    /// abnormal loop exit both call `.cancel()` on this so the
+    /// scheduler running on the parent task observes the quit signal.
+    cancellation: CancellationToken,
 }
 
 impl App {
     pub fn new(
         action_rx: mpsc::Receiver<Action>,
         prompt_rx: mpsc::UnboundedReceiver<PromptEnvelope>,
+        cancellation: CancellationToken,
     ) -> Self {
         let mode = build_mode();
         Self {
@@ -191,6 +199,7 @@ impl App {
             cached_width: u16::MAX,
             events_done: false,
             last_flush: Instant::now(),
+            cancellation,
         }
     }
 
@@ -545,10 +554,20 @@ impl App {
             return Ok(());
         }
         // Ctrl+C exits.
+        //
+        // In interactive mode the terminal is in raw mode, which means
+        // the tty driver does NOT translate Ctrl+C into SIGINT — it's
+        // delivered here as a plain key event. Setting `should_quit`
+        // alone tears down the App loop but leaves the scheduler
+        // running on the parent task (see the note on
+        // `Console::cancellation` for the wiring). Cancel the shared
+        // token so every cooperating scheduler worker observes the
+        // quit request too.
         if key_event.code == KeyCode::Char('c')
             && key_event.modifiers.contains(KeyModifiers::CONTROL)
         {
             self.should_quit = true;
+            self.cancellation.cancel();
             // Drain the entire prompt queue with Quit — Ctrl+C is a
             // "get me out" signal, not a per-prompt choice.
             self.state.drain_prompts_with_quit();

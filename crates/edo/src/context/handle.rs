@@ -78,6 +78,13 @@ unsafe impl Sync for Handle {}
 
 impl Handle {
     /// Creates a new `Handle` with the given components.
+    ///
+    /// The `cancellation` token is shared across every handle produced
+    /// for a single build session — this is how Ctrl+C / a quit prompt /
+    /// a peer fetch failure reach every scheduler worker cooperatively.
+    /// A fresh (never-cancelled) `CancellationToken::new()` is fine for
+    /// ad-hoc callers (tests, one-off tooling) that don't participate in
+    /// coordinated cancellation.
     pub fn new(
         log: LogManager,
         config: Config,
@@ -85,6 +92,7 @@ impl Handle {
         transforms: HashMap<Addr, Transform>,
         farms: HashMap<Addr, Farm>,
         args: HashMap<String, String>,
+        cancellation: CancellationToken,
     ) -> Self {
         Self {
             log,
@@ -93,7 +101,7 @@ impl Handle {
             transforms,
             farms,
             args,
-            cancellation: CancellationToken::new(),
+            cancellation,
             id_cache: None,
         }
     }
@@ -211,6 +219,7 @@ mod tests {
             HashMap::new(),
             HashMap::new(),
             HashMap::new(),
+            tokio_util::sync::CancellationToken::new(),
         );
 
         assert!(handle.transforms().is_empty());
@@ -234,6 +243,7 @@ mod tests {
             HashMap::new(),
             HashMap::new(),
             HashMap::new(),
+            tokio_util::sync::CancellationToken::new(),
         );
 
         let log_path = dir.path().join("test.log");

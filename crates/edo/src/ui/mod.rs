@@ -29,6 +29,7 @@ use std::sync::{
 
 use jiff::Timestamp;
 use tokio::sync::{mpsc, oneshot, watch};
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     context::Addr,
@@ -111,6 +112,17 @@ struct Inner {
     /// Count of non-privileged actions dropped due to backpressure.
     /// Emitted once at shutdown.
     dropped: AtomicU64,
+    /// Session-wide cancellation switch. Flipped by:
+    /// - the App's Ctrl+C handler (interactive path — raw mode
+    ///   swallows SIGINT so we have to handle the key event ourselves),
+    /// - the `tokio::signal::ctrl_c` watcher installed in the CLI's
+    ///   `main` (plain mode / pre-Context startup / SIGINT fallback).
+    ///
+    /// The Console publishes this switch so callers (`Context::init`)
+    /// can adopt it as their scheduler-cancellation token, closing the
+    /// loop from a Ctrl+C key event all the way down to every worker's
+    /// cooperative `token.is_cancelled()` probe.
+    cancellation: CancellationToken,
 }
 
 impl Console {
@@ -120,8 +132,10 @@ impl Console {
         let (action_tx, action_rx) = mpsc::channel::<Action>(CHANNEL_CAPACITY);
         let (prompt_tx, prompt_rx) = mpsc::unbounded_channel::<PromptEnvelope>();
         let (shutdown_done_tx, shutdown_done_rx) = watch::channel(false);
+        let cancellation = CancellationToken::new();
+        let app_cancellation = cancellation.clone();
         let join = tokio::spawn(async move {
-            let mut app = app::App::new(action_rx, prompt_rx);
+            let mut app = app::App::new(action_rx, prompt_rx, app_cancellation);
             if let Err(e) = app.run().await {
                 tracing::warn!(subsystem = "ui", "app exited with error: {e}");
             }
@@ -134,8 +148,18 @@ impl Console {
                 shutdown_done_tx,
                 shutdown_done_rx,
                 dropped: AtomicU64::new(0),
+                cancellation,
             }),
         }
+    }
+
+    /// Session-wide cancellation switch. See the docstring on
+    /// [`Inner::cancellation`] for the wiring. Cheap to clone; observers
+    /// can `await token.cancelled()` and cancellers can call `cancel()`
+    /// — flipping the same token from any producer reaches every
+    /// consumer.
+    pub fn cancellation(&self) -> CancellationToken {
+        self.handle.cancellation.clone()
     }
 
     /// Install this console as the process-wide [`CONSOLE`].
@@ -445,7 +469,7 @@ mod tests {
     ) {
         let (tx, rx) = mpsc::channel::<Action>(64);
         let (ptx, prx) = mpsc::unbounded_channel::<PromptEnvelope>();
-        let app = app::App::new(rx, prx);
+        let app = app::App::new(rx, prx, CancellationToken::new());
         (app, tx, ptx)
     }
 
@@ -655,7 +679,7 @@ mod tests {
         // Build an App with a channel large enough to hold 4×cap.
         let (tx, rx) = mpsc::channel::<Action>(cap * 8);
         let (_ptx, prx) = mpsc::unbounded_channel::<PromptEnvelope>();
-        let mut app = app::App::new(rx, prx);
+        let mut app = app::App::new(rx, prx, CancellationToken::new());
         app.force_plain();
 
         for i in 0..(cap * 4 + 1) {
@@ -694,7 +718,7 @@ mod tests {
     async fn drain_pending_stops_at_terminate() {
         let (tx, rx) = mpsc::channel::<Action>(64);
         let (_ptx, prx) = mpsc::unbounded_channel::<PromptEnvelope>();
-        let mut app = app::App::new(rx, prx);
+        let mut app = app::App::new(rx, prx, CancellationToken::new());
         app.force_plain();
 
         tx.try_send(Action::Diagnostic {

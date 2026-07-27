@@ -34,6 +34,7 @@ use std::env::current_dir;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::fs::create_dir_all;
+use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 mod address;
@@ -122,6 +123,13 @@ pub struct Context {
     farms: ArcMap<Addr, Farm>,
     /// Command Line Arguments
     args: HashMap<String, String>,
+    /// Session-wide cancellation token. Handed to every [`Handle`]
+    /// produced by [`Context::get_handle`] / [`Context::get_handle_with_args`]
+    /// so that a Ctrl+C from the TUI, a quit-prompt choice, or a peer
+    /// fetch failure can flip a single switch every worker observes.
+    /// Also cancelled by the installed `SIGINT` handler in the CLI
+    /// (see `main.rs`).
+    cancellation: CancellationToken,
 }
 
 unsafe impl Send for Context {}
@@ -180,6 +188,14 @@ impl Context {
             );
             dup.shutdown().await;
         }
+        // Adopt the console's cancellation token if a console is
+        // installed, so a Ctrl+C keystroke handled by the App and a
+        // scheduler-side `token.cancel()` operate on the same switch.
+        // Otherwise fall back to a fresh token (e.g. under tests that
+        // build a Context without ever installing the console).
+        let cancellation = ui::Console::global()
+            .map(|c| c.cancellation())
+            .unwrap_or_default();
         // Load the configuration
         let config = Config::load(config).await?;
         debug!(
@@ -224,6 +240,7 @@ impl Context {
             scheduler: Scheduler::new(&path.join("env"), &config).await?,
             farms: Arc::new(DashMap::new()),
             transforms: Arc::new(DashMap::new()),
+            cancellation,
         };
         Ok(ctx.clone())
     }
@@ -265,6 +282,7 @@ impl Context {
                 .map(|x| (x.key().clone(), x.value().clone()))
                 .collect(),
             self.args.clone(),
+            self.cancellation.clone(),
         )
     }
 
@@ -285,7 +303,16 @@ impl Context {
                 .map(|x| (x.key().clone(), x.value().clone()))
                 .collect(),
             merged,
+            self.cancellation.clone(),
         )
+    }
+
+    /// Returns a clone of the session-wide cancellation token. Flipping
+    /// this token cancels the scheduler cooperatively (see the checks
+    /// in `crates/edo/src/scheduler/graph.rs`). Wired to Ctrl+C via the
+    /// TUI `App` and to `tokio::signal::ctrl_c()` in the CLI.
+    pub fn cancellation(&self) -> CancellationToken {
+        self.cancellation.clone()
     }
 
     /// Returns a reference to the loaded configuration.
