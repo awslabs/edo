@@ -257,6 +257,23 @@ impl Schema {
     pub fn requires(&self) -> &BTreeMap<Addr, Requirement> {
         &self.requires
     }
+
+    /// Removes and returns the requirement at `addr`, if one is present.
+    ///
+    /// Used by override overlays (e.g. twoliter's kit/SDK digest and
+    /// local-path pins) that inject a pre-resolved source at the same
+    /// address and therefore need to suppress the resolver step.
+    pub fn remove_require(&mut self, addr: &Addr) -> Option<Requirement> {
+        self.requires.remove(addr)
+    }
+
+    /// Mutably access a vendor element by address.
+    ///
+    /// Used by override overlays to rewrite a vendor's registry URI
+    /// without rebuilding the whole schema.
+    pub fn vendor_mut(&mut self, addr: &Addr) -> Option<&mut Element> {
+        self.vendor.get_mut(addr)
+    }
 }
 
 #[cfg(test)]
