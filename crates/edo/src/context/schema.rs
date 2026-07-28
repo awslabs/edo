@@ -274,6 +274,16 @@ impl Schema {
     pub fn requires(&self) -> &BTreeMap<Addr, Requirement> {
         &self.requires
     }
+
+    /// Removes and returns the requirement at `addr`, if one is present.
+    pub fn remove_require(&mut self, addr: &Addr) -> Option<Requirement> {
+        self.requires.remove(addr)
+    }
+
+    /// Mutably access a vendor element by address.
+    pub fn vendor_mut(&mut self, addr: &Addr) -> Option<&mut Element> {
+        self.vendor.get_mut(addr)
+    }
 }
 
 #[cfg(test)]
@@ -306,6 +316,38 @@ mod tests {
         let retained = &schema.get_source_caches()["downloads"];
         assert_eq!(retained.addr, addr("//edo-source-cache/downloads"));
         assert_eq!(retained.kind, "local");
+    }
+
+    #[test]
+    fn test_remove_require_returns_requirement_once() {
+        let mut schema = parse_schema("[requires.sdk]\nkind = 'image'\nat = '=0.77.0'\n");
+        let key = schema.requires().keys().next().unwrap().clone();
+        let removed = schema.remove_require(&key).expect("requirement exists");
+        assert_eq!(removed.kind, "image");
+        assert_eq!(removed.at, VersionReq::parse("=0.77.0").unwrap());
+        assert!(removed.vendor.is_none(), "missing vendor defaults to None");
+        assert!(schema.requires().is_empty(), "requirement must be removed");
+        assert!(
+            schema.remove_require(&key).is_none(),
+            "missing requirement returns None"
+        );
+    }
+
+    #[test]
+    fn test_vendor_mut_updates_only_existing_vendor() {
+        let mut schema = parse_schema("[vendor.registry]\nkind = 'image'\nuri = 'old'\n");
+        let key = schema.vendors().keys().next().unwrap().clone();
+        schema
+            .vendor_mut(&key)
+            .expect("vendor exists")
+            .config
+            .insert("uri".into(), serde_json::json!("new"));
+        assert_eq!(schema.vendors()[&key].config["uri"], "new");
+        assert!(
+            schema.vendor_mut(&addr("//missing")).is_none(),
+            "missing vendor returns None"
+        );
+        assert_eq!(schema.vendors().len(), 1);
     }
 
     fn addr(s: &str) -> Addr {
