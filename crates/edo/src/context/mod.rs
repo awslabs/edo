@@ -463,6 +463,22 @@ impl Context {
         self.scheduler().run(self, addr).await?;
         Ok(())
     }
+
+    /// Caches farm inputs and prepares transforms without an execution runtime.
+    pub async fn fetch(&self, addr: &Addr) -> ContextResult<()> {
+        let log = self.log.create("fetch-environments").await?;
+        log.set_subject("environment-fetch");
+        let farms: Vec<Farm> = self
+            .farms
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect();
+        for farm in farms {
+            farm.fetch(&log, self.storage()).await?;
+        }
+        self.scheduler().fetch(self, addr).await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -533,6 +549,52 @@ mod tests {
                 }
             }
         };
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(log_manager)]
+    async fn test_fetch_caches_farm_inputs_without_setup() {
+        use crate::environment::{Farm, MockFarmImpl};
+        use crate::scheduler::graph::tests::register_mock;
+        use std::sync::atomic::AtomicUsize;
+
+        let dir = TempDir::new().unwrap();
+        let ctx = Context::init::<&Path, &Path>(
+            Some(dir.path()),
+            None,
+            HashMap::new(),
+            LogVerbosity::Info,
+            EventLog::Disabled,
+        )
+        .await
+        .unwrap();
+        let mut farm = MockFarmImpl::new();
+        farm.expect_fetch().times(1).returning(|_, _| Ok(()));
+        farm.expect_setup().times(0);
+        farm.expect_create().times(0);
+        ctx.insert_farm_for_test(&Addr::parse("//default").unwrap(), Farm::new(farm));
+        let state = register_mock(
+            &ctx,
+            "//context-fetch/target",
+            &[],
+            Arc::new(std::sync::Mutex::new(Vec::new())),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        ctx.fetch(&Addr::parse("//context-fetch/target").unwrap())
+            .await
+            .expect("fetch succeeds without farm setup");
+        assert_eq!(
+            state
+                .prepare_called
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            state
+                .transform_called
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
     }
 
     #[tokio::test]

@@ -136,7 +136,7 @@ impl ContainerConfig {
 /// Creates environments using a container runtime.
 pub struct ContainerFarm {
     addr: Addr,
-    config: ResolvedContainerConfig,
+    config: ContainerConfig,
     options: ContainerOptions,
     source: Source,
 }
@@ -154,16 +154,6 @@ impl FromElement for ContainerFarm {
         } else {
             ContainerConfig::default()
         };
-        let config = config.resolve(&options, |runtime| {
-            let cli = which(runtime).ok()?;
-            edo::ui_info!(
-                subsystem = "environment",
-                component = "container",
-                op = "runtime-detect";
-                "found container runtime {runtime} at {cli:?}"
-            );
-            Some(cli)
-        })?;
         let src_element = element
             .source
             .as_ref()
@@ -181,8 +171,32 @@ impl FromElement for ContainerFarm {
     }
 }
 
+impl ContainerFarm {
+    /// Detects an execution runtime only when setup or creation needs it.
+    fn resolve_config(&self) -> Result<ResolvedContainerConfig, error::Error> {
+        self.config.clone().resolve(&self.options, |runtime| {
+            let cli = which(runtime).ok()?;
+            edo::ui_info!(
+                subsystem = "environment",
+                component = "container",
+                op = "runtime-detect";
+                "found container runtime {runtime} at {cli:?}"
+            );
+            Some(cli)
+        })
+    }
+}
+
 #[async_trait]
 impl FarmImpl for ContainerFarm {
+    async fn fetch(&self, log: &Log, storage: &Storage) -> EnvResult<()> {
+        self.source
+            .cache(log, storage)
+            .await
+            .context(error::SourceSnafu)?;
+        Ok(())
+    }
+
     #[tracing::instrument(name = "container-load-image", skip_all, fields(addr = %self.addr, id))]
     async fn setup(&self, log: &Log, storage: &Storage) -> EnvResult<()> {
         trace!(
@@ -210,7 +224,8 @@ impl FarmImpl for ContainerFarm {
             component = "container",
             "check if the image is already loaded into the container runtime"
         );
-        let cli = &self.config.cli;
+        let config = self.resolve_config()?;
+        let cli = &config.cli;
         if cmd_nulled(
             ".",
             cli,
@@ -298,7 +313,7 @@ impl FarmImpl for ContainerFarm {
         );
         Ok(Environment::new(Container {
             name,
-            config: self.config.clone(),
+            config: self.resolve_config()?,
             user: self.options.user.clone(),
             path: path.to_path_buf(),
             running: AtomicBool::new(false),
@@ -873,7 +888,6 @@ mod tests {
             .kind("local")
             .config([("path".to_string(), json!(source_path))])
             .build();
-        let cli = dir.path().join("runtime");
         let farm_element = Element::builder()
             .addr(Addr::parse("//test/image").unwrap())
             .kind("container")
@@ -881,19 +895,30 @@ mod tests {
                 "default".into(),
                 vec![source_element],
             )])))
-            .config([
-                ("runtime".to_string(), json!("fake")),
-                ("cli".to_string(), json!(cli)),
-            ])
+            .config([("runtime".to_string(), json!("edo-nonexistent-runtime"))])
             .build();
         let farm = ContainerFarm::new(&farm_element, &ctx)
             .await
-            .expect("configured CLI must allow farm construction");
+            .expect("loading a farm must not detect a runtime");
+        let id = farm.source.get_unique_id().await.unwrap();
         let log = ctx.log().create("container-review").await.unwrap();
+        farm.fetch(&log, ctx.storage())
+            .await
+            .expect("prefetch must not detect a runtime");
+        assert!(
+            ctx.storage().has_local(&id).await.unwrap(),
+            "farm image must be cached"
+        );
+        assert!(
+            farm.resolve_config().is_err(),
+            "execution still requires a runtime"
+        );
 
         let cli = dir.path().join("runtime");
         let archive_record = dir.path().join("archive-path");
         let calls = dir.path().join("calls");
+        let mut farm = farm;
+        farm.options = options(json!({"cli": cli, "runtime": "fake"}));
         for (load_output, load_exit, tag_exit, expected) in [
             ("Loaded image: repo:tag", 7, 0, "load"),
             ("unrecognized output", 0, 0, "parse"),

@@ -14,6 +14,12 @@ use std::path::Path;
 #[cfg_attr(test, automock)]
 #[async_trait]
 pub trait Farm {
+    /// Caches farm inputs without initializing an execution runtime.
+    ///
+    /// Farms without external inputs need not do anything.
+    async fn fetch(&self, _log: &Log, _storage: &Storage) -> EnvResult<()> {
+        Ok(())
+    }
     /// Setup can be used for any one time initializations required for a farm
     async fn setup(&self, log: &Log, storage: &Storage) -> EnvResult<()>;
     /// Create a new environment using this farm
