@@ -514,6 +514,14 @@ impl Context {
         self.scheduler().run(self, addr).await?;
         Ok(())
     }
+
+    /// Sets up environments and drives the scheduler through the
+    /// fetch/prepare phase only — no transform execution.
+    pub async fn fetch(&self, addr: &Addr) -> ContextResult<()> {
+        self.setup_environments().await?;
+        self.scheduler().fetch(self, addr).await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
