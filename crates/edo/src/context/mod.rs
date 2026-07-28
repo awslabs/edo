@@ -554,6 +554,32 @@ impl Context {
         build_result?;
         Ok(())
     }
+
+    /// Sets up environments and drives the scheduler through the
+    /// fetch/prepare phase only — no transform execution.
+    ///
+    /// Mirrors [`Context::run`]'s teardown discipline: the inline canvas
+    /// is always shut down before this method returns, regardless of
+    /// which phase failed, so an early `setup_environments` failure
+    /// never leaves the tty in raw mode.
+    pub async fn fetch(&self, addr: &Addr) -> ContextResult<()> {
+        let env_setup = self.setup_environments().await;
+        let build_result = if env_setup.is_ok() {
+            self.scheduler().fetch(self, addr).await
+        } else {
+            // Skip scheduling but still tear the canvas down below.
+            Ok(())
+        };
+        // Drain the inline canvas before propagating any error so the
+        // user sees the final BuildFinished summary (or the env-setup
+        // error chain) on a restored terminal.
+        if let Some(c) = ui::Console::global() {
+            c.shutdown().await;
+        }
+        env_setup?;
+        build_result?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

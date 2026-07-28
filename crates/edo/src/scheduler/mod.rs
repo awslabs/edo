@@ -123,6 +123,15 @@ impl Scheduler {
     pub async fn run(&self, ctx: &Context, addr: &Addr) -> Result<()> {
         self.inner.run(ctx, addr).await
     }
+
+    /// Builds the dependency graph for `addr` and drives it through
+    /// [`Graph::fetch`] only — no transform execution.
+    ///
+    /// Convenience wrapper around [`Inner::fetch`]; see that method for the
+    /// phase-by-phase walk-through.
+    pub async fn fetch(&self, ctx: &Context, addr: &Addr) -> Result<()> {
+        self.inner.fetch(ctx, addr).await
+    }
 }
 
 /// Inner state held behind the [`Scheduler`]'s `Arc`.
@@ -166,6 +175,45 @@ impl Inner {
         graph.fetch(ctx).await?;
         let graph_ref = Arc::new(graph);
         graph_ref.run(&self.path, ctx, addr).await?;
+        Ok(())
+    }
+
+    /// Drives a fetch-only pass for `addr`: DAG construction and
+    /// `Graph::fetch` (source prepare, cache probes, id memoization),
+    /// then stops without invoking [`Graph::run`].
+    ///
+    /// Sequencing mirrors [`Inner::run`] up to the fetch phase — keep in
+    /// sync with that method:
+    ///
+    /// 1. `Graph::new` allocates an empty DAG sized for `workers`
+    ///    concurrent tasks.
+    /// 2. `Graph::add` recursively pulls in `addr` and its transitive
+    ///    dependencies.
+    /// 3. `Console::start_build` is emitted *between* `add` and `fetch`
+    ///    so it sequences ahead of the per-node task events fired inside
+    ///    `fetch`.
+    /// 4. `Graph::fetch` populates each node's [`Id`](crate::storage::Id),
+    ///    consults the build cache, and prepares (downloads sources for)
+    ///    every node that isn't already built.
+    ///
+    /// `Graph::fetch` emits `BuildFinished` itself on the error path
+    /// (and cancels the shared token). The success path here emits the
+    /// terminal `ui_finish_build!()` so the canvas state machine reaches
+    /// `finished` regardless of outcome.
+    pub async fn fetch(&self, ctx: &Context, addr: &Addr) -> Result<()> {
+        let mut graph = Graph::new(self.workers);
+        graph.add(ctx, addr).await?;
+
+        if let Some(c) = crate::ui::Console::global() {
+            c.start_build(addr, graph.subgraph_size(addr)).await;
+        }
+
+        graph.fetch(ctx).await?;
+        // Balance the `BuildStarted` above. `Graph::fetch` only emits
+        // `BuildFinished` on its error path; the success path is our
+        // responsibility here so the console state machine ends in
+        // `finished` for fetch-only runs.
+        crate::ui_finish_build!();
         Ok(())
     }
 }
@@ -281,6 +329,46 @@ mod tests {
         assert_eq!(h_a.transform_called.load(AtomicOrdering::SeqCst), 1);
         assert_eq!(h_b.transform_called.load(AtomicOrdering::SeqCst), 1);
         assert_eq!(h_c.transform_called.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    // ── Scheduler::fetch stops after prepare ─────────────────────────────
+
+    #[tokio::test]
+    #[serial_test::serial(log_manager)]
+    async fn fetch_runs_prepare_and_stops_before_execution() {
+        let Some(ctx) = try_shared_context().await else {
+            eprintln!(
+                "skip: global tracing subscriber already initialized by a \
+                 sibling test"
+            );
+            return;
+        };
+        ensure_default_farm(&ctx);
+
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mi = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let h_c = register_mock(&ctx, "//sf/c", &[], order.clone(), mi.clone());
+        let h_b = register_mock(&ctx, "//sf/b", &["//sf/c"], order.clone(), mi.clone());
+        let h_a = register_mock(&ctx, "//sf/a", &["//sf/b"], order, mi);
+
+        let dir = TempDir::new().unwrap();
+        let cfg = empty_config(&dir).await;
+        let s = Scheduler::new(dir.path().join("ws"), &cfg).await.unwrap();
+        s.fetch(&ctx, &Addr::parse("//sf/a").unwrap())
+            .await
+            .expect("fetch");
+
+        // Every node's `prepare` fired exactly once …
+        assert_eq!(h_a.prepare_called.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(h_b.prepare_called.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(h_c.prepare_called.load(AtomicOrdering::SeqCst), 1);
+        // … and no node advanced past prepare into stage/transform.
+        assert_eq!(h_a.stage_called.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(h_b.stage_called.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(h_c.stage_called.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(h_a.transform_called.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(h_b.transform_called.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(h_c.transform_called.load(AtomicOrdering::SeqCst), 0);
     }
 
     #[tokio::test]
