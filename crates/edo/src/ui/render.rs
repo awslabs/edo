@@ -25,7 +25,14 @@ pub(crate) fn draw_frame(state: &State, frame: &mut Frame) {
     // per frame; more importantly makes durations line up across rows.
     let now = Timestamp::now();
     let area = frame.area();
-    let chunks = Layout::vertical([Constraint::Length(2), Constraint::Min(1)]).split(area);
+    // The statusline slot is 2 rows in the common case, but when a
+    // prompt overlay is active it renders inside a bordered Block that
+    // consumes 2 rows for the top/bottom borders. Without extra height
+    // the body lines (`addr:/error:` and the choice row) are clipped
+    // and the user sees an empty red-bordered strip.
+    let status_height: u16 = if state.prompt.is_some() { 4 } else { 2 };
+    let chunks =
+        Layout::vertical([Constraint::Length(status_height), Constraint::Min(1)]).split(area);
     render_tasks(state, frame, chunks[1], now);
     render_statusline(state, frame, chunks[0]);
 }
