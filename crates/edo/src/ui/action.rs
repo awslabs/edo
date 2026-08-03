@@ -102,6 +102,7 @@ fn fmt_bracket(component: &str, id: Option<&str>) -> String {
 /// single `…` character when truncation occurs. Uses a byte-based char
 /// approximation (each char = 1 column) — enough for the CLI diagnostics
 /// which are ASCII-heavy, and cheaper than pulling in `unicode-width`.
+#[allow(dead_code)]
 fn truncate_visible(s: &str, max: usize) -> String {
     if max == 0 {
         return String::new();
@@ -116,6 +117,69 @@ fn truncate_visible(s: &str, max: usize) -> String {
     let take = max - 1;
     let mut out: String = s.chars().take(take).collect();
     out.push('…');
+    out
+}
+
+/// Soft-wrap `s` into chunks of at most `max` characters. Prefers to
+/// break at the last ASCII whitespace inside each chunk so words stay
+/// intact; falls back to a hard break when a single word is longer than
+/// `max`. Returns at least one chunk (possibly empty) for any input so
+/// callers can rely on `chunks.len() >= 1`.
+///
+/// Wrapping is done here — in the action layer — so the app layer can
+/// reserve exactly `chunks.len()` scroll-back rows via `insert_before`.
+/// If we let the terminal wrap a single 1-row insert, the extra visual
+/// rows overlap the inline viewport and produce "ghost" prefix lines.
+fn wrap_visible(s: &str, max: usize) -> Vec<String> {
+    if max == 0 {
+        return vec![String::new()];
+    }
+    if s.chars().count() <= max {
+        return vec![s.to_string()];
+    }
+
+    let mut out: Vec<String> = Vec::new();
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0usize;
+    while i < chars.len() {
+        let end = (i + max).min(chars.len());
+        // If we've consumed everything, the last slice is the final
+        // chunk — emit as-is.
+        if end == chars.len() {
+            out.push(chars[i..end].iter().collect());
+            break;
+        }
+        // Try to break at the last whitespace inside [i, end). Skip
+        // whitespace on the right edge of the slice so a break at a
+        // trailing space doesn't leave the next line starting with a
+        // space anyway.
+        let mut break_at: Option<usize> = None;
+        let mut k = end;
+        while k > i {
+            k -= 1;
+            if chars[k].is_ascii_whitespace() {
+                break_at = Some(k);
+                break;
+            }
+        }
+        let (chunk_end, next_start) = match break_at {
+            // Only prefer the word-break if it isn't the very first
+            // char of the window — otherwise we'd emit an empty chunk
+            // and loop forever on a leading-whitespace payload.
+            Some(k) if k > i => (k, k + 1),
+            _ => (end, end),
+        };
+        out.push(chars[i..chunk_end].iter().collect());
+        i = next_start;
+        // Skip any run of whitespace at the start of the next line so
+        // the wrapped continuation doesn't lead with a stray space.
+        while i < chars.len() && chars[i].is_ascii_whitespace() {
+            i += 1;
+        }
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
     out
 }
 
@@ -155,9 +219,15 @@ impl Action {
     }
 
     /// Render this event into one or more `ratatui::Line`s that fit
-    /// within `width` columns. Long ids and messages are truncated with
-    /// `…` so the terminal never has to wrap them — wrapping was the
-    /// root cause of empty-`info` ghost lines in captured stderr logs.
+    /// within `width` columns. Long messages are soft-wrapped across
+    /// multiple rows (continuation rows are indented under the message
+    /// column) so users see the full text at their terminal width.
+    ///
+    /// Wrapping is done here — not left to the terminal — so the
+    /// interactive app layer can reserve exactly `lines.len()`
+    /// scroll-back rows via `insert_before`. Letting the terminal wrap
+    /// a 1-row insert would overlap the inline viewport and produce
+    /// "ghost" duplicate prefix lines.
     pub fn to_lines_width(&self, width: u16) -> Vec<Line<'_>> {
         let width = width as usize;
         match self {
@@ -239,17 +309,32 @@ impl Action {
             } => {
                 let sev_str = severity_label(*severity);
                 let bracket = fmt_bracket(component, id.as_deref());
-                let prefix_visible = sev_str.chars().count() + bracket.chars().count() + 2; // ':' + ' '
-                let budget = width.saturating_sub(prefix_visible);
-                let msg = truncate_visible(message, budget);
-                vec![Line::from(vec![
-                    severity.to_span(),
-                    Span::styled(
-                        format!("{bracket}:"),
-                        Style::default().fg(Color::DarkGray).italic(),
-                    ),
-                    Span::raw(format!(" {msg}")),
-                ])]
+                // Prefix layout: "<sev><bracket>: <msg…>". `bracket`
+                // starts with a leading space when non-empty, so the
+                // ": " suffix contributes 2 columns.
+                let prefix_visible = sev_str.chars().count() + bracket.chars().count() + 2;
+                let budget = width.saturating_sub(prefix_visible).max(1);
+                let chunks = wrap_visible(message, budget);
+                let indent = " ".repeat(prefix_visible);
+                let mut lines: Vec<Line<'_>> = Vec::with_capacity(chunks.len());
+                for (idx, chunk) in chunks.iter().enumerate() {
+                    if idx == 0 {
+                        lines.push(Line::from(vec![
+                            severity.to_span(),
+                            Span::styled(
+                                format!("{bracket}:"),
+                                Style::default().fg(Color::DarkGray).italic(),
+                            ),
+                            Span::raw(format!(" {chunk}")),
+                        ]));
+                    } else {
+                        // Continuation rows: align under the message
+                        // column so wrapped text visually pairs with
+                        // its header without repeating the sev/bracket.
+                        lines.push(Line::from(vec![Span::raw(format!("{indent}{chunk}"))]));
+                    }
+                }
+                lines
             }
             Self::StartTask {
                 component,
@@ -260,23 +345,45 @@ impl Action {
             } if *status == TaskStatus::Cached => {
                 let bracket = fmt_bracket(component, Some(id.as_str()));
                 let label = status_label(*status);
-                let prefix_visible =
-                    label.chars().count() + bracket.chars().count() + operation.chars().count() + 2;
-                let budget = width.saturating_sub(prefix_visible);
-                let msg_span = if let Some(message) = message {
-                    let m = truncate_visible(message, budget.saturating_sub(2));
-                    Span::raw(format!(": {m}"))
-                } else {
-                    Span::raw("")
-                };
-                vec![Line::from(vec![
-                    status.to_span(),
-                    Span::styled(
-                        format!("{bracket}({operation})"),
-                        Style::default().fg(Color::DarkGray).italic(),
-                    ),
-                    msg_span,
-                ])]
+                // Header layout: "<label><bracket>(<operation>): <msg>".
+                // `bracket` includes its leading space; `(operation)`
+                // adds 2 for the parens; ": " adds 2 more.
+                let header_visible = label.chars().count()
+                    + bracket.chars().count()
+                    + operation.chars().count()
+                    + 4;
+                let budget = width.saturating_sub(header_visible).max(1);
+                match message {
+                    None => vec![Line::from(vec![
+                        status.to_span(),
+                        Span::styled(
+                            format!("{bracket}({operation})"),
+                            Style::default().fg(Color::DarkGray).italic(),
+                        ),
+                    ])],
+                    Some(message) => {
+                        let chunks = wrap_visible(message, budget);
+                        let indent = " ".repeat(header_visible);
+                        let mut lines: Vec<Line<'_>> = Vec::with_capacity(chunks.len());
+                        for (idx, chunk) in chunks.iter().enumerate() {
+                            if idx == 0 {
+                                lines.push(Line::from(vec![
+                                    status.to_span(),
+                                    Span::styled(
+                                        format!("{bracket}({operation})"),
+                                        Style::default().fg(Color::DarkGray).italic(),
+                                    ),
+                                    Span::raw(format!(": {chunk}")),
+                                ]));
+                            } else {
+                                lines.push(Line::from(vec![Span::raw(format!(
+                                    "{indent}{chunk}"
+                                ))]));
+                            }
+                        }
+                        lines
+                    }
+                }
             }
             Self::UpdateTask {
                 component,
@@ -291,23 +398,42 @@ impl Action {
             {
                 let bracket = fmt_bracket(component, Some(id.as_str()));
                 let label = status_label(*status);
-                let prefix_visible =
-                    label.chars().count() + bracket.chars().count() + operation.chars().count() + 2;
-                let budget = width.saturating_sub(prefix_visible);
-                let msg_span = if let Some(message) = message {
-                    let m = truncate_visible(message, budget.saturating_sub(2));
-                    Span::raw(format!(": {m}"))
-                } else {
-                    Span::raw("")
-                };
-                vec![Line::from(vec![
-                    status.to_span(),
-                    Span::styled(
-                        format!("{bracket}({operation})"),
-                        Style::default().fg(Color::DarkGray).italic(),
-                    ),
-                    msg_span,
-                ])]
+                let header_visible = label.chars().count()
+                    + bracket.chars().count()
+                    + operation.chars().count()
+                    + 4;
+                let budget = width.saturating_sub(header_visible).max(1);
+                match message {
+                    None => vec![Line::from(vec![
+                        status.to_span(),
+                        Span::styled(
+                            format!("{bracket}({operation})"),
+                            Style::default().fg(Color::DarkGray).italic(),
+                        ),
+                    ])],
+                    Some(message) => {
+                        let chunks = wrap_visible(message, budget);
+                        let indent = " ".repeat(header_visible);
+                        let mut lines: Vec<Line<'_>> = Vec::with_capacity(chunks.len());
+                        for (idx, chunk) in chunks.iter().enumerate() {
+                            if idx == 0 {
+                                lines.push(Line::from(vec![
+                                    status.to_span(),
+                                    Span::styled(
+                                        format!("{bracket}({operation})"),
+                                        Style::default().fg(Color::DarkGray).italic(),
+                                    ),
+                                    Span::raw(format!(": {chunk}")),
+                                ]));
+                            } else {
+                                lines.push(Line::from(vec![Span::raw(format!(
+                                    "{indent}{chunk}"
+                                ))]));
+                            }
+                        }
+                        lines
+                    }
+                }
             }
             _ => vec![],
         }
@@ -436,12 +562,62 @@ mod tests {
             message: long_msg,
         };
         let lines = ev.to_lines_width(80);
-        assert_eq!(lines.len(), 1, "expected exactly one line");
-        assert!(
-            line_visible_width(&lines[0]) <= 80,
-            "line width {} exceeded budget 80",
-            line_visible_width(&lines[0])
-        );
+        // Long diagnostics wrap across multiple rows so the reader
+        // sees the whole message; each row must still fit the budget.
+        assert!(lines.len() > 1, "expected wrapping, got {}", lines.len());
+        for (i, line) in lines.iter().enumerate() {
+            assert!(
+                line_visible_width(line) <= 80,
+                "line {i} width {} exceeded budget 80",
+                line_visible_width(line)
+            );
+        }
+        // Concatenating all row content should recover the message
+        // (modulo the header prefix on row 0 and indent on
+        // continuations). The 500-x payload must be fully present.
+        let joined: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect::<Vec<_>>()
+            .join("");
+        assert_eq!(joined.matches('x').count(), 500);
+    }
+
+    #[test]
+    fn diagnostic_wraps_at_word_boundary() {
+        // Deliberately picks a payload where a word boundary sits well
+        // inside the wrap window so the wrapper can prefer it over a
+        // mid-word break.
+        let ev = Action::Diagnostic {
+            component: "src".to_string(),
+            id: None,
+            severity: Severity::Info,
+            message: "alpha beta gamma delta epsilon zeta eta theta iota".to_string(),
+        };
+        let lines = ev.to_lines_width(30);
+        assert!(lines.len() >= 2);
+        // No continuation line should start with whitespace — the
+        // wrapper is expected to swallow the break character.
+        for line in &lines[1..] {
+            let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            let trimmed_leading = text.trim_start_matches(' ');
+            assert!(
+                !trimmed_leading.starts_with(' '),
+                "continuation should not begin with extra space: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn diagnostic_short_message_is_single_line() {
+        let ev = Action::Diagnostic {
+            component: "storage".to_string(),
+            id: None,
+            severity: Severity::Info,
+            message: "ok".to_string(),
+        };
+        let lines = ev.to_lines_width(80);
+        assert_eq!(lines.len(), 1);
     }
 
     #[test]
