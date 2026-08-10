@@ -103,10 +103,12 @@ pub fn sanitize_path_hint(hint: &Path) -> Option<PathBuf> {
 
 pub mod error;
 mod farm;
+mod helpers;
 mod vfs;
 
 pub use error::EnvironmentError;
 pub use farm::*;
+pub use helpers::*;
 pub use vfs::*;
 
 /// Convenience result alias for fallible environment operations.
