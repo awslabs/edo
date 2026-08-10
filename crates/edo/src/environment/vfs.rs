@@ -15,9 +15,11 @@
 
 use std::path::{Path, PathBuf};
 
+use snafu::ResultExt;
+
 use crate::{
     context::Log,
-    environment::{EnvResult, Environment, error},
+    environment::{EnvResult, Environment, error, shell_quote, shell_quote_path},
     storage::Id,
 };
 
@@ -190,6 +192,17 @@ impl Vfs {
         self.env.read_bytes(&path).await
     }
 
+    // tokio::fs::read_link
+    pub async fn read_link(&self, path: impl AsRef<Path>) -> EnvResult<PathBuf> {
+        let path = self.canonicalize(path).await?;
+        let path_q = shell_quote_path(&path);
+        let out = self
+            .output("read_link", "readlink", &[path_q.as_str()])
+            .await?;
+        let text = String::from_utf8_lossy(&out);
+        Ok(PathBuf::from(text.trim()))
+    }
+
     // tokio::fs::write
     pub async fn write(&self, path: impl AsRef<Path>, buffer: &[u8]) -> EnvResult<()> {
         let path = self.canonicalize(path).await?;
@@ -221,6 +234,17 @@ impl Vfs {
             .await?
         {
             return error::VfsSnafu { action: "rm" }.fail();
+        }
+        Ok(())
+    }
+
+    /// Remove a single file at `path` only if it exists.
+    ///
+    /// Fails with an [`error::VfsSnafu`] if the `rm` command reports a
+    /// non-zero exit status.
+    pub async fn try_remove_file(&self, path: impl AsRef<Path>) -> EnvResult<()> {
+        if self.try_exists(path.as_ref()).await? {
+            self.remove_file(path.as_ref()).await?;
         }
         Ok(())
     }
@@ -308,6 +332,74 @@ impl Vfs {
             return error::VfsSnafu { action: "rename" }.fail();
         }
         Ok(())
+    }
+
+    /// List contents of a directory
+    pub async fn list(&self, path: impl AsRef<Path>) -> EnvResult<Vec<PathBuf>> {
+        let dir = self.canonicalize(path).await?;
+        let dir_q = shell_quote_path(&dir);
+        let out = self
+            .output(
+                "ls",
+                "find",
+                &[dir_q.as_str(), "-mindepth", "1", "-maxdepth", "1"],
+            )
+            .await?;
+        Ok(parse_find_output(&out))
+    }
+
+    /// Search for files matching a pattern
+    pub async fn find_files(
+        &self,
+        path: impl AsRef<Path>,
+        glob: &str,
+        follow_symlinks: bool,
+    ) -> EnvResult<Vec<PathBuf>> {
+        let dir = self.canonicalize(path).await?;
+        let dir_q = shell_quote_path(&dir);
+        let glob_q = shell_quote(glob);
+        let mut args: Vec<&str> = Vec::with_capacity(11);
+        if follow_symlinks {
+            args.push("-L");
+        }
+        args.push(&dir_q);
+        args.extend_from_slice(&["-mindepth", "1", "-maxdepth", "1", "-type", "f", "-name"]);
+        args.push(&glob_q);
+        let out = self.output("find_files", "find", &args).await?;
+        Ok(parse_find_output(&out))
+    }
+
+    /// Search for files matching a pattern recursively
+    pub async fn find_files_recursive(
+        &self,
+        path: impl AsRef<Path>,
+        glob: &str,
+    ) -> EnvResult<Vec<PathBuf>> {
+        let dir = self.canonicalize(path).await?;
+        let dir_q = shell_quote_path(&dir);
+        let glob_q = shell_quote(glob);
+        let out = self
+            .output(
+                "find_files_recursive",
+                "find",
+                &[dir_q.as_str(), "-type", "f", "-name", glob_q.as_str()],
+            )
+            .await?;
+        Ok(parse_find_output(&out))
+    }
+
+    /// Return the size in bytes of `path`.
+    pub async fn size(&self, path: impl AsRef<Path>) -> EnvResult<u64> {
+        let path = self.canonicalize(path).await?;
+        let quoted = shell_quote_path(&path);
+        let out = self
+            .output("stat_size", "stat", &["-c", "%s", quoted.as_str()])
+            .await?;
+        let text = String::from_utf8_lossy(&out);
+        let trimmed = text.trim();
+        trimmed
+            .parse::<u64>()
+            .context(error::SizeOpSnafu { trimmed })
     }
 
     /// Run an arbitrary `program` with `args` in the environment at the
@@ -410,4 +502,17 @@ impl AsRef<Path> for Vfs {
     fn as_ref(&self) -> &Path {
         self.path.as_ref()
     }
+}
+
+/// Parse the stdout of a `find ...` call: split on newlines, drop
+/// empty lines, sort, and materialize as `PathBuf`s.
+fn parse_find_output(bytes: &[u8]) -> Vec<PathBuf> {
+    let text = String::from_utf8_lossy(bytes);
+    let mut lines: Vec<PathBuf> = text
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(PathBuf::from)
+        .collect();
+    lines.sort();
+    lines
 }

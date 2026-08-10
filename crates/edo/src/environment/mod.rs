@@ -70,10 +70,12 @@ pub fn resolved_stage_subpath(hint: &Path, media_type: &MediaType) -> PathBuf {
 
 pub mod error;
 mod farm;
+mod helpers;
 mod vfs;
 
 pub use error::EnvironmentError;
 pub use farm::*;
+pub use helpers::*;
 pub use vfs::*;
 
 /// Convenience result alias for fallible environment operations.

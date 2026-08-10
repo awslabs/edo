@@ -1,3 +1,5 @@
+use std::num::ParseIntError;
+
 use snafu::Snafu;
 
 /// Errors produced by the environment subsystem.
@@ -23,6 +25,11 @@ pub enum EnvironmentError {
     /// A command executed inside the environment returned a non-zero exit status.
     #[snafu(display("command execution failed"))]
     Run,
+    #[snafu(display("expected decimal size for size operation, got {trimmed:?}: {source}"))]
+    SizeOp {
+        trimmed: String,
+        source: ParseIntError,
+    },
     /// A propagated storage-layer error encountered during environment setup or I/O.
     #[snafu(transparent)]
     Storage {
