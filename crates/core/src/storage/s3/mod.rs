@@ -12,7 +12,7 @@ use edo::{
     util::{Reader, Writer},
 };
 use ocilot::models::Platform;
-use snafu::{OptionExt, ResultExt};
+use snafu::{IntoError, OptionExt, ResultExt};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -130,17 +130,29 @@ impl S3Backend {
             .send()
             .await
             .context(error::GetSnafu)?;
-        let bytes = response.body.collect().await.unwrap();
-        let catalog: Catalog =
-            serde_json::from_slice(bytes.to_vec().as_slice()).context(error::DeserializeSnafu)?;
-        Ok(catalog)
+        let bytes = response
+            .body
+            .collect()
+            .await
+            .map_err(|e| error::ReadBodySnafu.into_error(Box::new(e)))?;
+        serde_json::from_slice::<Catalog>(bytes.to_vec().as_slice())
+            .context(error::DeserializeSnafu)
+            .map_err(Into::into)
     }
 
-    /// Waits for any existing lock file to be released before proceeding.
+    /// Polls until the catalog lock object is gone.
+    ///
+    /// S3 has no native compare-and-swap on object creation, so concurrent
+    /// writers cannot use this to *guarantee* serialized access; the lock
+    /// object is a best-effort hint to back off when another writer is
+    /// known to be in progress. Returns `LockTimeout` once the retry
+    /// budget is exhausted so the caller does not silently trample a
+    /// peer's in-flight write — the previous behaviour of "warn and
+    /// proceed anyway" was racy and could lose updates.
     pub async fn wait_for_lock(&self) -> StorageResult<()> {
+        const MAX_ATTEMPTS: u32 = 5;
         let mut interval = tokio::time::interval(Duration::from_secs(1));
-        let mut attempts = 1;
-        loop {
+        for attempt in 1..=MAX_ATTEMPTS {
             interval.tick().await;
             if self
                 .client
@@ -151,15 +163,22 @@ impl S3Backend {
                 .await
                 .is_err()
             {
-                break;
-            } else if attempts >= 5 {
-                warn!(
-                    "lock file did not disappear after 5seconds, s3 bucket may have stale lock file at {}.lock",
-                    self.catalog_key
-                );
-                break;
+                return Ok(());
             }
-            attempts += 1;
+            if attempt == MAX_ATTEMPTS {
+                error!(
+                    subsystem = "storage",
+                    component = "s3",
+                    catalog_key = %self.catalog_key,
+                    "lock object {}.lock did not clear after {MAX_ATTEMPTS} attempts; failing",
+                    self.catalog_key,
+                );
+                return Err(error::LockTimeoutSnafu {
+                    key: format!("{}.lock", self.catalog_key),
+                }
+                .build()
+                .into());
+            }
         }
         Ok(())
     }
