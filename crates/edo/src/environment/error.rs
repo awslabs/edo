@@ -35,6 +35,12 @@ pub enum EnvironmentError {
     /// Failure during VFS operation
     #[snafu(display("vfs operation failed: {action}"))]
     Vfs { action: String },
+    /// A staging `path_hint` contained a component that could escape the
+    /// destination root (absolute path, drive prefix, or `..`).
+    #[snafu(display(
+        "artifact staging path hint {hint:?} is unsafe: it would escape the destination root"
+    ))]
+    UnsafePathHint { hint: std::path::PathBuf },
 }
 
 #[cfg(test)]

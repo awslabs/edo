@@ -1,20 +1,28 @@
 use async_trait::async_trait;
 use edo::context::{Addr, Context, FromNode, Log, Node, non_configurable};
-use edo::environment::Environment;
 use edo::record;
 use edo::source::{SourceImpl, SourceResult};
-use edo::storage::{Artifact, Compression, Config, Id, MediaType, Storage};
+use edo::storage::{Artifact, Compression, Config, Id, LayerOptions, MediaType, Storage};
 use merkle_hash::MerkleTree;
 use snafu::{OptionExt, ResultExt};
-use std::path::{Path, PathBuf, absolute};
+use std::path::{PathBuf, absolute};
 use tokio::{fs::File, io::AsyncWriteExt};
 use tokio_tar::Builder;
 
 /// A source backed by a local filesystem path.
 pub struct LocalSource {
     path: PathBuf,
-    out: PathBuf,
-    is_archive: bool,
+    out: Option<PathBuf>,
+}
+
+/// Folds an optional `out` value into a hash so two otherwise-identical
+/// sources with different `out`s produce different ids. Empty/missing
+/// `out` hashes a stable empty marker so old ids stay deterministic.
+fn out_bytes(out: Option<&PathBuf>) -> Vec<u8> {
+    out.and_then(|p| p.to_str())
+        .unwrap_or("")
+        .as_bytes()
+        .to_vec()
 }
 
 #[async_trait]
@@ -22,7 +30,7 @@ impl FromNode for LocalSource {
     type Error = error::Error;
 
     async fn from_node(_: &Addr, node: &Node, _: &Context) -> Result<Self, error::Error> {
-        node.validate_keys(&["path", "out", "is_archive"])?;
+        node.validate_keys(&["path"])?;
         let path = node
             .get("path")
             .unwrap()
@@ -33,24 +41,11 @@ impl FromNode for LocalSource {
             })?;
         let out = node
             .get("out")
-            .unwrap()
-            .as_string()
-            .context(error::FieldSnafu {
-                field: "out",
-                type_: "string",
-            })?;
-        let is_archive = node
-            .get("is_archive")
-            .unwrap()
-            .as_bool()
-            .context(error::FieldSnafu {
-                field: "is_archive",
-                type_: "bool",
-            })?;
+            .and_then(|x| x.as_string())
+            .map(PathBuf::from);
         Ok(Self {
             path: PathBuf::from(path),
-            out: PathBuf::from(out),
-            is_archive,
+            out,
         })
     }
 }
@@ -66,8 +61,13 @@ impl SourceImpl for LocalSource {
             .build()
             .context(error::MerkleSnafu)?;
         let hash = merkle.root.item.hash;
-        // Local files will never be precached usually
-        let digest = base16::encode_lower(hash.as_slice());
+        // Fold `out` into the manifest digest so `out` changes invalidate
+        // the cached manifest. The blob itself is still derived purely
+        // from the file content; only the *manifest* id changes.
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(hash.as_slice());
+        hasher.update(&out_bytes(self.out.as_ref()));
+        let digest = base16::encode_lower(hasher.finalize().as_bytes());
 
         let id = Id::builder()
             .name(
@@ -94,14 +94,29 @@ impl SourceImpl for LocalSource {
         // Start our layer
         let mut writer = storage.safe_start_layer().await?;
         // If the path is a file we do that
-        let media_type = if self.path.is_file() {
+        let (media_type, path_hint) = if self.path.is_file() {
             trace!(component = "source", type = "local", "reading file at {}", self.path.display());
             let mut reader = File::open(&self.path).await.context(error::ReadFileSnafu)?;
             record!(log, "copy", "storing file from {:?}", self.path);
             tokio::io::copy(&mut reader, &mut writer)
                 .await
                 .context(error::ReadFileSnafu)?;
-            MediaType::File(Compression::None)
+            // Detect the media type from the filename so local archives
+            // (.tar, .tar.gz, .tgz, .zip, ...) are extracted at stage
+            // time rather than copied verbatim.
+            let filename = self
+                .path
+                .file_name()
+                .map(|x| x.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let media_type = MediaType::detect(&filename)?;
+            let path_hint = self.out.clone().or_else(|| {
+                self.path
+                    .file_name()
+                    .map(|x| x.to_str().unwrap())
+                    .map(PathBuf::from)
+            });
+            (media_type, path_hint)
         } else {
             // We want to archive it if its a directory
             trace!(component = "source", type = "local", "archiving directory at {}", self.path.display());
@@ -118,44 +133,28 @@ impl SourceImpl for LocalSource {
                 .await
                 .context(error::ArchiveSnafu)?;
             archive.finish().await.context(error::ArchiveSnafu)?;
-            MediaType::Tar(Compression::None)
+            (MediaType::Tar(Compression::None), self.out.clone())
         };
         writer.flush().await.context(error::ReadFileSnafu)?;
         // Save the layer
-        artifact.layers_mut().push(
-            storage
-                .safe_finish_layer(&media_type, None, &writer)
-                .await?,
-        );
+        let layer = storage
+            .safe_finish_layer(
+                &writer,
+                &LayerOptions::builder().media_type(media_type).build(),
+            )
+            .await?;
+        // Record the staging hint at the artifact level keyed by the layer
+        // digest (matches `Catalog::blob_counts` and `LayerDigest::digest()`).
+        if let Some(hint) = path_hint {
+            artifact
+                .config_mut()
+                .path_hints_mut()
+                .insert(layer.digest().digest(), hint);
+        }
+        artifact.layers_mut().push(layer);
         // Save the artifact
         storage.safe_save(&artifact).await?;
         Ok(artifact)
-    }
-
-    async fn stage(
-        &self,
-        log: &Log,
-        storage: &Storage,
-        env: &Environment,
-        path: &Path,
-    ) -> SourceResult<()> {
-        // Staging is rather simple as we just want to move the remote file to the expected location
-        let out = path.join(self.out.clone());
-        let id = self.get_unique_id().await?;
-        // Get the artifact
-        let artifact = storage.safe_open(&id).await?;
-        let layer = artifact.layers().first().unwrap();
-        let reader = storage.safe_read(layer).await?;
-        if self.is_archive || matches!(layer.media_type(), MediaType::Tar(..)) {
-            trace!(component = "source", type = "local", "staging contents of archive into {}", out.display());
-            record!(log, "extract", "extracing archive into {out:?}");
-            env.unpack_stream(&out, reader).await?;
-        } else {
-            trace!(component = "source", type = "local", "staging file to {}", out.display());
-            record!(log, "copy", "copying file to {out:?}");
-            env.write_stream(&out, reader).await?;
-        }
-        Ok(())
     }
 }
 

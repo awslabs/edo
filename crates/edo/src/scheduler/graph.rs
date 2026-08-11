@@ -791,7 +791,7 @@ pub(crate) mod tests {
         m.expect_clean().returning(|_| Ok(()));
         m.expect_write_bytes().returning(|_, _| Ok(()));
         m.expect_write_stream().returning(|_, _| Ok(()));
-        m.expect_unpack_stream().returning(|_, _| Ok(()));
+        m.expect_unpack_stream().returning(|_, _, _| Ok(()));
         m.expect_read_bytes().returning(|_| Ok(Vec::new()));
         m.expect_read_stream().returning(|_, _| Ok(()));
         m.expect_execute().returning(|_, _, _, _| Ok(true));

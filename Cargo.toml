@@ -8,7 +8,8 @@ default-members = ["crates/cli"]
 arc-handle           = "1.0"
 assert_cmd           = "2"
 astral-tokio-tar     = "0.6"
-async-compression    = { version = "0.4", features = ["bzip2", "gzip", "lz4", "lzma", "tokio", "xz", "zstd"] }
+async-compression    = { version = "0.4", features = ["bzip2", "gzip", "lzma", "lz4", "tokio", "xz", "zstd"] }
+async_zip            = { version = "0.0.18", features = ["tokio", "deflate", "bzip2", "lzma", "zstd", "xz"] }
 async-recursion      = "1.1"
 async-trait          = "0.1"
 aws-config           = "1"
@@ -48,7 +49,7 @@ keyring              = "3.6"
 merkle_hash          = "3.8"
 mockall              = "0.14"
 names                = { version = "0.14", default-features = false, features = [] }
-ocilot               = "0.1"
+ocilot               = "0.2"
 os_pipe              = "1.2"
 owo-colors           = { version = "4.3", features = ["supports-colors"] }
 parking_lot          = { version = "0.12", features = ["send_guard"] }
@@ -56,6 +57,7 @@ predicates           = "3"
 rand                 = "0.10"
 rayon                = "1.12"
 regex                = "1.12"
+rustix               = { version = "1.1", features = ["fs"] }
 reqwest              = { version = "0.13", default-features = false, features = ["json", "stream"] }
 resolvo              = { version = "0.10", features = ["serde", "tokio", "version-ranges"] }
 semver               = { version = "1.0", features = ["serde"] }

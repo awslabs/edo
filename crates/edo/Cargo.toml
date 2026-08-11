@@ -37,6 +37,7 @@ owo-colors         = { workspace = true }
 parking_lot        = { workspace = true }
 rand               = { workspace = true }
 regex              = { workspace = true }
+rustix             = { workspace = true }
 reqwest            = { workspace = true }
 resolvo            = { workspace = true }
 semver             = { workspace = true }
