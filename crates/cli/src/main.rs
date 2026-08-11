@@ -14,6 +14,20 @@ pub mod error {
     pub enum Error {
         #[snafu(display("io error: {source}"))]
         Io { source: std::io::Error },
+        #[snafu(display("no transform registered for address {addr}"))]
+        UnknownTransform { addr: String },
+        #[snafu(display(
+            "cannot checkout artifact layer with media type {media_type}: not supported"
+        ))]
+        UnsupportedMediaType { media_type: String },
+        #[snafu(display("failed to extract zip layer: {source}"))]
+        ZipExtract {
+            source: edo_core::environment::ZipError,
+        },
+        #[snafu(display(
+            "artifact staging path hint {hint:?} is unsafe: it would escape the output root"
+        ))]
+        UnsafePathHint { hint: std::path::PathBuf },
         #[snafu(transparent)]
         Context { source: edo::context::ContextError },
         #[snafu(transparent)]
