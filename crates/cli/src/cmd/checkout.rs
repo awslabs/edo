@@ -5,6 +5,7 @@ use crate::Result;
 use crate::error;
 use async_compression::tokio::bufread::BzDecoder;
 use async_compression::tokio::bufread::GzipDecoder;
+use async_compression::tokio::bufread::Lz4Decoder;
 use async_compression::tokio::bufread::LzmaDecoder;
 use async_compression::tokio::bufread::XzDecoder;
 use async_compression::tokio::bufread::ZstdDecoder;
@@ -55,7 +56,8 @@ impl Checkout {
                 MediaType::Tar(compression) => {
                     let reader: Pin<Box<dyn tokio::io::AsyncRead>> = match compression {
                         Compression::Bzip2 => Box::pin(BzDecoder::new(reader)),
-                        Compression::Lz => Box::pin(LzmaDecoder::new(reader)),
+                        Compression::Lz4 => Box::pin(Lz4Decoder::new(reader)),
+                        Compression::Lzma => Box::pin(LzmaDecoder::new(reader)),
                         Compression::Xz => Box::pin(XzDecoder::new(reader)),
                         Compression::Gzip => Box::pin(GzipDecoder::new(reader)),
                         Compression::Zstd => Box::pin(ZstdDecoder::new(reader)),
