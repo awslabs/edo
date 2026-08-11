@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use snafu::ResultExt;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 const ARTIFACT_SCHEMA_VERSION: &str = "v1";
@@ -20,8 +21,10 @@ pub enum Compression {
     Gzip,
     #[serde(rename = ".bz2", alias = ".bzip2", alias = ".bzip")]
     Bzip2,
-    #[serde(rename = ".lz4", alias = ".lzma")]
-    Lz,
+    #[serde(rename = ".lz4")]
+    Lz4,
+    #[serde(rename = ".lzma")]
+    Lzma,
     #[serde(rename = ".xz")]
     Xz,
     #[serde(other, rename = "")]
@@ -54,9 +57,13 @@ impl Compression {
         if bzip.is_match(input) {
             return Ok((split_by(input, &bzip), Compression::Bzip2));
         }
-        let lz = Regex::new(r"[\.\+]{1}(lz4|lzma)$").context(error::RegexSnafu)?;
-        if lz.is_match(input) {
-            return Ok((split_by(input, &lz), Compression::Lz));
+        let lz4 = Regex::new(r"[\.\+]{1}lz4$").context(error::RegexSnafu)?;
+        if lz4.is_match(input) {
+            return Ok((split_by(input, &lz4), Compression::Lz4));
+        }
+        let lzma = Regex::new(r"[\.\+]{1}lzma$").context(error::RegexSnafu)?;
+        if lzma.is_match(input) {
+            return Ok((split_by(input, &lzma), Compression::Lzma));
         }
         let xz = Regex::new(r"[\.\+]{1}xz$").context(error::RegexSnafu)?;
         if xz.is_match(input) {
@@ -72,7 +79,8 @@ impl fmt::Display for Compression {
             Self::Zstd => ".zst",
             Self::Gzip => ".gz",
             Self::Bzip2 => ".bz2",
-            Self::Lz => ".lz4",
+            Self::Lz4 => ".lz4",
+            Self::Lzma => ".lzma",
             Self::Xz => ".xz",
             Self::None => "",
         })
@@ -93,6 +101,40 @@ pub enum MediaType {
 }
 
 impl MediaType {
+    pub fn detect(input: &str) -> StorageResult<MediaType> {
+        // Normalize compound archive suffixes that bundle tar+compression
+        // (.tgz, .tbz, .tbz2, .txz) into their expanded form so the
+        // downstream `.contains(".tar")` check classifies them correctly.
+        let normalized = if let Some(stem) = input.strip_suffix(".tgz") {
+            format!("{stem}.tar.gz")
+        } else if let Some(stem) = input.strip_suffix(".tbz2") {
+            format!("{stem}.tar.bz2")
+        } else if let Some(stem) = input.strip_suffix(".tbz") {
+            format!("{stem}.tar.bz2")
+        } else if let Some(stem) = input.strip_suffix(".txz") {
+            format!("{stem}.tar.xz")
+        } else {
+            input.to_string()
+        };
+        let (stripped, compression) = Compression::detect(&normalized)?;
+        // Use `ends_with` (not `contains`) so filenames like
+        // `release.tar.signature` are not misclassified as tar archives.
+        // The compression suffix is already stripped by `Compression::detect`,
+        // so `foo.tar.gz` arrives here as `foo.tar`.
+        if stripped.ends_with(".tar") {
+            Ok(MediaType::Tar(compression))
+        } else if stripped.ends_with(".zip") {
+            Ok(MediaType::Zip(compression))
+        } else {
+            Ok(MediaType::File(compression))
+        }
+    }
+
+    /// Returns `true` if the media type is an archive (tar or zip)
+    pub fn is_archive(&self) -> bool {
+        matches!(self, Self::Tar(..) | Self::Zip(..))
+    }
+
     /// Returns `true` if the media type carries a non-`None` compression.
     pub fn is_compressed(&self) -> bool {
         match self {
@@ -103,6 +145,19 @@ impl MediaType {
             | Self::Image(comp)
             | Self::Zip(comp)
             | Self::Custom(_, comp) => !matches!(comp, Compression::None),
+        }
+    }
+
+    /// Returns the compression setting
+    pub fn compression(&self) -> Compression {
+        match self {
+            Self::Manifest => Compression::None,
+            Self::File(comp)
+            | Self::Tar(comp)
+            | Self::Oci(comp)
+            | Self::Image(comp)
+            | Self::Zip(comp)
+            | Self::Custom(_, comp) => comp.clone(),
         }
     }
 
@@ -208,6 +263,13 @@ pub type Requires = BTreeMap<String, BTreeMap<String, VersionReq>>;
 ///
 /// Contains the unique [`Id`], a set of capability strings this artifact
 /// provides, its dependency requirements, and freeform metadata.
+///
+/// `path_hints` maps a layer's bare hex digest (matching `Catalog::blob_counts`
+/// keys and `LayerDigest::digest()`) to a relative path that
+/// [`Environment::stage`](crate::environment::Environment::stage) uses when
+/// extracting/writing the layer. Stored at the artifact level (rather than
+/// per-`Layer`) so that the same content-addressed blob can be shared by
+/// multiple manifests that present it at different paths.
 #[derive(Serialize, Deserialize, Clone, Debug, Builder)]
 pub struct Config {
     id: Id,
@@ -217,6 +279,9 @@ pub struct Config {
     requires: Requires,
     #[builder(into, default = Metadata::default())]
     metadata: Metadata,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[builder(into, default = BTreeMap::new())]
+    path_hints: BTreeMap<String, PathBuf>,
 }
 
 macro_rules! handle {
@@ -236,10 +301,16 @@ impl Config {
     handle!(metadata, metadata_mut, metadata, Metadata);
     handle!(requires, requires_mut, requires, Requires);
     handle!(provides, provides_mut, provides, BTreeSet<String>);
+    handle!(path_hints, path_hints_mut, path_hints, BTreeMap<String, PathBuf>);
+
+    /// Look up the staging path hint for `digest`, if one was recorded.
+    pub fn path_hint_for(&self, digest: &LayerDigest) -> Option<&PathBuf> {
+        self.path_hints.get(&digest.digest())
+    }
 }
 
 /// A BLAKE3 content digest identifying a layer's blob.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct LayerDigest(String);
 
 impl LayerDigest {
@@ -289,7 +360,9 @@ impl<'de> Deserialize<'de> for LayerDigest {
 /// A single content-addressed blob within an [`Artifact`].
 ///
 /// Each layer has a media type describing its content format, a BLAKE3 digest,
-/// a byte size, and an optional platform constraint.
+/// a byte size, and an optional platform constraint. Layers are purely
+/// content-addressed; presentation hints (where to stage the blob) live on
+/// [`Config::path_hints`] so the same blob can be reused across artifacts.
 #[derive(Serialize, Deserialize, Debug, Clone, Builder)]
 pub struct Layer {
     #[builder(into)]
@@ -300,6 +373,28 @@ pub struct Layer {
     size: usize,
     #[builder(into)]
     platform: Option<Platform>,
+}
+
+#[derive(Debug, Clone, Builder)]
+pub struct LayerOptions {
+    #[builder(into)]
+    media_type: MediaType,
+    #[builder(into)]
+    platform: Option<Platform>,
+}
+
+impl LayerOptions {
+    handle!(media_type, media_type_mut, media_type, MediaType);
+    handle!(platform, platform_mut, platform, Option<Platform>);
+
+    pub fn create<L: Into<LayerDigest>>(&self, digest: L, size: usize) -> Layer {
+        Layer::builder()
+            .media_type(self.media_type.clone())
+            .digest(digest.into())
+            .size(size)
+            .maybe_platform(self.platform.clone())
+            .build()
+    }
 }
 
 impl Layer {
@@ -328,4 +423,128 @@ impl Artifact {
     handle!(config, config_mut, config, Config);
     handle!(media_type, media_type_mut, media_type, MediaType);
     handle!(layers, layers_mut, layers, Vec<Layer>);
+}
+
+#[derive(Debug, Clone, Builder)]
+pub struct ArtifactStageOptions {
+    // Id to stage
+    #[builder(into)]
+    id: Id,
+    // Path to stage the artifact
+    #[builder(into)]
+    path: PathBuf,
+    // If this artifact layer is compressed, decompress it
+    #[builder(into, default = true)]
+    decompress: bool,
+    // If this is an archive extract it when staging
+    #[builder(into, default = true)]
+    extract: bool,
+    // Ignore source artifact path_hint
+    #[builder(into, default = false)]
+    ignore_artifact_path: bool,
+}
+
+impl ArtifactStageOptions {
+    pub fn id(&self) -> &Id {
+        &self.id
+    }
+
+    pub fn path(&self) -> &Path {
+        self.path.as_path()
+    }
+
+    pub fn decompress(&self) -> bool {
+        self.decompress
+    }
+
+    pub fn extract(&self) -> bool {
+        self.extract
+    }
+
+    pub fn ignore_artifact_path(&self) -> bool {
+        self.ignore_artifact_path
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Regression: `.lz4` and `.lzma` were collapsed into a single
+    // `Compression::Lz` variant, causing lzma content to be encoded as lz4.
+    // After the split, each suffix maps to its own variant.
+    #[test]
+    fn compression_detect_distinguishes_lz4_and_lzma() {
+        let (base, c) = Compression::detect("foo.tar.lz4").unwrap();
+        assert_eq!(base, "foo.tar");
+        assert_eq!(c, Compression::Lz4);
+
+        let (base, c) = Compression::detect("foo.tar.lzma").unwrap();
+        assert_eq!(base, "foo.tar");
+        assert_eq!(c, Compression::Lzma);
+    }
+
+    #[test]
+    fn compression_display_round_trips_suffix() {
+        assert_eq!(Compression::Lz4.to_string(), ".lz4");
+        assert_eq!(Compression::Lzma.to_string(), ".lzma");
+        assert_eq!(Compression::Gzip.to_string(), ".gz");
+        assert_eq!(Compression::Xz.to_string(), ".xz");
+        assert_eq!(Compression::Zstd.to_string(), ".zst");
+        assert_eq!(Compression::Bzip2.to_string(), ".bz2");
+        assert_eq!(Compression::None.to_string(), "");
+    }
+
+    // Regression: archive detection previously used `contains(".tar")` and
+    // `contains(".zip")`, which misclassified suffixes like
+    // `release.tar.signature` as tar archives. `ends_with` makes the check
+    // suffix-anchored (safe because the compression suffix has already been
+    // stripped by `Compression::detect`).
+    #[test]
+    fn media_type_detect_does_not_misclassify_dotted_tar_middle() {
+        let mt = MediaType::detect("release.tar.signature").unwrap();
+        assert!(
+            matches!(mt, MediaType::File(Compression::None)),
+            "expected File, got {mt:?}"
+        );
+    }
+
+    #[test]
+    fn media_type_detect_does_not_misclassify_dotted_zip_middle() {
+        let mt = MediaType::detect("bundle.zip.sig").unwrap();
+        assert!(
+            matches!(mt, MediaType::File(Compression::None)),
+            "expected File, got {mt:?}"
+        );
+    }
+
+    #[test]
+    fn media_type_detect_recognizes_plain_tar() {
+        let mt = MediaType::detect("archive.tar").unwrap();
+        assert!(matches!(mt, MediaType::Tar(Compression::None)));
+    }
+
+    #[test]
+    fn media_type_detect_recognizes_tar_gz() {
+        let mt = MediaType::detect("archive.tar.gz").unwrap();
+        assert!(matches!(mt, MediaType::Tar(Compression::Gzip)));
+    }
+
+    #[test]
+    fn media_type_detect_recognizes_compound_tgz() {
+        let mt = MediaType::detect("archive.tgz").unwrap();
+        assert!(matches!(mt, MediaType::Tar(Compression::Gzip)));
+    }
+
+    #[test]
+    fn media_type_detect_recognizes_zip() {
+        let mt = MediaType::detect("bundle.zip").unwrap();
+        assert!(matches!(mt, MediaType::Zip(Compression::None)));
+    }
+
+    #[test]
+    fn media_type_detect_recognizes_tar_lzma() {
+        let mt = MediaType::detect("archive.tar.lzma").unwrap();
+        assert!(matches!(mt, MediaType::Tar(Compression::Lzma)));
+    }
 }
