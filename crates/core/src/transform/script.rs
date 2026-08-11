@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 use edo::context::{Addr, Context, FromNode, Handle, Log, Node, non_configurable};
 use edo::environment::{Environment, Vfs};
 use edo::source::Source;
-use edo::storage::{Artifact, Compression, Config, Id, MediaType};
+use edo::storage::{
+    Artifact, ArtifactStageOptions, Compression, Config, Id, LayerOptions, MediaType,
+};
 use edo::transform::{TransformError, TransformImpl, TransformResult, TransformStatus};
 
 use async_trait::async_trait;
@@ -154,7 +156,7 @@ impl TransformImpl for ScriptTransform {
         Ok(())
     }
 
-    async fn stage(&self, log: &Log, ctx: &Handle, env: &Environment) -> TransformResult<()> {
+    async fn stage(&self, _log: &Log, ctx: &Handle, env: &Environment) -> TransformResult<()> {
         // First we want to create our build-root and install-roots
         let build_root = Path::new("build-root");
         env.create_dir(build_root).await?;
@@ -167,26 +169,30 @@ impl TransformImpl for ScriptTransform {
                 .context(error::NotFoundSnafu { addr: dep.clone() })?;
             let id = t.get_unique_id(ctx).await?;
             trace!(component = "transform", type = "script", "staging dependency {dep} with id {id}");
-            let artifact = ctx.storage().safe_open(&id).await?;
-            for layer in artifact.layers() {
-                let reader = ctx.storage().safe_read(layer).await?;
-                match layer.media_type() {
-                    MediaType::Tar(..) => {
-                        env.unpack_stream(build_root, reader).await?;
-                    }
-                    _ => {
-                        warn!(
-                            "skipping stage for dependency layer that we do not know how to stage"
-                        );
-                    }
-                }
-            }
+            // Use Environment::stage so decompression, archive vs file
+            // dispatch, and path_hint placement are handled uniformly
+            // (matching how sources are staged below).
+            env.stage(
+                ctx,
+                ArtifactStageOptions::builder()
+                    .id(id)
+                    .path(build_root)
+                    .build(),
+            )
+            .await?;
         }
 
         // Stage all sources in our build-root
         for (addr, source) in self.sources.iter() {
             trace!(component = "transform", type = "script", "staging source {addr}");
-            source.stage(log, ctx.storage(), env, build_root).await?;
+            env.stage(
+                ctx,
+                ArtifactStageOptions::builder()
+                    .id(source.get_unique_id().await?)
+                    .path(build_root)
+                    .build(),
+            )
+            .await?;
         }
         Ok(())
     }
@@ -195,7 +201,14 @@ impl TransformImpl for ScriptTransform {
         match async move {
             // Run the script in our environment
             let id = self.get_unique_id(ctx).await?;
-            let handlebars = Handlebars::new();
+            // Handlebars defaults to HTML-escaping interpolated values
+            // (`&` → `&amp;`, `<` → `&lt;`, etc.) which corrupts shell
+            // commands — e.g. `--arg url='https://h?a=1&b=2'` would render
+            // with the ampersand escaped into the generated script. The
+            // script template is producing shell, not HTML, so swap in
+            // `no_escape` to render values verbatim.
+            let mut handlebars = Handlebars::new();
+            handlebars.register_escape_fn(handlebars::no_escape);
             let vfs = Vfs::new(&id, env, log).await?;
 
             let mut script = vec![format!("#!/usr/bin/env {}", self.interpreter)];
@@ -234,8 +247,17 @@ impl TransformImpl for ScriptTransform {
             // Make it executable
             vfs.command("chmod", "chmod", &["+x", script.as_ref()])
                 .await?;
-            // Run the script
-            vfs.command("script", script.clone(), &Vec::<&str>::new())
+            // Run the script via the configured interpreter so the script
+            // path resolves regardless of whether `.` is in PATH. Dispatch
+            // through the build-root vfs so the script's working directory is
+            // build-root, matching the pre-refactor behaviour where scripts
+            // could reference staged sources by build-root-relative paths.
+            build_root
+                .command(
+                    "script",
+                    &self.interpreter,
+                    &[AsRef::<str>::as_ref(&script)],
+                )
                 .await?;
 
             // The result of a script transform is everything put in the install-root
@@ -254,18 +276,20 @@ impl TransformImpl for ScriptTransform {
             artifact.layers_mut().push(
                 ctx.storage()
                     .safe_finish_layer(
-                        &MediaType::Tar(Compression::None),
-                        Some(
-                            Platform::builder()
-                                .os(std::env::consts::OS)
-                                .architecture(
-                                    self.arch
-                                        .clone()
-                                        .unwrap_or(std::env::consts::OS.to_string()),
-                                )
-                                .build(),
-                        ),
                         &writer,
+                        &LayerOptions::builder()
+                            .media_type(MediaType::Tar(Compression::None))
+                            .platform(
+                                Platform::builder()
+                                    .os(std::env::consts::OS)
+                                    .architecture(
+                                        self.arch
+                                            .clone()
+                                            .unwrap_or(std::env::consts::ARCH.to_string()),
+                                    )
+                                    .build(),
+                            )
+                            .build(),
                     )
                     .await?,
             );

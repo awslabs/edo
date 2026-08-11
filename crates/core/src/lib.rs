@@ -9,7 +9,7 @@ use edo::{
     transform::Transform,
 };
 use environment::{ContainerFarm, LocalFarm};
-use source::{GitSource, ImageSource, LocalSource, RemoteSource, VendorSource};
+use source::{GitSource, ImageSource, LocalSource, RemoteSource};
 use std::sync::Arc;
 use storage::S3Backend;
 use transform::{ComposeTransform, ImportTransform, ScriptTransform};
@@ -70,12 +70,6 @@ pub fn register_core(ctx: &Context) {
         "remote",
         Arc::new(async |addr, node, ctx| {
             Ok(Source::new(RemoteSource::new(&addr, &node, &ctx).await?))
-        }),
-    );
-    registry.register_source(
-        "vendor",
-        Arc::new(async |addr, node, ctx| {
-            Ok(Source::new(VendorSource::new(&addr, &node, &ctx).await?))
         }),
     );
     registry.register_transform(

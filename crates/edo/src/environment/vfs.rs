@@ -95,7 +95,7 @@ impl Vfs {
             .execute(
                 &self.log,
                 &self.id,
-                &self.path(),
+                self.path(),
                 &format!("stat {path:?} > /dev/null 2> /dev/null"),
             )
             .await

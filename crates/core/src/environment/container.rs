@@ -4,7 +4,7 @@ use edo::context::{Addr, Context, Definable, FromNode, Log, Node};
 use edo::environment::{EnvResult, Environment, EnvironmentImpl, FarmImpl};
 use edo::record;
 use edo::source::Source;
-use edo::storage::{Id, Storage};
+use edo::storage::{Id, MediaType, Storage};
 use edo::util::{
     Reader, Writer, cmd_collect_out, cmd_noinput, cmd_noredirect, cmd_nulled, from_dash,
 };
@@ -15,7 +15,6 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::fs::{File, create_dir_all, remove_file};
-use tokio::io::AsyncWriteExt;
 use tracing::Instrument;
 use uuid::Uuid;
 use which::which;
@@ -139,7 +138,7 @@ impl FarmImpl for ContainerFarm {
         }
         // The image source stores an oci image as an oci archive in the first layer
         let layer = artifact.layers().first().unwrap();
-        let mut reader = storage.safe_read(&layer).await?;
+        let mut reader = storage.safe_read(layer).await?;
 
         let path = env::temp_dir().join(Uuid::now_v7().to_string());
         let mut archive = File::create(&path).await.context(error::IoSnafu)?;
@@ -365,12 +364,12 @@ impl EnvironmentImpl for Container {
 
     async fn write_bytes(&self, path: &Path, buffer: &[u8]) -> EnvResult<()> {
         let file_path = self.path.join(path);
-        if let Some(parent) = file_path.parent() {
-            if !parent.exists() {
-                tokio::fs::create_dir_all(parent)
-                    .await
-                    .context(error::CreateDirectorySnafu)?;
-            }
+        if let Some(parent) = file_path.parent()
+            && !parent.exists()
+        {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .context(error::CreateDirectorySnafu)?;
         }
         trace!(component = "environment", type = "container", "writing contents to file at {}", file_path.display());
         tokio::fs::write(&file_path, buffer)
@@ -381,12 +380,12 @@ impl EnvironmentImpl for Container {
 
     async fn write_stream(&self, path: &Path, mut reader: Reader) -> EnvResult<()> {
         let file_path = self.path.join(path);
-        if let Some(parent) = file_path.parent() {
-            if !parent.exists() {
-                tokio::fs::create_dir_all(parent)
-                    .await
-                    .context(error::CreateDirectorySnafu)?;
-            }
+        if let Some(parent) = file_path.parent()
+            && !parent.exists()
+        {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .context(error::CreateDirectorySnafu)?;
         }
         trace!(component = "environment", type = "container", "writing contents to file at {}", file_path.display());
         let mut file = File::create(&file_path)
@@ -398,21 +397,34 @@ impl EnvironmentImpl for Container {
         Ok(())
     }
 
-    async fn unpack_stream(&self, path: &Path, reader: Reader) -> EnvResult<()> {
+    async fn unpack_stream(
+        &self,
+        path: &Path,
+        media_type: &MediaType,
+        reader: Reader,
+    ) -> EnvResult<()> {
         let file_path = self.path.join(path);
         if !file_path.exists() {
             tokio::fs::create_dir_all(&file_path)
                 .await
                 .context(error::CreateDirectorySnafu)?;
         }
-        trace!(component = "environment", type = "container", "unpacking archive into {}", file_path.display());
-        let mut archive = tokio_tar::ArchiveBuilder::new(reader)
-            .set_preserve_permissions(true)
-            .build();
-        archive
-            .unpack(&file_path)
-            .await
-            .context(error::ExtractSnafu)?;
+        match media_type {
+            MediaType::Zip(..) => {
+                trace!(component = "environment", type = "container", "unpacking zip into {}", file_path.display());
+                super::extract_zip_stream(&file_path, reader).await?;
+            }
+            _ => {
+                trace!(component = "environment", type = "container", "unpacking archive into {}", file_path.display());
+                let mut archive = tokio_tar::ArchiveBuilder::new(reader)
+                    .set_preserve_permissions(true)
+                    .build();
+                archive
+                    .unpack(&file_path)
+                    .await
+                    .context(error::ExtractSnafu)?;
+            }
+        }
         Ok(())
     }
 

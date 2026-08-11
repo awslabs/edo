@@ -24,7 +24,6 @@ pub use error::StorageResult;
 use futures::future::try_join_all;
 pub use id::*;
 pub use local::*;
-use ocilot::models::Platform;
 use tokio::task::JoinError;
 
 use crate::util::{Reader, Writer};
@@ -143,11 +142,10 @@ impl Inner {
     // Finish writing a new layer
     async fn safe_finish_layer(
         &self,
-        media_type: &MediaType,
-        platform: Option<Platform>,
         writer: &Writer,
+        options: &LayerOptions,
     ) -> StorageResult<Layer> {
-        self.local.finish_layer(media_type, platform, writer).await
+        self.local.finish_layer(writer, options).await
     }
 
     // Save the artifact in the local cache
@@ -173,7 +171,11 @@ impl Inner {
                 let mut reader = backend.read(&layer).await?;
                 let mut writer = local.start_layer().await?;
                 tokio::io::copy(&mut reader, &mut writer).await.context(error::IoSnafu)?;
-                local.finish_layer(layer.media_type(), layer.platform().clone(), &writer).await?;
+                local.finish_layer(
+                    &writer, &LayerOptions::builder()
+                        .media_type(layer.media_type().clone())
+                        .maybe_platform(layer.platform().clone())
+                        .build()).await?;
                 Ok(())
             }.instrument(info_span!(target: "storage", "downloading", id = artifact.config().id().to_string(), digest = digest))));
         }
@@ -195,7 +197,11 @@ impl Inner {
                 let mut reader = local.read(&layer).await?;
                 let mut writer = backend.start_layer().await?;
                 tokio::io::copy(&mut reader, &mut writer).await.context(error::IoSnafu)?;
-                backend.finish_layer(layer.media_type(), layer.platform().clone(), &writer).await?;
+                backend.finish_layer(&writer, &LayerOptions::builder()
+                    .media_type(layer.media_type().clone())
+                    .maybe_platform(layer.platform().clone())
+                    .build()
+                ).await?;
                 Ok(())
             }.instrument(info_span!(target: "storage", "uploading", id = artifact.config().id().to_string(), digest = digest))));
         }
@@ -334,6 +340,38 @@ impl Storage {
         self.inner.write().await.set_output_cache(cache);
     }
 
+    /// Reports whether `id` is present in the **local** cache only.
+    ///
+    /// Cheap, side-effect-free probe: never touches networked source or
+    /// build caches. Used by [`Source::is_cached`](crate::source::Source::is_cached)
+    /// and the scheduler's fetch-phase short-circuit to avoid spawning
+    /// per-node prepare tasks when every input is already on disk.
+    ///
+    /// **safe operation** No network IO.
+    pub async fn has_local(&self, id: &Id) -> StorageResult<bool> {
+        self.inner.read().await.local.has(id).await
+    }
+
+    /// Reports whether the **local** cache already stores a blob with the
+    /// given bare hex digest. Used by content-addressed sources (e.g.
+    /// [`RemoteSource`](https://example.com)) to skip the network fetch when
+    /// only the manifest id changed (e.g. because `out` changed) but the
+    /// underlying blob is unchanged.
+    ///
+    /// **safe operation** No network IO.
+    pub async fn has_local_blob(&self, digest: &str) -> StorageResult<bool> {
+        self.inner.read().await.local.has_blob(digest).await
+    }
+
+    /// Returns the on-disk size of a blob in the **local** cache, if
+    /// present. Used by content-addressed sources to populate the
+    /// accurate `Layer::size` when reusing an existing blob.
+    ///
+    /// **safe operation** No network IO.
+    pub async fn local_blob_size(&self, digest: &str) -> StorageResult<Option<u64>> {
+        self.inner.read().await.local.blob_size(digest).await
+    }
+
     /// Open an artifact stored in the local cache
     /// **safe operation** This operation is safe to call in a networkless environment or in the
     /// build stages as it will make no network calls
@@ -356,14 +394,13 @@ impl Storage {
     /// Finish writing of a local layer
     pub async fn safe_finish_layer(
         &self,
-        media_type: &MediaType,
-        platform: Option<Platform>,
         writer: &Writer,
+        options: &LayerOptions,
     ) -> StorageResult<Layer> {
         self.inner
             .write()
             .await
-            .safe_finish_layer(media_type, platform, writer)
+            .safe_finish_layer(writer, options)
             .await
     }
 
