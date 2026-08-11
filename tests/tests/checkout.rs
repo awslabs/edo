@@ -5,12 +5,8 @@ fn checkout_extracts_files() {
     let fx = copy_fixture("hello_local");
     fx.edo(&["run", "//hello_local/emit"]).success();
     let out = fx.dir.path().join("out");
-    fx.edo(&[
-        "checkout",
-        "//hello_local/emit",
-        out.to_str().unwrap(),
-    ])
-    .success();
+    fx.edo(&["checkout", "//hello_local/emit", out.to_str().unwrap()])
+        .success();
     let greeting = find_file(&out, "greeting.txt").expect("greeting.txt must exist");
     let content = std::fs::read_to_string(&greeting).unwrap();
     assert!(
@@ -24,12 +20,8 @@ fn checkout_script_produces_hello_txt() {
     let fx = copy_fixture("hello_script");
     fx.edo(&["run", "//hello_script/build"]).success();
     let out = fx.dir.path().join("out");
-    fx.edo(&[
-        "checkout",
-        "//hello_script/build",
-        out.to_str().unwrap(),
-    ])
-    .success();
+    fx.edo(&["checkout", "//hello_script/build", out.to_str().unwrap()])
+        .success();
     let hello = find_file(&out, "hello.txt").expect("hello.txt must exist");
     let content = std::fs::read_to_string(&hello).unwrap();
     assert!(
@@ -43,12 +35,8 @@ fn checkout_compose_contains_all() {
     let fx = copy_fixture("hello_compose");
     fx.edo(&["run", "//hello_compose/bundle"]).success();
     let out = fx.dir.path().join("out");
-    fx.edo(&[
-        "checkout",
-        "//hello_compose/bundle",
-        out.to_str().unwrap(),
-    ])
-    .success();
+    fx.edo(&["checkout", "//hello_compose/bundle", out.to_str().unwrap()])
+        .success();
     assert!(
         find_file(&out, "left.txt").is_some(),
         "left.txt missing from composed artifact",

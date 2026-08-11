@@ -11,6 +11,8 @@ path = "src/lib.rs"
 [dependencies]
 assert_cmd  = { workspace = true }
 predicates  = { workspace = true }
+regex       = { workspace = true }
+serde_json  = { workspace = true }
 serial_test = { workspace = true }
 tempfile    = { workspace = true }
 tokio       = { workspace = true }
@@ -20,6 +22,7 @@ which       = { workspace = true }
 assert_cmd  = { workspace = true }
 edo-cli     = { path = "../crates/cli" }
 predicates  = { workspace = true }
+regex       = { workspace = true }
 serde_json  = { workspace = true }
 serial_test = { workspace = true }
 tempfile    = { workspace = true }
