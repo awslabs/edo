@@ -5,6 +5,7 @@ use futures::TryStreamExt;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use snafu::{ResultExt, ensure};
+use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
 use std::path::PathBuf;
 use tokio_util::io::StreamReader;
 use tracing::Instrument;
@@ -123,17 +124,7 @@ impl SourceImpl for RemoteSource {
                     .build()
             } else {
                 record!(log, "fetch", "fetching artifact from {url}");
-                let client = reqwest::Client::builder()
-                    .user_agent(concat!("edo/", env!("CARGO_PKG_VERSION")))
-                    .referer(false)
-                    .redirect(reqwest::redirect::Policy::limited(10))
-                    .build()
-                    .context(error::RequestSnafu)?;
-                let response = client
-                    .get(url.clone())
-                    .send()
-                    .await
-                    .context(error::RequestSnafu)?;
+                let response = send_with_ipv4_fallback(log, &url).await?;
                 ensure!(
                     response.status().is_success(),
                     error::FailedSnafu {
@@ -192,6 +183,90 @@ impl SourceImpl for RemoteSource {
             url = %self.url
         ))
         .await
+    }
+}
+
+/// Build a reqwest client, optionally forcing the outbound socket to bind
+/// an IPv4 local address. Binding `0.0.0.0` disables the IPv6 attempt in
+/// hyper's connector, which is our workaround for hosts that publish AAAA
+/// records but sit behind a broken/absent IPv6 default route.
+fn build_client(ipv4_only: bool) -> Result<reqwest::Client, reqwest::Error> {
+    let mut builder = reqwest::Client::builder()
+        .user_agent(concat!("edo/", env!("CARGO_PKG_VERSION")))
+        .referer(false)
+        .redirect(reqwest::redirect::Policy::limited(10));
+    if ipv4_only {
+        builder = builder.local_address(Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED)));
+    }
+    builder.build()
+}
+
+/// Best-effort check: does this URL's host resolve to both IPv6 and IPv4
+/// families? Only in that case is an IPv4-only retry meaningful — a host
+/// with only A records that fails to connect is genuinely unreachable and
+/// retrying would just double the wait.
+async fn host_is_dual_stack(url: &Url) -> bool {
+    let Some(host) = url.host_str().map(str::to_owned) else {
+        return false;
+    };
+    let port = url.port_or_known_default().unwrap_or(0);
+    tokio::task::spawn_blocking(move || {
+        let Ok(addrs) = (host.as_str(), port).to_socket_addrs() else {
+            return false;
+        };
+        let mut v4 = false;
+        let mut v6 = false;
+        for addr in addrs {
+            if addr.is_ipv4() {
+                v4 = true;
+            } else if addr.is_ipv6() {
+                v6 = true;
+            }
+            if v4 && v6 {
+                return true;
+            }
+        }
+        false
+    })
+    .await
+    .unwrap_or(false)
+}
+
+/// GET `url`, retrying once forced onto IPv4 if the first attempt fails at
+/// the connect stage on a dual-stack host. `reqwest` / `hyper_util` 0.13 do
+/// not implement Happy Eyeballs, so on a dual-stack host with no working
+/// IPv6 route the AAAA address is tried first and returns `ENETUNREACH`
+/// before the A record is ever considered. The retry is gated on the host
+/// actually publishing both families so IPv4-only failures don't pay for
+/// a redundant connect.
+async fn send_with_ipv4_fallback(
+    log: &Log,
+    url: &Url,
+) -> Result<reqwest::Response, error::RemoteSourceError> {
+    let client = build_client(false).context(error::RequestSnafu)?;
+    match client.get(url.clone()).send().await {
+        Ok(response) => Ok(response),
+        Err(err) if err.is_connect() && host_is_dual_stack(url).await => {
+            debug!(
+                subsystem = "source",
+                component = "remote",
+                url = %url,
+                error = %err,
+                "connect failed on dual-stack host, retrying with IPv4-only local bind"
+            );
+            record!(
+                log,
+                "fetch",
+                "connect failed ({err}); retrying with IPv4-only"
+            );
+            let client = build_client(true).context(error::RequestSnafu)?;
+            client
+                .get(url.clone())
+                .send()
+                .await
+                .context(error::RequestSnafu)
+        }
+        Err(err) => Err(err).context(error::RequestSnafu),
     }
 }
 
