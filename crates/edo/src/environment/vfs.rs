@@ -13,6 +13,8 @@
 //! [`Vfs::entry`] to obtain a child [`Vfs`] rooted at a nested path without
 //! mutating the original.
 
+use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use snafu::ResultExt;
@@ -22,6 +24,11 @@ use crate::{
     environment::{EnvResult, Environment, error, shell_quote, shell_quote_path},
     storage::Id,
 };
+
+/// Directory, relative to the environment root, that holds the temporary
+/// files [`Vfs::output`] captures stdout into. Entries under it are excluded
+/// from [`Vfs::list`] and the `find_files*` results.
+const SCRATCH_DIR: &str = ".edo-vfs";
 
 /// Filesystem view of an [`Environment`], rooted at a tracked working path.
 ///
@@ -111,7 +118,10 @@ impl Vfs {
                 &self.log,
                 &self.id,
                 self.path(),
-                &format!("stat {path:?} > /dev/null 2> /dev/null"),
+                &format!(
+                    "stat -- {} > /dev/null 2> /dev/null",
+                    shell_quote_path(&path)
+                ),
             )
             .await
     }
@@ -166,7 +176,7 @@ impl Vfs {
                 &self.log,
                 &self.id,
                 &self.path,
-                &format!("mkdir -p {path:?}"),
+                &format!("mkdir -p -- {}", shell_quote_path(&path)),
             )
             .await?
         {
@@ -192,15 +202,17 @@ impl Vfs {
         self.env.read_bytes(&path).await
     }
 
-    // tokio::fs::read_link
+    /// Return the target of the symbolic link at `path` (analogous to
+    /// [`tokio::fs::read_link`]). The target is returned verbatim, without
+    /// being resolved against the link's directory.
     pub async fn read_link(&self, path: impl AsRef<Path>) -> EnvResult<PathBuf> {
         let path = self.canonicalize(path).await?;
         let path_q = shell_quote_path(&path);
         let out = self
-            .output("read_link", "readlink", &[path_q.as_str()])
+            .output("read_link", "readlink", ["--", path_q.as_str()])
             .await?;
-        let text = String::from_utf8_lossy(&out);
-        Ok(PathBuf::from(text.trim()))
+        let target = out.strip_suffix(b"\n").unwrap_or(&out);
+        Ok(PathBuf::from(OsStr::from_bytes(target)))
     }
 
     // tokio::fs::write
@@ -230,7 +242,12 @@ impl Vfs {
         );
         if !self
             .env
-            .execute(&self.log, &self.id, &self.path, &format!("rm {path:?}"))
+            .execute(
+                &self.log,
+                &self.id,
+                &self.path,
+                &format!("rm -- {}", shell_quote_path(&path)),
+            )
             .await?
         {
             return error::VfsSnafu { action: "rm" }.fail();
@@ -238,15 +255,22 @@ impl Vfs {
         Ok(())
     }
 
-    /// Remove a single file at `path` only if it exists.
+    /// Remove a single file (or symlink, dangling or not) at `path`,
+    /// succeeding if nothing exists there.
     ///
-    /// Fails with an [`error::VfsSnafu`] if the `rm` command reports a
-    /// non-zero exit status.
+    /// Fails with an [`error::VfsSnafu`] if the `rm -f` command reports a
+    /// non-zero exit status (e.g. `path` is a directory).
     pub async fn try_remove_file(&self, path: impl AsRef<Path>) -> EnvResult<()> {
-        if self.try_exists(path.as_ref()).await? {
-            self.remove_file(path.as_ref()).await?;
-        }
-        Ok(())
+        let path = self.canonicalize(path).await?;
+        trace!(
+            subsystem = "environment",
+            component = "vfs",
+            op = "rm",
+            "removing file at {path:?} from environment if present"
+        );
+        let path_q = shell_quote_path(&path);
+        self.command("rm", "rm", ["-f", "--", path_q.as_str()])
+            .await
     }
 
     /// Recursively remove a directory at `path` (analogous to
@@ -265,7 +289,12 @@ impl Vfs {
         );
         if !self
             .env
-            .execute(&self.log, &self.id, &self.path, &format!("rm -r {path:?}"))
+            .execute(
+                &self.log,
+                &self.id,
+                &self.path,
+                &format!("rm -r -- {}", shell_quote_path(&path)),
+            )
             .await?
         {
             return error::VfsSnafu { action: "rmdir" }.fail();
@@ -295,7 +324,11 @@ impl Vfs {
                 &self.log,
                 &self.id,
                 &self.path,
-                &format!("cp -r {from:?} {to:?}"),
+                &format!(
+                    "cp -r -- {} {}",
+                    shell_quote_path(&from),
+                    shell_quote_path(&to)
+                ),
             )
             .await?
         {
@@ -325,7 +358,11 @@ impl Vfs {
                 &self.log,
                 &self.id,
                 &self.path,
-                &format!("mv {from:?} {to:?}"),
+                &format!(
+                    "mv -- {} {}",
+                    shell_quote_path(&from),
+                    shell_quote_path(&to)
+                ),
             )
             .await?
         {
@@ -334,72 +371,109 @@ impl Vfs {
         Ok(())
     }
 
-    /// List contents of a directory
+    /// List the entries directly inside the directory at `path`.
+    ///
+    /// Returns sorted absolute paths, excluding `.` and `..`.
     pub async fn list(&self, path: impl AsRef<Path>) -> EnvResult<Vec<PathBuf>> {
-        let dir = self.canonicalize(path).await?;
-        let dir_q = shell_quote_path(&dir);
-        let out = self
-            .output(
-                "ls",
-                "find",
-                &[dir_q.as_str(), "-mindepth", "1", "-maxdepth", "1"],
-            )
-            .await?;
-        Ok(parse_find_output(&out))
+        self.find("list", path, false, &["-mindepth", "1", "-maxdepth", "1"])
+            .await
     }
 
-    /// Search for files matching a pattern
+    /// Find regular files directly inside the directory at `path` whose
+    /// name matches `glob`.
+    ///
+    /// `glob` is a `find -name` pattern matched against the file name only,
+    /// so a pattern containing `/` (e.g. `sub/*.rs`) never matches. With
+    /// `follow_symlinks`, symlinks to regular files are included. Returns
+    /// sorted absolute paths.
     pub async fn find_files(
         &self,
         path: impl AsRef<Path>,
         glob: &str,
         follow_symlinks: bool,
     ) -> EnvResult<Vec<PathBuf>> {
-        let dir = self.canonicalize(path).await?;
-        let dir_q = shell_quote_path(&dir);
         let glob_q = shell_quote(glob);
-        let mut args: Vec<&str> = Vec::with_capacity(11);
-        if follow_symlinks {
-            args.push("-L");
-        }
-        args.push(&dir_q);
-        args.extend_from_slice(&["-mindepth", "1", "-maxdepth", "1", "-type", "f", "-name"]);
-        args.push(&glob_q);
-        let out = self.output("find_files", "find", &args).await?;
-        Ok(parse_find_output(&out))
+        self.find(
+            "find_files",
+            path,
+            follow_symlinks,
+            &[
+                "-mindepth",
+                "1",
+                "-maxdepth",
+                "1",
+                "-type",
+                "f",
+                "-name",
+                &glob_q,
+            ],
+        )
+        .await
     }
 
-    /// Search for files matching a pattern recursively
+    /// Find regular files anywhere beneath the directory at `path` whose
+    /// name matches `glob`.
+    ///
+    /// `glob` is a `find -name` pattern matched against the file name only,
+    /// so a pattern containing `/` (e.g. `sub/*.rs`) never matches. With
+    /// `follow_symlinks`, symlinked directories are descended into and
+    /// symlinks to regular files are included. Returns sorted absolute paths.
     pub async fn find_files_recursive(
         &self,
         path: impl AsRef<Path>,
         glob: &str,
+        follow_symlinks: bool,
+    ) -> EnvResult<Vec<PathBuf>> {
+        let glob_q = shell_quote(glob);
+        self.find(
+            "find_files_recursive",
+            path,
+            follow_symlinks,
+            &["-type", "f", "-name", &glob_q],
+        )
+        .await
+    }
+
+    /// Run `find [-L] <path> <filters...> -print0` and parse the results,
+    /// dropping anything under [`SCRATCH_DIR`].
+    async fn find(
+        &self,
+        action: &str,
+        path: impl AsRef<Path>,
+        follow_symlinks: bool,
+        filters: &[&str],
     ) -> EnvResult<Vec<PathBuf>> {
         let dir = self.canonicalize(path).await?;
         let dir_q = shell_quote_path(&dir);
-        let glob_q = shell_quote(glob);
-        let out = self
-            .output(
-                "find_files_recursive",
-                "find",
-                &[dir_q.as_str(), "-type", "f", "-name", glob_q.as_str()],
-            )
-            .await?;
-        Ok(parse_find_output(&out))
+        let mut args: Vec<&str> = Vec::new();
+        if follow_symlinks {
+            args.push("-L");
+        }
+        args.push(&dir_q);
+        args.extend_from_slice(filters);
+        args.push("-print0");
+        let out = self.output(action, "find", &args).await?;
+        let scratch = self.scratch_dir().await?;
+        Ok(parse_find_output(&out, &scratch))
     }
 
-    /// Return the size in bytes of `path`.
+    /// Return the size in bytes of the file at `path`.
+    ///
+    /// Symlinks are followed, so this reports the target's size like
+    /// [`tokio::fs::metadata`]. Fails if `path` is a directory.
     pub async fn size(&self, path: impl AsRef<Path>) -> EnvResult<u64> {
         let path = self.canonicalize(path).await?;
         let quoted = shell_quote_path(&path);
+        // `wc -c < file` is portable across GNU, BSD and busybox; BSD pads
+        // the count with leading spaces.
         let out = self
-            .output("stat_size", "stat", &["-c", "%s", quoted.as_str()])
+            .output("size", "wc", ["-c", "<", quoted.as_str()])
             .await?;
         let text = String::from_utf8_lossy(&out);
         let trimmed = text.trim();
         trimmed
             .parse::<u64>()
-            .context(error::SizeOpSnafu { trimmed })
+            .context(error::SizeOpSnafu { path, trimmed })
     }
 
     /// Run an arbitrary `program` with `args` in the environment at the
@@ -445,18 +519,21 @@ impl Vfs {
     }
 
     /// Run an arbitrary `program` with `args` in the environment at the
-    /// [`Vfs`]'s current working path and capture its output
+    /// [`Vfs`]'s current working path and capture its stdout.
     ///
     /// `action` is a short label used in [`error::VfsSnafu`] if the command
     /// reports a non-zero exit status. Arguments are joined with single
     /// spaces — callers needing shell-quoting must quote themselves.
+    ///
+    /// Stdout is captured in a temporary file under `.edo-vfs/` at the
+    /// environment root, which is removed whether or not the command
+    /// succeeds.
     pub async fn output<S, A, I>(&self, action: &str, program: S, args: A) -> EnvResult<Vec<u8>>
     where
         S: AsRef<str>,
         A: IntoIterator<Item = I>,
         I: AsRef<str>,
     {
-        // We want to create a temporary file
         trace!(
             subsystem = "environment",
             component = "vfs",
@@ -465,16 +542,18 @@ impl Vfs {
             "executing command in environment: {}",
             program.as_ref()
         );
-        let filename = names::Generator::default().next().unwrap();
-        let filepath = self.canonicalize(filename).await?;
-        if !self
+        let scratch = self.scratch_dir().await?;
+        let filepath = scratch.join(names::Generator::default().next().unwrap());
+        let scratch_q = shell_quote_path(&scratch);
+        let file_q = shell_quote_path(&filepath);
+        let ran = self
             .env
             .execute(
                 &self.log,
                 &self.id,
                 &self.path,
                 &format!(
-                    "{} {} > {filepath:?}",
+                    "mkdir -p -- {scratch_q} && {{ {} {}; }} > {file_q}",
                     program.as_ref(),
                     args.into_iter()
                         .map(|x| x.as_ref().to_string())
@@ -482,13 +561,35 @@ impl Vfs {
                         .join(" ")
                 ),
             )
-            .await?
-        {
-            return error::VfsSnafu { action }.fail();
+            .await;
+        let result = match ran {
+            Ok(true) => self.env.read_bytes(&filepath).await,
+            Ok(false) => error::VfsSnafu { action }.fail(),
+            Err(e) => Err(e),
+        };
+        // `rmdir` only succeeds once no other capture is in flight.
+        let cleaned = self
+            .env
+            .execute(
+                &self.log,
+                &self.id,
+                &self.path,
+                &format!("rm -f -- {file_q}; rmdir -- {scratch_q} 2> /dev/null; true"),
+            )
+            .await;
+        let buffer = result?;
+        if !cleaned? {
+            return error::VfsSnafu {
+                action: "output-cleanup",
+            }
+            .fail();
         }
-        let buffer = self.env.read_bytes(&filepath).await?;
-        self.remove_file(&filepath).await?;
         Ok(buffer)
+    }
+
+    /// Absolute path of [`SCRATCH_DIR`] inside the environment.
+    async fn scratch_dir(&self) -> EnvResult<PathBuf> {
+        self.env.expand(Path::new(SCRATCH_DIR)).await
     }
 }
 
@@ -504,15 +605,174 @@ impl AsRef<Path> for Vfs {
     }
 }
 
-/// Parse the stdout of a `find ...` call: split on newlines, drop
-/// empty lines, sort, and materialize as `PathBuf`s.
-fn parse_find_output(bytes: &[u8]) -> Vec<PathBuf> {
-    let text = String::from_utf8_lossy(bytes);
-    let mut lines: Vec<PathBuf> = text
-        .lines()
-        .filter(|l| !l.is_empty())
-        .map(PathBuf::from)
+/// Parse the stdout of a `find ... -print0` call: split on NUL, drop empty
+/// entries and anything at or under `exclude`, and sort.
+fn parse_find_output(bytes: &[u8], exclude: &Path) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = bytes
+        .split(|b| *b == 0)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| PathBuf::from(OsStr::from_bytes(entry)))
+        .filter(|path| !path.starts_with(exclude))
         .collect();
-    lines.sort();
-    lines
+    paths.sort();
+    paths
+}
+
+#[cfg(test)]
+mod tests {
+    //! Exercises [`Vfs`] against the host shell: the mocked environment runs
+    //! each command with `sh -c` inside a temporary root directory.
+    use super::*;
+    use crate::context::logmgr::test_support::shared_log_manager;
+    use crate::environment::{EnvironmentError, MockEnvironmentImpl};
+    use std::process::Command;
+    use tempfile::TempDir;
+
+    fn shell_env(root: &Path) -> Environment {
+        let mut m = MockEnvironmentImpl::new();
+        let base = root.to_path_buf();
+        m.expect_expand().returning(move |p| {
+            Ok(if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                base.join(p)
+            })
+        });
+        let base = root.to_path_buf();
+        m.expect_execute().returning(move |_, _, path, cmd| {
+            let status = Command::new("sh")
+                .arg("-c")
+                .arg(cmd)
+                .current_dir(base.join(path))
+                .status()
+                .map_err(|source| EnvironmentError::Io { source })?;
+            Ok(status.success())
+        });
+        m.expect_read_bytes()
+            .returning(|p| std::fs::read(p).map_err(|source| EnvironmentError::Io { source }));
+        Environment::new(m)
+    }
+
+    async fn vfs(dir: &TempDir) -> Vfs {
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let log = Log::new(&shared_log_manager().await, dir.path().join("vfs.log")).unwrap();
+        let id = Id::builder()
+            .name("vfs-test".to_string())
+            .digest("0".to_string())
+            .build();
+        Vfs::new(&id, &shell_env(&root), &log).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn list_excludes_capture_file() {
+        let dir = TempDir::new().unwrap();
+        let vfs = vfs(&dir).await;
+        std::fs::write(vfs.path().join("a"), b"").unwrap();
+        std::fs::create_dir(vfs.path().join("sub")).unwrap();
+        let listed = vfs.list(".").await.unwrap();
+        assert_eq!(listed, [vfs.path().join("a"), vfs.path().join("sub")]);
+        assert!(!vfs.path().join(SCRATCH_DIR).exists());
+    }
+
+    #[tokio::test]
+    async fn find_files_excludes_capture_file() {
+        let dir = TempDir::new().unwrap();
+        let vfs = vfs(&dir).await;
+        std::fs::write(vfs.path().join("a.rs"), b"").unwrap();
+        std::fs::create_dir(vfs.path().join("sub")).unwrap();
+        std::fs::write(vfs.path().join("sub/b.rs"), b"").unwrap();
+        assert_eq!(
+            vfs.find_files(".", "*", false).await.unwrap(),
+            [vfs.path().join("a.rs")]
+        );
+        assert_eq!(
+            vfs.find_files_recursive(".", "*", false).await.unwrap(),
+            [vfs.path().join("a.rs"), vfs.path().join("sub/b.rs")]
+        );
+    }
+
+    #[tokio::test]
+    async fn find_handles_unusual_file_names() {
+        let dir = TempDir::new().unwrap();
+        let vfs = vfs(&dir).await;
+        let newline = vfs.path().join("two\nlines");
+        let non_utf8 = vfs.path().join(OsStr::from_bytes(b"bad\xff"));
+        let quoted = vfs.path().join("it's $(x)");
+        for p in [&newline, &non_utf8, &quoted] {
+            std::fs::write(p, b"").unwrap();
+        }
+        let mut expected = vec![newline, non_utf8, quoted];
+        expected.sort();
+        assert_eq!(vfs.list(".").await.unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn find_recursive_follows_symlinks_on_request() {
+        let dir = TempDir::new().unwrap();
+        let vfs = vfs(&dir).await;
+        let target = dir.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("f.txt"), b"").unwrap();
+        std::os::unix::fs::symlink(&target, vfs.path().join("link")).unwrap();
+        assert!(
+            vfs.find_files_recursive(".", "*.txt", false)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            vfs.find_files_recursive(".", "*.txt", true).await.unwrap(),
+            [vfs.path().join("link/f.txt")]
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_output_cleans_up_capture_file() {
+        let dir = TempDir::new().unwrap();
+        let vfs = vfs(&dir).await;
+        assert!(vfs.size("missing").await.is_err());
+        assert!(vfs.read_link("missing").await.is_err());
+        assert!(!vfs.path().join(SCRATCH_DIR).exists());
+        assert!(vfs.list(".").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn size_reports_bytes_and_follows_symlinks() {
+        let dir = TempDir::new().unwrap();
+        let vfs = vfs(&dir).await;
+        std::fs::write(vfs.path().join("f"), b"hello").unwrap();
+        std::os::unix::fs::symlink("f", vfs.path().join("l")).unwrap();
+        assert_eq!(vfs.size("f").await.unwrap(), 5);
+        assert_eq!(vfs.size("l").await.unwrap(), 5);
+        std::fs::create_dir(vfs.path().join("d")).unwrap();
+        assert!(vfs.size("d").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn read_link_preserves_whitespace() {
+        let dir = TempDir::new().unwrap();
+        let vfs = vfs(&dir).await;
+        std::os::unix::fs::symlink(" target \n", vfs.path().join("l")).unwrap();
+        assert_eq!(
+            vfs.read_link("l").await.unwrap(),
+            PathBuf::from(" target \n")
+        );
+    }
+
+    #[tokio::test]
+    async fn try_remove_file_handles_missing_and_dangling() {
+        let dir = TempDir::new().unwrap();
+        let vfs = vfs(&dir).await;
+        vfs.try_remove_file("missing").await.unwrap();
+        let dangling = vfs.path().join("dangling");
+        std::os::unix::fs::symlink("nowhere", &dangling).unwrap();
+        vfs.try_remove_file("dangling").await.unwrap();
+        assert!(std::fs::symlink_metadata(&dangling).is_err());
+        let odd = vfs.path().join("$(touch pwned)");
+        std::fs::write(&odd, b"").unwrap();
+        vfs.try_remove_file("$(touch pwned)").await.unwrap();
+        assert!(!odd.exists());
+        assert!(!vfs.path().join("pwned").exists());
+    }
 }

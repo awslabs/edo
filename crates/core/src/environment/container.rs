@@ -362,6 +362,14 @@ impl Container {
         }
         Ok(local)
     }
+
+    /// Append one `--env KEY=VALUE` pair per environment variable.
+    fn push_env_args(&self, args: &mut Vec<String>) {
+        for entry in self.env.iter() {
+            args.push("--env".into());
+            args.push(format!("{}={}", entry.key(), entry.value()));
+        }
+    }
 }
 
 #[async_trait]
@@ -451,10 +459,7 @@ impl EnvironmentImpl for Container {
                 std::path::absolute(self.path.clone()).unwrap().display()
             ));
         }
-        for entry in self.env.iter() {
-            args.push("--env".into());
-            args.push(format!("{}={}", entry.key(), entry.value()));
-        }
+        self.push_env_args(&mut args);
         args.push("--name".into());
         args.push(self.name.clone());
         args.push(self.tag.clone());
@@ -668,10 +673,7 @@ impl EnvironmentImpl for Container {
             args.push("-u".into());
             args.push("0:0".into());
         }
-        for entry in self.env.iter() {
-            args.push("--env".into());
-            args.push(format!("{}={}", entry.key(), entry.value()));
-        }
+        self.push_env_args(&mut args);
         args.push(self.name.clone());
         let mut run_args = args.clone();
         run_args.push("sh".into());
@@ -702,10 +704,7 @@ impl EnvironmentImpl for Container {
             args.push("-u".into());
             args.push("0:0".into());
         }
-        for entry in self.env.iter() {
-            args.push("--env".into());
-            args.push(format!("{}={}", entry.key(), entry.value()));
-        }
+        self.push_env_args(&mut args);
         args.push(self.name.clone());
         let mut run_args = args.clone();
         run_args.push("sh".into());
@@ -998,6 +997,25 @@ mod tests {
             running: AtomicBool::new(false),
             env: DashMap::new(),
         }
+    }
+
+    #[test]
+    fn env_vars_are_passed_as_separate_flags() {
+        let container = container("root", Path::new("workspace"));
+        container.env.insert("A".into(), "1".into());
+        container.env.insert("B".into(), "x,y=z".into());
+        let mut args = Vec::new();
+        container.push_env_args(&mut args);
+        assert_eq!(args.len(), 4);
+        let mut pairs: Vec<_> = args
+            .chunks(2)
+            .map(|pair| {
+                assert_eq!(pair[0], "--env");
+                pair[1].clone()
+            })
+            .collect();
+        pairs.sort();
+        assert_eq!(pairs, ["A=1", "B=x,y=z"]);
     }
 
     #[test]
