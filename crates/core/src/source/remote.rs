@@ -5,7 +5,9 @@ use futures::TryStreamExt;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use snafu::{ResultExt, ensure};
+use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
 use std::path::PathBuf;
+use std::time::Duration;
 use tokio_util::io::StreamReader;
 use tracing::Instrument;
 use url::Url;
@@ -120,17 +122,7 @@ impl SourceImpl for RemoteSource {
                     .build()
             } else {
                 record!(log, "fetch", "fetching artifact from {url}");
-                let client = reqwest::Client::builder()
-                    .user_agent(concat!("edo/", env!("CARGO_PKG_VERSION")))
-                    .referer(false)
-                    .redirect(reqwest::redirect::Policy::limited(10))
-                    .build()
-                    .context(error::RequestSnafu)?;
-                let response = client
-                    .get(url.clone())
-                    .send()
-                    .await
-                    .context(error::RequestSnafu)?;
+                let response = send_with_ipv4_fallback(log, &url).await?;
                 ensure!(
                     response.status().is_success(),
                     error::FailedSnafu {
@@ -189,6 +181,102 @@ impl SourceImpl for RemoteSource {
     }
 }
 
+/// Upper bound on establishing a TCP connection, so an unreachable address
+/// fails instead of waiting for the OS TCP timeout.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Build a reqwest client. When `ipv4_only`, bind 0.0.0.0 so only IPv4
+/// remotes are dialed.
+fn build_client(ipv4_only: bool) -> Result<reqwest::Client, reqwest::Error> {
+    let mut builder = reqwest::Client::builder()
+        .user_agent(concat!("edo/", env!("CARGO_PKG_VERSION")))
+        .referer(false)
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .connect_timeout(CONNECT_TIMEOUT);
+    if ipv4_only {
+        builder = builder.local_address(Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED)));
+    }
+    builder.build()
+}
+
+/// Whether the host of `url` resolves to both IPv4 and IPv6 addresses.
+async fn host_is_dual_stack(url: &Url) -> bool {
+    let Some(host) = url.host_str().map(str::to_owned) else {
+        return false;
+    };
+    let port = url.port_or_known_default().unwrap_or(0);
+    tokio::task::spawn_blocking(move || {
+        let Ok(addrs) = (host.as_str(), port).to_socket_addrs() else {
+            return false;
+        };
+        let mut v4 = false;
+        let mut v6 = false;
+        for addr in addrs {
+            if addr.is_ipv4() {
+                v4 = true;
+            } else if addr.is_ipv6() {
+                v6 = true;
+            }
+            if v4 && v6 {
+                return true;
+            }
+        }
+        false
+    })
+    .await
+    .unwrap_or(false)
+}
+
+/// Whether `err` was caused by an `ENETUNREACH`/`EHOSTUNREACH` socket error.
+fn is_unreachable(err: &reqwest::Error) -> bool {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(e) = source {
+        if let Some(io) = e.downcast_ref::<std::io::Error>()
+            && matches!(
+                io.kind(),
+                std::io::ErrorKind::NetworkUnreachable | std::io::ErrorKind::HostUnreachable
+            )
+        {
+            return true;
+        }
+        source = e.source();
+    }
+    false
+}
+
+/// GET `url`. If the request fails with a network/host-unreachable error
+/// and the host is dual-stack, retry once over IPv4 only.
+async fn send_with_ipv4_fallback(
+    log: &Log,
+    url: &Url,
+) -> Result<reqwest::Response, error::RemoteSourceError> {
+    let client = build_client(false).context(error::RequestSnafu)?;
+    match client.get(url.clone()).send().await {
+        Ok(response) => Ok(response),
+        Err(first) if is_unreachable(&first) && host_is_dual_stack(url).await => {
+            debug!(
+                subsystem = "source",
+                component = "remote",
+                url = %url,
+                error = %first,
+                "remote unreachable on dual-stack host, retrying with IPv4-only local bind"
+            );
+            record!(
+                log,
+                "fetch",
+                "remote unreachable ({first}); retrying with IPv4-only"
+            );
+            let client = build_client(true).context(error::RequestSnafu)?;
+            client
+                .get(url.clone())
+                .send()
+                .await
+                .context(error::RetrySnafu { first })
+        }
+        Err(err) => Err(err).context(error::RequestSnafu),
+    }
+}
+
 pub mod error {
     use snafu::Snafu;
 
@@ -210,6 +298,13 @@ pub mod error {
         Io { source: std::io::Error },
         #[snafu(display("failed to make request to remote: {source}"))]
         Request { source: reqwest::Error },
+        #[snafu(display(
+            "failed to make request to remote: {first}; IPv4-only retry also failed: {source}"
+        ))]
+        Retry {
+            first: reqwest::Error,
+            source: reqwest::Error,
+        },
         #[snafu(display("invalid url provided to remote source: {source}"))]
         Url { source: url::ParseError },
     }

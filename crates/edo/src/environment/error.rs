@@ -25,8 +25,10 @@ pub enum EnvironmentError {
     /// A command executed inside the environment returned a non-zero exit status.
     #[snafu(display("command execution failed"))]
     Run,
-    #[snafu(display("expected decimal size for size operation, got {trimmed:?}: {source}"))]
+    /// [`super::Vfs::size`] could not parse the byte count reported for `path`.
+    #[snafu(display("expected decimal size of {path:?}, got {trimmed:?}: {source}"))]
     SizeOp {
+        path: std::path::PathBuf,
         trimmed: String,
         source: ParseIntError,
     },

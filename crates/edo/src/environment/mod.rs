@@ -108,7 +108,7 @@ mod vfs;
 
 pub use error::EnvironmentError;
 pub use farm::*;
-pub use helpers::*;
+pub use helpers::{shell_quote, shell_quote_path};
 pub use vfs::*;
 
 /// Convenience result alias for fallible environment operations.
