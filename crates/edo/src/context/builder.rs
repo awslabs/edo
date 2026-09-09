@@ -305,24 +305,17 @@ impl Project {
             ctx.add_transform(element).await?;
         }
 
-        // Provenance: emit a typed summary of what got loaded so the canvas
-        // header, JSONL log, and simple sink all have a single record of
-        // project shape. Sequenced after registration so counts reflect
-        // post-resolution state.
-        if let Some(c) = crate::ui::Console::global() {
-            c.emit_summary(
-                self.project_path.as_path(),
-                self.schema.transforms().len(),
-                self.schema.sources().len(),
-                self.schema.environments().len(),
-                locked_reused,
-            )
-            .await;
-            // Vendors and caches are not currently represented in the
-            // tui Summary event; surface them as info diagnostics so
-            // they still appear in the log.
-            let _ = cache_count;
-        }
+        // Provenance: emit a typed summary of what got loaded so the
+        // JSONL log has a single record of project shape. Sequenced
+        // after registration so counts reflect post-resolution state.
+        crate::summary!(
+            path = self.project_path.as_path(),
+            transforms = self.schema.transforms().len(),
+            sources = self.schema.sources().len(),
+            farms = self.schema.environments().len(),
+            locked = locked_reused
+        );
+        let _ = cache_count;
 
         Ok(())
     }

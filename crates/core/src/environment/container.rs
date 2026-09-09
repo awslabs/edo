@@ -652,9 +652,12 @@ impl EnvironmentImpl for Container {
             "running command"
         );
         let cli = self.config.cli.as_ref().unwrap();
+        // No `-i`: stdin is /dev/null for build commands (see
+        // `edo::util::cmd_noinput`), and an attached stdin would make the
+        // runtime pump the user's terminal, stealing keystrokes from the
+        // scheduler's interactive failure prompt.
         let mut args = vec![
             "exec".to_string(),
-            "-i".to_string(),
             "--workdir".to_string(),
             format!("{}", work_dir.display()),
         ];

@@ -25,17 +25,34 @@ use super::{
     transform::Transform,
 };
 use crate::storage::{Backend, LocalBackend, Storage};
-use crate::ui;
 use dashmap::DashMap;
 use serde_json::json;
 use snafu::ResultExt;
 use std::collections::{BTreeMap, HashMap};
 use std::env::current_dir;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::fs::create_dir_all;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
+
+/// Process-wide slot for the CLI-owned cancellation token.
+///
+/// The CLI installs a `tokio::signal::ctrl_c` watcher on process start
+/// (before any `Context` exists) that flips this token on the first
+/// SIGINT. `Context::init` clones this token into its own state so both
+/// the signal handler and the scheduler observers see the same switch.
+/// If never installed (e.g. under tests), `Context::init` falls back to
+/// a fresh token.
+static SIGINT_TOKEN: OnceLock<CancellationToken> = OnceLock::new();
+
+/// Install a session-wide cancellation token that [`Context::init`]
+/// will adopt. Callable exactly once per process; subsequent calls
+/// return the already-installed token so a caller can still get a
+/// clone. Used by the CLI's SIGINT watcher.
+pub fn install_cancellation() -> CancellationToken {
+    SIGINT_TOKEN.get_or_init(CancellationToken::new).clone()
+}
 
 mod address;
 mod builder;
@@ -78,18 +95,6 @@ pub use registry::*;
 /// Re-exports the typed-schema types ([`Schema`], [`Requirement`]).
 pub use schema::*;
 
-/// Configuration for the build-event console.
-///
-/// Retained as a stub so existing call sites continue to compile during
-/// the migration to the new `tui` module. The new tui has a single
-/// fixed rendering mode and no JSONL sink; this struct's fields are
-/// kept for API compatibility but are otherwise inert.
-#[derive(Clone, Debug, Default)]
-pub struct ConsoleConfig {
-    /// Path to the JSONL event log. Currently unused by the tui.
-    pub event_log: Option<PathBuf>,
-}
-
 /// Convenience alias for `Result<T, ContextError>`.
 pub type ContextResult<T> = std::result::Result<T, error::ContextError>;
 
@@ -125,10 +130,9 @@ pub struct Context {
     args: HashMap<String, String>,
     /// Session-wide cancellation token. Handed to every [`Handle`]
     /// produced by [`Context::get_handle`] / [`Context::get_handle_with_args`]
-    /// so that a Ctrl+C from the TUI, a quit-prompt choice, or a peer
-    /// fetch failure can flip a single switch every worker observes.
-    /// Also cancelled by the installed `SIGINT` handler in the CLI
-    /// (see `main.rs`).
+    /// so that a quit-prompt choice or a peer fetch failure can flip a
+    /// single switch every worker observes. Also cancelled by the
+    /// installed `SIGINT` handler in the CLI (see `main.rs`).
     cancellation: CancellationToken,
 }
 
@@ -143,7 +147,7 @@ impl Context {
         config: Option<ConfigPath>,
         args: HashMap<String, String>,
         verbosity: LogVerbosity,
-        _console_cfg: ConsoleConfig,
+        event_log: EventLog,
     ) -> ContextResult<Self>
     where
         ProjectPath: AsRef<Path>,
@@ -167,35 +171,16 @@ impl Context {
         // Logs should be in a project specific folder, so they
         // do not clash with other project workspaces.
         let log_path = path.join("logs");
-        let log = LogManager::init(&log_path, verbosity).await?;
-        // Install the global tui console exactly once per process.
-        // Subsequent `Context::init` calls (e.g. in tests) become a
-        // no-op so the UI task isn't spawned twice. `install` returns
-        // `Err(console)` if the slot is already taken — a second
-        // `Console::new` spawned an App task we now have to unwind. We
-        // shut it down synchronously so its raw-mode toggle doesn't
-        // stomp on the incumbent's viewport.
-        if ui::CONSOLE.get().is_none()
-            && let Err(dup) = ui::Console::new().install()
-        {
-            // Lost the race with a concurrent Context::init. Drain the
-            // App task we spawned so it doesn't linger.
-            trace!(
-                subsystem = "context",
-                component = "project",
-                op = "init",
-                "lost the race with concurrent Context::init"
-            );
-            dup.shutdown().await;
-        }
-        // Adopt the console's cancellation token if a console is
-        // installed, so a Ctrl+C keystroke handled by the App and a
-        // scheduler-side `token.cancel()` operate on the same switch.
-        // Otherwise fall back to a fresh token (e.g. under tests that
-        // build a Context without ever installing the console).
-        let cancellation = ui::Console::global()
-            .map(|c| c.cancellation())
-            .unwrap_or_default();
+        let log = LogManager::init(&log_path, verbosity, event_log).await?;
+        // Adopt the CLI-installed cancellation token if one exists;
+        // otherwise start fresh (e.g. under tests). The CLI's SIGINT
+        // watcher (see `cli::main`) publishes a token here so both the
+        // signal handler and every scheduler worker observe the same
+        // switch.
+        let cancellation = SIGINT_TOKEN
+            .get()
+            .cloned()
+            .unwrap_or_else(CancellationToken::new);
         // Load the configuration
         let config = Config::load(config).await?;
         debug!(
@@ -328,11 +313,6 @@ impl Context {
     /// Returns a reference to the log manager.
     pub fn log(&self) -> &LogManager {
         &self.log
-    }
-
-    /// Returns the global tui console handle, if installed.
-    pub fn console(&self) -> Option<&'static ui::Console> {
-        ui::Console::global()
     }
 
     /// Returns a reference to the execution scheduler.
@@ -494,7 +474,7 @@ impl Context {
                 component = "project",
                 op = "setup-environment";
                 &id,
-                ui::UiTaskStatus::Running,
+                crate::log::TaskStatus::Running,
                 None
             );
             let result = entry
@@ -506,9 +486,9 @@ impl Context {
                 ))
                 .await;
             let status = if result.is_ok() {
-                ui::UiTaskStatus::Success
+                crate::log::TaskStatus::Success
             } else {
-                ui::UiTaskStatus::Failed
+                crate::log::TaskStatus::Failed
             };
             crate::ui_update_task!(
                 subsystem = "context",
@@ -529,55 +509,17 @@ impl Context {
     }
 
     /// Sets up environments and executes the build for the given transform address.
-    ///
-    /// The inline canvas is always shut down before this method returns,
-    /// regardless of which phase failed. Without this guarantee an early
-    /// `setup_environments` failure would `?`-propagate past the cleanup
-    /// and leave the tty in raw mode with a frozen canvas overlay —
-    /// the user would see the snafu error chain printed underneath but
-    /// have no functioning prompt or shell.
     pub async fn run(&self, addr: &Addr) -> ContextResult<()> {
-        let env_setup = self.setup_environments().await;
-        let build_result = if env_setup.is_ok() {
-            self.scheduler().run(self, addr).await
-        } else {
-            // Skip scheduling but still tear the canvas down below.
-            Ok(())
-        };
-        // Drain the inline canvas before propagating any error so the
-        // user sees the final BuildFinished summary (or the env-setup
-        // error chain) on a restored terminal.
-        if let Some(c) = ui::Console::global() {
-            c.shutdown().await;
-        }
-        env_setup?;
-        build_result?;
+        self.setup_environments().await?;
+        self.scheduler().run(self, addr).await?;
         Ok(())
     }
 
     /// Sets up environments and drives the scheduler through the
     /// fetch/prepare phase only — no transform execution.
-    ///
-    /// Mirrors [`Context::run`]'s teardown discipline: the inline canvas
-    /// is always shut down before this method returns, regardless of
-    /// which phase failed, so an early `setup_environments` failure
-    /// never leaves the tty in raw mode.
     pub async fn fetch(&self, addr: &Addr) -> ContextResult<()> {
-        let env_setup = self.setup_environments().await;
-        let build_result = if env_setup.is_ok() {
-            self.scheduler().fetch(self, addr).await
-        } else {
-            // Skip scheduling but still tear the canvas down below.
-            Ok(())
-        };
-        // Drain the inline canvas before propagating any error so the
-        // user sees the final BuildFinished summary (or the env-setup
-        // error chain) on a restored terminal.
-        if let Some(c) = ui::Console::global() {
-            c.shutdown().await;
-        }
-        env_setup?;
-        build_result?;
+        self.setup_environments().await?;
+        self.scheduler().fetch(self, addr).await?;
         Ok(())
     }
 }
@@ -636,7 +578,7 @@ mod tests {
             None,
             HashMap::new(),
             LogVerbosity::Info,
-            ConsoleConfig::default(),
+            EventLog::Disabled,
         )
         .await
         {

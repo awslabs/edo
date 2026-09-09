@@ -168,9 +168,7 @@ impl Inner {
         // ahead of every task start event (those fire inside `fetch`).
         // Total is the reachable subgraph size, which is only known
         // after `add` completes.
-        if let Some(c) = crate::ui::Console::global() {
-            c.start_build(addr, graph.subgraph_size(addr)).await;
-        }
+        crate::ui_start_build!(&addr.to_string(), graph.subgraph_size(addr));
 
         graph.fetch(ctx).await?;
         let graph_ref = Arc::new(graph);
@@ -204,9 +202,7 @@ impl Inner {
         let mut graph = Graph::new(self.workers);
         graph.add(ctx, addr).await?;
 
-        if let Some(c) = crate::ui::Console::global() {
-            c.start_build(addr, graph.subgraph_size(addr)).await;
-        }
+        crate::ui_start_build!(&addr.to_string(), graph.subgraph_size(addr));
 
         graph.fetch(ctx).await?;
         // Balance the `BuildStarted` above. `Graph::fetch` only emits

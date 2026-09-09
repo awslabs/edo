@@ -55,7 +55,6 @@ use tracing::Instrument;
 use crate::context::{Addr, Context, Handle, IdCache};
 use crate::storage::{Artifact, Id};
 use crate::transform::Transform;
-use crate::ui;
 
 use super::node::Node;
 use super::{Result, error};
@@ -75,18 +74,26 @@ mod phase {
     pub const CLEAN: &str = "clean";
 }
 
-/// Format a `std::time::Duration` using the same `Nms`/`N.Ns`/`NmMs`/
-/// `NhMm` shape as `Task::to_line` / `Event::to_lines`. Delegates to
-/// [`crate::ui::action::fmt_short_duration`] so the two callsites can't
-/// drift in their rounding, thresholds, or singular/plural handling.
+/// Format a `std::time::Duration` in the compact `Nms`/`N.Ns`/`NmMs`/
+/// `NhMm` shape used in scheduler task-update messages.
 fn format_std_duration(d: std::time::Duration) -> String {
-    // `jiff::Span::try_from(std::time::Duration)` is fallible in
-    // principle (Duration can exceed jiff's span bounds), but our
-    // callers pass `Instant::elapsed()` values that never come close
-    // to that limit. On the theoretical overflow path we fall back to
-    // "?" rather than crash the render.
-    let span = jiff::Span::try_from(d).unwrap_or(jiff::Span::new());
-    crate::ui::action::fmt_short_duration(span)
+    let ms = d.as_millis();
+    if ms < 1_000 {
+        return format!("{ms}ms");
+    }
+    let secs_f = ms as f64 / 1000.0;
+    if secs_f < 60.0 {
+        return format!("{secs_f:.1}s");
+    }
+    let total_secs = (ms / 1000) as u64;
+    let mins = total_secs / 60;
+    let secs = total_secs % 60;
+    if mins < 60 {
+        return format!("{mins}m{secs}s");
+    }
+    let hours = mins / 60;
+    let rem_mins = mins % 60;
+    format!("{hours}h{rem_mins}m")
 }
 
 /// Execution graph: the DAG plus per-root metadata required to dispatch
@@ -341,7 +348,7 @@ impl Graph {
                         component = "scheduler",
                         op = "fetch";
                         &node.addr.to_string(),
-                        ui::UiTaskStatus::Cached,
+                        crate::log::TaskStatus::Cached,
                         Some("cache-hit".into())
                     );
                     continue;
@@ -357,7 +364,7 @@ impl Graph {
                 component = "scheduler",
                 op = "fetch";
                 &node.addr.to_string(),
-                ui::UiTaskStatus::Wait,
+                crate::log::TaskStatus::Wait,
                 Some("queued".into())
             );
 
@@ -373,7 +380,7 @@ impl Graph {
                         component = "scheduler",
                         op = "fetch";
                         &node.addr.to_string(),
-                        ui::UiTaskStatus::Wait,
+                        crate::log::TaskStatus::Wait,
                         None
                     );
                     continue;
@@ -385,7 +392,7 @@ impl Graph {
                         component = "scheduler",
                         op = "fetch";
                         &node.addr.to_string(),
-                        ui::UiTaskStatus::Failed,
+                        crate::log::TaskStatus::Failed,
                         Some(e.to_string())
                     );
                     sync_error = Some(e.into());
@@ -415,7 +422,7 @@ impl Graph {
                         component = "scheduler",
                         op = "fetch";
                         &node.addr.to_string(),
-                        ui::UiTaskStatus::Failed,
+                        crate::log::TaskStatus::Failed,
                         None
                     );
                     break 'outer;
@@ -436,7 +443,7 @@ impl Graph {
                         component = "scheduler",
                         op = "fetch";
                         &node_for_task.addr.to_string(),
-                        ui::UiTaskStatus::Running,
+                        crate::log::TaskStatus::Running,
                         Some(phase::FETCH.into())
                     );
                     let prepare_result = transform.prepare(&logf, &task_ctx).await;
@@ -452,7 +459,7 @@ impl Graph {
                             component = "scheduler",
                             op = "fetch";
                             &node_for_task.addr.to_string(),
-                            ui::UiTaskStatus::Failed,
+                            crate::log::TaskStatus::Failed,
                             Some(e.to_string())
                         );
                         return Err(e.into());
@@ -462,7 +469,7 @@ impl Graph {
                         component = "scheduler",
                         op = "fetch";
                         &node_for_task.addr.to_string(),
-                        ui::UiTaskStatus::Success,
+                        crate::log::TaskStatus::Success,
                         None
                     );
                     drop(logf);
@@ -823,7 +830,7 @@ impl Graph {
                         component = "scheduler",
                         op = "execution";
                         &node.addr.to_string(),
-                        ui::UiTaskStatus::Failed,
+                        crate::log::TaskStatus::Failed,
                         Some(e.to_string())
                     );
                     node.set_failed();
@@ -928,7 +935,7 @@ async fn run_transform_lifecycle(
         component = "scheduler",
         op = "execution";
         &node.addr.to_string(),
-        ui::UiTaskStatus::Running,
+        crate::log::TaskStatus::Running,
         Some(phase::CREATE_ENV.into())
     );
     let env_addr = transform.environment().await?;
@@ -947,7 +954,7 @@ async fn run_transform_lifecycle(
             component = "scheduler",
             op = "execution";
             &node.addr.to_string(),
-            ui::UiTaskStatus::Canceled,
+            crate::log::TaskStatus::Canceled,
             None
         );
         return error::CancelledSnafu.fail();
@@ -959,7 +966,7 @@ async fn run_transform_lifecycle(
         component = "scheduler",
         op = "execution";
         &node.addr.to_string(),
-        ui::UiTaskStatus::Running,
+        crate::log::TaskStatus::Running,
         Some(phase::SETUP.into())
     );
     environment.setup(&logf, ctx.storage()).await?;
@@ -970,7 +977,7 @@ async fn run_transform_lifecycle(
             component = "scheduler",
             op = "execution";
             &node.addr.to_string(),
-            ui::UiTaskStatus::Canceled,
+            crate::log::TaskStatus::Canceled,
             None
         );
         return error::CancelledSnafu.fail();
@@ -982,7 +989,7 @@ async fn run_transform_lifecycle(
         component = "scheduler",
         op = "execution";
         &node.addr.to_string(),
-        ui::UiTaskStatus::Running,
+        crate::log::TaskStatus::Running,
         Some(phase::SPIN_UP.into())
     );
     environment.up(&logf).await?;
@@ -1001,7 +1008,7 @@ async fn run_transform_lifecycle(
             component = "scheduler",
             op = "execution";
             &node.addr.to_string(),
-            ui::UiTaskStatus::Running,
+            crate::log::TaskStatus::Running,
             Some(phase::STAGE.into())
         );
         transform.stage(&logf, ctx, &environment).await?;
@@ -1015,7 +1022,7 @@ async fn run_transform_lifecycle(
             component = "scheduler",
             op = "execution";
             &node.addr.to_string(),
-            ui::UiTaskStatus::Running,
+            crate::log::TaskStatus::Running,
             Some(phase::EXECUTE.into())
         );
         super::execute::execute(&logf, ctx, &node.addr, transform, &environment).await
@@ -1030,7 +1037,7 @@ async fn run_transform_lifecycle(
         component = "scheduler",
         op = "execution";
         &node.addr.to_string(),
-        ui::UiTaskStatus::Running,
+        crate::log::TaskStatus::Running,
         Some(phase::SPIN_DOWN.into())
     );
 
@@ -1041,7 +1048,7 @@ async fn run_transform_lifecycle(
         component = "scheduler",
         op = "execution";
         &node.addr.to_string(),
-        ui::UiTaskStatus::Running,
+        crate::log::TaskStatus::Running,
         Some(phase::CLEAN.into())
     );
     let _ = environment.clean(&logf).await;
@@ -1054,7 +1061,7 @@ async fn run_transform_lifecycle(
                 component = "scheduler",
                 op = "execution";
                 &node.addr.to_string(),
-                ui::UiTaskStatus::Success,
+                crate::log::TaskStatus::Success,
                 Some(format!(
                     "{} ({})",
                     phase::EXECUTE,
@@ -1069,7 +1076,7 @@ async fn run_transform_lifecycle(
                 component = "scheduler",
                 op = "execution";
                 &node.addr.to_string(),
-                ui::UiTaskStatus::Failed,
+                crate::log::TaskStatus::Failed,
                 Some(format!(
                     "{} ({})",
                     phase::EXECUTE,
@@ -1155,7 +1162,7 @@ pub(crate) mod tests {
             None,
             HashMap::new(),
             LogVerbosity::Info,
-            crate::context::ConsoleConfig::default(),
+            crate::context::EventLog::Disabled,
         )
         .await
         {

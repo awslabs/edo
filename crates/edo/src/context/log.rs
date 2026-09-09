@@ -38,7 +38,7 @@ use std::sync::Arc;
 /// tests) [`block_in_place`] would panic; we degrade to a direct call,
 /// which is safe because the caller was already going to run the same
 /// blocking code synchronously.
-fn run_blocking<F, R>(f: F) -> R
+pub(crate) fn run_blocking<F, R>(f: F) -> R
 where
     F: FnOnce() -> R,
 {

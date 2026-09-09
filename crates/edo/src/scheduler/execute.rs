@@ -1,22 +1,27 @@
 //! Interactive transform executor with error recovery.
 //!
-//! Handles running a single transform, catching failures, and surfacing the
-//! failure prompt through the build console.
+//! Handles running a single transform, catching failures, and prompting
+//! the user with options to view logs, retry, open a shell, or abort.
 
 use super::{Result, error};
 use crate::{
-    context::{Handle, Log},
+    context::{Handle, Log, run_blocking},
     environment::Environment,
     storage::Artifact,
     transform::{Transform, TransformStatus},
-    ui::{self, PromptChoice, PromptRequest},
 };
-use std::io;
+use dialoguer::{Editor, Select};
+use snafu::ResultExt;
+use std::fs::read_to_string;
 
 /// Executes a transform with interactive error recovery.
 ///
 /// Runs the given transform within the provided environment. On failure,
-/// drives the failure prompt via [`crate::ui::Console::prompt`].
+/// prompts the user with `view log` / `retry` / `shell` / `quit` options
+/// via the `dialoguer` crate. The prompt runs under
+/// [`LogManager::prompt`](crate::context::LogManager::prompt), which
+/// gives it exclusive ownership of the terminal while the remaining
+/// transforms keep running.
 /// On success, uploads the resulting artifact to the build cache.
 pub async fn execute(
     log: &Log,
@@ -31,13 +36,10 @@ pub async fn execute(
         // Make an attempt
         let attempt_result = transform.transform(log, ctx, env).await;
         match &attempt_result {
-            // If the attempt was successful exit out and return the resulting artifact
             TransformStatus::Success(artifact) => {
                 result = Ok(artifact.clone());
                 break 'transform;
             }
-            // If the attempt failed for any reason we need to prompt the user what
-            // we should do about it.
             TransformStatus::Retryable(log_file, e) | TransformStatus::Failed(log_file, e) => {
                 crate::ui_error!(
                     subsystem = "transform",
@@ -48,69 +50,71 @@ pub async fn execute(
                     e.to_string()
                 );
 
-                let allow_retry = matches!(attempt_result, TransformStatus::Retryable(..));
-                let allow_shell = transform.can_shell();
-                let shell_callback: Option<Box<dyn FnMut() -> io::Result<()> + Send>> =
-                    if allow_shell {
-                        // Capture the env + transform handles into a closure
-                        // the render task can call once the canvas is
-                        // suspended.
-                        let transform = transform.clone();
-                        let env = env.clone();
-                        Some(Box::new(move || {
-                            transform
-                                .shell(&env)
-                                .map_err(|e| io::Error::other(e.to_string()))
-                        }))
-                    } else {
-                        None
-                    };
-                let request = PromptRequest {
-                    addr: addr.clone(),
-                    error: e.to_string(),
-                    log_file: log_file.clone(),
-                    allow_retry,
-                    allow_shell,
-                    shell: shell_callback,
-                };
-                let choice = match ui::Console::global() {
-                    Some(c) => c.prompt(request).await,
-                    None => PromptChoice::Quit,
-                };
-                match choice {
-                    PromptChoice::Retry if allow_retry => {
-                        continue 'transform;
-                    }
-                    PromptChoice::Retry => {
-                        // Defensive: the prompt should never offer
-                        // `retry` when `allow_retry == false`, but if
-                        // it somehow returns one (canvas absent,
-                        // shutdown race, second prompt rejected) we
-                        // emit an explicit diagnostic instead of
-                        // silently downgrading to abort (P1).
-                        crate::ui_warn!(
-                            subsystem = "transform",
-                            component = "scheduler",
-                            op = "execution",
-                            id = addr;
-                            "retry not available for this failure; aborting"
-                        );
-                        ctx.cancellation().cancel();
-                        result = error::PassthroughSnafu {
-                            message: e.to_string(),
-                        }
-                        .fail();
-                        break 'transform;
-                    }
-                    PromptChoice::Quit => {
-                        ctx.cancellation().cancel();
-                        result = error::PassthroughSnafu {
-                            message: e.to_string(),
-                        }
-                        .fail();
-                        break 'transform;
-                    }
+                // Assemble the offered options list. `view log` only
+                // when the transform reported a `.log` file, `retry`
+                // only when the failure was marked `Retryable`,
+                // `shell` only when the transform advertises a shell.
+                let mut options: Vec<&'static str> = Vec::new();
+                if log_file.is_some() {
+                    options.push("view log");
                 }
+                if matches!(attempt_result, TransformStatus::Retryable(..)) {
+                    options.push("retry");
+                }
+                if transform.can_shell() {
+                    options.push("shell");
+                }
+                options.push("quit");
+
+                // Hand the terminal to the prompt: bar rows are cleared,
+                // bar redraws stop and sibling log lines are buffered
+                // until `Select` is done, so nothing interleaves onto
+                // stderr and nothing else reads the keyboard. Sibling
+                // transforms keep running throughout — `block_in_place`
+                // releases this tokio worker so their tasks are not
+                // starved while we wait on the user.
+                let should_quit = run_blocking(|| {
+                    ctx.log().prompt(|| {
+                        'prompt: loop {
+                            let index = Select::new()
+                                .items(options.as_slice())
+                                .default(0)
+                                .interact()
+                                .context(error::InquireSnafu)?;
+                            match options[index] {
+                                "view log" => {
+                                    let log_text = read_to_string(log_file.as_ref().expect(
+                                        "log_file is Some when 'view log' option is present",
+                                    ))
+                                    .context(error::IoSnafu)?;
+                                    Editor::new().edit(&log_text).context(error::InquireSnafu)?;
+                                    continue 'prompt;
+                                }
+                                "shell" => {
+                                    transform.shell(env)?;
+                                    continue 'prompt;
+                                }
+                                "retry" => {
+                                    break 'prompt Ok::<bool, error::SchedulerError>(false);
+                                }
+                                "quit" => {
+                                    ctx.cancellation().cancel();
+                                    break 'prompt Ok(true);
+                                }
+                                _ => break 'prompt Ok(true),
+                            }
+                        }
+                    })
+                })?;
+                if should_quit {
+                    result = error::PassthroughSnafu {
+                        message: e.to_string(),
+                    }
+                    .fail();
+                    break 'transform;
+                }
+                // Retry path: loop and re-run the transform.
+                continue 'transform;
             }
         }
     }
@@ -122,14 +126,6 @@ pub async fn execute(
         }
         Err(e) => Err(e),
     }
-}
-
-/// Best-effort: derive the failed transform's `Addr`. The `Transform`
-/// trait does not expose its address directly — callers pass the
-/// scheduler's `node.addr` instead.
-#[allow(dead_code)]
-fn addr_for(_t: &Transform) -> Option<crate::context::Addr> {
-    None
 }
 
 #[cfg(test)]
@@ -167,7 +163,7 @@ mod tests {
             None,
             HashMap::new(),
             LogVerbosity::Info,
-            crate::context::ConsoleConfig::default(),
+            crate::context::EventLog::Disabled,
         )
         .await
         {

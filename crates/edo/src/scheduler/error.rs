@@ -27,6 +27,8 @@ pub enum SchedulerError {
     Graph { source: daggy::WouldCycle<String> },
     #[snafu(display("FATAL: infallible error occured in scheduler"))]
     Infallable,
+    #[snafu(display("interactive prompt failed: {source}"))]
+    Inquire { source: dialoguer::Error },
     #[snafu(display("io error: {source}"))]
     Io { source: std::io::Error },
     #[snafu(display("failed to wait for execution tasks: {source}"))]
