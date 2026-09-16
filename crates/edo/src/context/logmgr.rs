@@ -58,7 +58,7 @@ use std::{
     io::{IsTerminal, Write as _},
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicBool, Ordering as AtomicOrdering},
     },
     time::{Duration, Instant},
@@ -208,16 +208,42 @@ pub struct LogManager {
     inner: Arc<Inner>,
 }
 
+/// Process-wide singleton. The `tracing` global subscriber can only be
+/// installed once per process (`try_init` fails on the second call), and
+/// callers like `twoliter publish kit` legitimately construct multiple
+/// `Context`s in a single run (one per target arch). We cache the first
+/// `LogManager` and hand back clones on subsequent `init` calls so both
+/// the subscriber and the log directory survive.
+static LOG_MANAGER: OnceLock<LogManager> = OnceLock::new();
+
 impl LogManager {
     /// Initializes the log directory at `path` and sets up the tracing subscriber.
+    ///
+    /// The tracing subscriber is process-global and installed on the first
+    /// call. Subsequent calls in the same process return a clone of the
+    /// first `LogManager` — the `path`, `verbosity`, and `event_log`
+    /// arguments are ignored after the first successful init. This lets a
+    /// binary construct multiple `Context`s without tripping
+    /// `SetGlobalDefaultError`.
     pub async fn init<P: AsRef<Path>>(
         path: P,
         verbosity: LogVerbosity,
         event_log: EventLog,
     ) -> Result<Self> {
-        Ok(Self {
+        if let Some(existing) = LOG_MANAGER.get() {
+            return Ok(existing.clone());
+        }
+        let mgr = Self {
             inner: Arc::new(Inner::init(path, verbosity, event_log).await?),
-        })
+        };
+        // Race between two concurrent `init` calls: the loser drops its
+        // freshly built manager and returns the winner's. Both paths
+        // installed the same global subscriber via `try_init`, but only
+        // the winner's `try_init` call succeeded — the loser's Inner
+        // would have already returned `Err(SetGlobalDefault)` and we
+        // wouldn't reach here. So in practice this is only a defensive
+        // guard against the first-call fast path racing itself.
+        Ok(LOG_MANAGER.get_or_init(|| mgr).clone())
     }
 
     /// Creates a new [`Log`] file for the given task `id`.
