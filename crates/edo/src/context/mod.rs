@@ -18,13 +18,6 @@
 //! - Registry — plugin handler registry ([`Registry`], [`Handler`])
 //! - Builder — project loading and dependency resolution ([`Project`])
 
-use super::{
-    environment::Farm,
-    scheduler::Scheduler,
-    source::{Source, Vendor},
-    transform::Transform,
-};
-use crate::storage::{Backend, LocalBackend, Storage};
 use dashmap::DashMap;
 use serde_json::json;
 use snafu::ResultExt;
@@ -35,6 +28,14 @@ use std::sync::{Arc, OnceLock};
 use tokio::fs::create_dir_all;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
+
+use super::{
+    environment::Farm,
+    scheduler::Scheduler,
+    source::{Source, Vendor},
+    storage::{Backend, LocalBackend, Storage},
+    transform::Transform,
+};
 
 /// Process-wide slot for the CLI-owned cancellation token.
 ///

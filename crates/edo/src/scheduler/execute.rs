@@ -2,6 +2,9 @@
 //!
 //! Handles running a single transform, catching failures, and prompting
 //! the user with options to view logs, retry, open a shell, or abort.
+use dialoguer::{Editor, Select};
+use snafu::ResultExt;
+use std::fs::read_to_string;
 
 use super::{Result, error};
 use crate::{
@@ -10,9 +13,6 @@ use crate::{
     storage::Artifact,
     transform::{Transform, TransformStatus},
 };
-use dialoguer::{Editor, Select};
-use snafu::ResultExt;
-use std::fs::read_to_string;
 
 /// Executes a transform with interactive error recovery.
 ///
@@ -139,7 +139,7 @@ mod tests {
     use crate::context::{Addr, Context, LogVerbosity};
     use crate::environment::{Environment, Farm, MockEnvironmentImpl, MockFarmImpl};
     use crate::storage::{
-        Artifact as StorageArtifact, Compression, Config as ArtifactConfig, Id, MediaType,
+        Artifact as StorageArtifact, Compression, Config as ArtifactConfig, Digest, Id, MediaType,
     };
     use crate::transform::{MockTransformImpl, Transform, TransformStatus};
     use std::collections::HashMap;
@@ -203,8 +203,7 @@ mod tests {
         Farm::new(f)
     }
 
-    fn success_transform(digest: &str) -> Transform {
-        let digest = digest.to_string();
+    fn success_transform(digest: &Digest) -> Transform {
         let mut t = MockTransformImpl::new();
         t.expect_environment()
             .returning(|| Ok(Addr::parse("//default").unwrap()));
@@ -249,13 +248,14 @@ mod tests {
             eprintln!("skip: subscriber already initialized");
             return;
         };
+        let digest = Digest::builder().update("deadbeef".as_bytes()).build();
         // No build cache is registered → `upload_build` is a silent no-op,
         // so a Success path must still return the artifact cleanly.
         let handle = ctx.get_handle();
         let log = handle.log().create("execute-test").await.expect("log");
         let farm = mini_farm();
         let env = farm.create(&log, Path::new("/")).await.expect("env");
-        let transform = success_transform("deadbeef");
+        let transform = success_transform(&digest);
 
         let artifact = execute(
             &log,
@@ -266,7 +266,7 @@ mod tests {
         )
         .await
         .expect("execute success");
-        assert_eq!(artifact.config().id().digest(), "deadbeef");
+        assert_eq!(artifact.config().id().digest(), &digest);
         assert_eq!(artifact.config().id().name(), "exec_mock");
     }
 }

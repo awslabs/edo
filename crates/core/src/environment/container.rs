@@ -1,13 +1,5 @@
 use async_trait::async_trait;
 use dashmap::DashMap;
-use edo::context::{Addr, Context, Element, FromElement, Log};
-use edo::environment::{EnvResult, Environment, EnvironmentImpl, FarmImpl};
-use edo::record;
-use edo::source::Source;
-use edo::storage::{Id, MediaType, Storage};
-use edo::util::{
-    Reader, Writer, cmd_collect_out, cmd_noinput, cmd_noredirect, cmd_nulled, from_dash,
-};
 use regex::Regex;
 use snafu::ResultExt;
 use snafu::{OptionExt, ensure};
@@ -17,9 +9,17 @@ use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::fs::{File, create_dir_all, remove_file};
-use tracing::Instrument;
 use uuid::Uuid;
 use which::which;
+
+use edo::{
+    context::{Addr, Context, Element, FromElement, Log},
+    environment::{EnvResult, Environment, EnvironmentImpl, FarmImpl},
+    record,
+    source::Source,
+    storage::{Id, MediaType, Storage},
+    util::{Reader, Writer, cmd_collect_out, cmd_noinput, cmd_noredirect, cmd_nulled, from_dash},
+};
 
 const SHA256_EXTRACT: LazyLock<Regex> =
     LazyLock::new(|| Regex::new("sha256:([a-fA-F0-9]{64})").unwrap());
@@ -642,7 +642,7 @@ impl EnvironmentImpl for Container {
         Ok(())
     }
 
-    async fn execute(&self, log: &Log, id: &Id, path: &Path, cmd: &str) -> EnvResult<bool> {
+    async fn execute(&self, log: &Log, _id: &Id, path: &Path, cmd: &str) -> EnvResult<bool> {
         let work_dir = Path::new("/root").join(path);
         trace!(
             subsystem = "environment",

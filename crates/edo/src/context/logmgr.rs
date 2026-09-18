@@ -53,6 +53,11 @@
 //! [`TaskLayer`] uses to route it to a progress bar instead of a
 //! printed line.
 
+use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
+use jiff::Zoned;
+use owo_colors::{OwoColorize, Stream};
+use parking_lot::Mutex;
+use snafu::ResultExt;
 use std::{
     collections::HashMap,
     io::{IsTerminal, Write as _},
@@ -63,12 +68,6 @@ use std::{
     },
     time::{Duration, Instant},
 };
-
-use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
-use jiff::Zoned;
-use owo_colors::{OwoColorize, Stream};
-use parking_lot::Mutex;
-use snafu::ResultExt;
 use tokio::fs::{create_dir_all, remove_dir_all};
 use tracing::{
     Event, Level, Subscriber,

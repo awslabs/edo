@@ -12,27 +12,31 @@
 mod artifact;
 mod backend;
 mod catalog;
+mod digest;
 pub mod error;
 mod id;
 mod local;
 
-pub use artifact::*;
-pub use backend::*;
-pub use catalog::*;
-pub use error::StorageError;
-pub use error::StorageResult;
-use futures::future::try_join_all;
-pub use id::*;
-pub use local::*;
-use tokio::task::JoinError;
+pub use artifact::{
+    Artifact, ArtifactStageOptions, Compression, Config, Layer, LayerOptions, MediaType, Metadata,
+    Requires,
+};
+pub use backend::{Backend, BackendImpl};
+pub use catalog::Catalog;
+pub use digest::{Algorithm, Digest, DigestBuilder};
+pub use error::{StorageError, StorageResult};
+pub use id::{Id, Name};
+pub use local::LocalBackend;
 
 use crate::util::{Reader, Writer};
+use futures::future::try_join_all;
 use indexmap::IndexMap;
 use snafu::ResultExt;
 use std::collections::BTreeSet;
 use std::future::Future;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tokio::task::JoinError;
 use tracing::Instrument;
 
 /// Handle over multiple layered artifact caches.
@@ -147,7 +151,7 @@ impl Inner {
     async fn safe_read(&self, layer: &Layer) -> StorageResult<Reader> {
         debug!(
             subsystem = "storage",
-            digest = %layer.digest().digest(),
+            digest = %layer.digest(),
             "opening local layer"
         );
         self.local.read(layer).await
@@ -185,7 +189,7 @@ impl Inner {
             let backend = backend.clone();
             let local = self.local.clone();
             let layer = layer.clone();
-            let digest = layer.digest().digest();
+            let digest = layer.digest().clone();
             handles.push(tokio::spawn(async move {
                 let layer = layer.clone();
                 let mut reader = backend.read(&layer).await?;
@@ -211,7 +215,7 @@ impl Inner {
             let backend = backend.clone();
             let local = self.local.clone();
             let layer = layer.clone();
-            let digest = layer.digest().digest();
+            let digest = layer.digest().clone();
             handles.push(tokio::spawn(async move {
                 let layer = layer.clone();
                 let mut reader = local.read(&layer).await?;
@@ -418,7 +422,7 @@ impl Storage {
     /// underlying blob is unchanged.
     ///
     /// **safe operation** No network IO.
-    pub async fn has_local_blob(&self, digest: &str) -> StorageResult<bool> {
+    pub async fn has_local_blob(&self, digest: &Digest) -> StorageResult<bool> {
         self.inner.read().await.local.has_blob(digest).await
     }
 
@@ -427,7 +431,7 @@ impl Storage {
     /// accurate `Layer::size` when reusing an existing blob.
     ///
     /// **safe operation** No network IO.
-    pub async fn local_blob_size(&self, digest: &str) -> StorageResult<Option<u64>> {
+    pub async fn local_blob_size(&self, digest: &Digest) -> StorageResult<Option<u64>> {
         self.inner.read().await.local.blob_size(digest).await
     }
 

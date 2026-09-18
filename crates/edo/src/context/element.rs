@@ -6,12 +6,12 @@
 //! vendors, environment farms) are constructed from raw [`Element`]
 //! definitions. [`SourceMap`] models the optional `source = ...` field in
 //! its three accepted shapes.
-
-use super::{Addr, Config, ContextResult, error};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use snafu::{OptionExt, ResultExt};
 use std::collections::BTreeMap;
+
+use super::{Addr, Config, ContextResult, error};
 
 /// The raw TOML shapes accepted for an element's `source` field.
 ///

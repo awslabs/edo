@@ -19,8 +19,6 @@
 //! for callers that already hold a runtime worker \u2014 they are expected
 //! to know they are performing blocking IO.
 
-use super::LogManager;
-use super::{ContextResult as Result, error};
 use parking_lot::Mutex;
 use snafu::ResultExt;
 use std::fs::{File, OpenOptions};
@@ -28,6 +26,9 @@ use std::io::Write;
 use std::os::fd::IntoRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+use super::LogManager;
+use super::{ContextResult as Result, error};
 
 /// Run a synchronous, potentially-blocking closure without pinning a
 /// tokio worker thread.

@@ -1,4 +1,3 @@
-use super::{StorageResult, error, id::Id};
 use bon::Builder;
 use ocilot::models::Platform;
 use regex::Regex;
@@ -9,6 +8,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+
+use super::{
+    digest::Digest,
+    error::{self, StorageResult},
+    id::Id,
+};
 
 const ARTIFACT_SCHEMA_VERSION: &str = "v1";
 
@@ -281,7 +286,7 @@ pub struct Config {
     metadata: Metadata,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     #[builder(into, default = BTreeMap::new())]
-    path_hints: BTreeMap<String, PathBuf>,
+    path_hints: BTreeMap<Digest, PathBuf>,
 }
 
 macro_rules! handle {
@@ -301,59 +306,11 @@ impl Config {
     handle!(metadata, metadata_mut, metadata, Metadata);
     handle!(requires, requires_mut, requires, Requires);
     handle!(provides, provides_mut, provides, BTreeSet<String>);
-    handle!(path_hints, path_hints_mut, path_hints, BTreeMap<String, PathBuf>);
+    handle!(path_hints, path_hints_mut, path_hints, BTreeMap<Digest, PathBuf>);
 
     /// Look up the staging path hint for `digest`, if one was recorded.
-    pub fn path_hint_for(&self, digest: &LayerDigest) -> Option<&PathBuf> {
-        self.path_hints.get(&digest.digest())
-    }
-}
-
-/// A SHA256 content digest identifying a layer's blob.
-#[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
-pub struct LayerDigest(String);
-
-impl LayerDigest {
-    /// Return the raw hex digest string (without the `sha256:` prefix).
-    pub fn digest(&self) -> String {
-        self.0.clone()
-    }
-}
-
-impl<'a> From<&'a str> for LayerDigest {
-    fn from(value: &'a str) -> Self {
-        Self(value.strip_prefix("sha256:").unwrap_or(value).to_string())
-    }
-}
-
-impl From<String> for LayerDigest {
-    fn from(value: String) -> Self {
-        Self::from(value.as_str())
-    }
-}
-
-impl Serialize for LayerDigest {
-    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_str(&format!("sha256:{}", self.0))
-    }
-}
-
-impl<'de> Deserialize<'de> for LayerDigest {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let str = String::deserialize(deserializer)?;
-        if str.starts_with("sha256:") {
-            Ok(Self(str.strip_prefix("sha256:").unwrap().to_string()))
-        } else {
-            Err(serde::de::Error::custom(
-                "not a valid artifact layer digest",
-            ))
-        }
+    pub fn path_hint_for(&self, digest: &Digest) -> Option<&PathBuf> {
+        self.path_hints.get(digest)
     }
 }
 
@@ -364,22 +321,18 @@ impl<'de> Deserialize<'de> for LayerDigest {
 /// content-addressed; presentation hints (where to stage the blob) live on
 /// [`Config::path_hints`] so the same blob can be reused across artifacts.
 #[derive(Serialize, Deserialize, Debug, Clone, Builder)]
+#[builder(on(_, into))]
 pub struct Layer {
-    #[builder(into)]
     media_type: MediaType,
-    #[builder(into)]
-    digest: LayerDigest,
-    #[builder(into)]
+    digest: Digest,
     size: usize,
-    #[builder(into)]
     platform: Option<Platform>,
 }
 
 #[derive(Debug, Clone, Builder)]
+#[builder(on(_, into))]
 pub struct LayerOptions {
-    #[builder(into)]
     media_type: MediaType,
-    #[builder(into)]
     platform: Option<Platform>,
 }
 
@@ -387,10 +340,10 @@ impl LayerOptions {
     handle!(media_type, media_type_mut, media_type, MediaType);
     handle!(platform, platform_mut, platform, Option<Platform>);
 
-    pub fn create<L: Into<LayerDigest>>(&self, digest: L, size: usize) -> Layer {
+    pub fn create(&self, digest: Digest, size: usize) -> Layer {
         Layer::builder()
             .media_type(self.media_type.clone())
-            .digest(digest.into())
+            .digest(digest)
             .size(size)
             .maybe_platform(self.platform.clone())
             .build()
@@ -399,7 +352,7 @@ impl LayerOptions {
 
 impl Layer {
     handle!(media_type, media_type_mut, media_type, MediaType);
-    handle!(digest, digest_mut, digest, LayerDigest);
+    handle!(digest, digest_mut, digest, Digest);
     handle!(size, size_mut, size, usize);
     handle!(platform, platform_mut, platform, Option<Platform>);
 }

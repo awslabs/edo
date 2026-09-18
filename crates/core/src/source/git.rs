@@ -1,16 +1,17 @@
 use async_trait::async_trait;
-use edo::context::{Context, Element, FromElement, Log};
-use edo::record;
-use edo::source::{SourceImpl, SourceResult};
-use edo::storage::{Artifact, Compression, Config, Id, LayerOptions, MediaType, Storage};
-use edo::util::cmd_noinput;
-use sha2::{Digest, Sha256};
 use snafu::{ResultExt, ensure};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use tempfile::tempdir;
 use tokio::io::AsyncWriteExt;
-use tracing::Instrument;
+
+use edo::{
+    context::{Context, Element, FromElement, Log},
+    record,
+    source::{SourceImpl, SourceResult},
+    storage::{Artifact, Compression, Config, Digest, Id, LayerOptions, MediaType, Storage},
+    util::cmd_noinput,
+};
 
 /// A source that clones a Git repository at a specific reference.
 #[derive(serde::Deserialize, Debug, Clone)]
@@ -37,16 +38,16 @@ impl SourceImpl for GitSource {
         // Fold `out` into the digest so changing the staging path
         // invalidates the cached manifest. The name is kept stable
         // (no longer embeds `out`) so the human-facing id stays clean.
-        let mut hasher = Sha256::new();
-        hasher.update(self.reference.as_bytes());
-        hasher.update(
+
+        let mut digest = Digest::builder();
+        digest.update(self.reference.as_bytes()).update(
             self.out
                 .as_ref()
                 .and_then(|p| p.to_str())
                 .unwrap_or("")
                 .as_bytes(),
         );
-        let digest = base16::encode_lower(hasher.finalize().as_slice());
+
         let id = Id::builder()
             .name(format!(
                 "{}@{}-{:?}",
@@ -57,7 +58,7 @@ impl SourceImpl for GitSource {
                     .and_then(|x| x.to_str())
                     .unwrap_or_default()
             ))
-            .digest(digest)
+            .digest(digest.build())
             .build();
         trace!(subsystem = "source", component = "git", id = %id, "calculated id");
         Ok(id)
@@ -126,7 +127,7 @@ impl SourceImpl for GitSource {
             artifact
                 .config_mut()
                 .path_hints_mut()
-                .insert(layer.digest().digest(), hint);
+                .insert(layer.digest().clone(), hint);
         }
         artifact.layers_mut().push(layer);
         // Now save the artifact itself

@@ -22,17 +22,19 @@
 //! [`crate::register_core`](crate::register_core).
 
 use async_trait::async_trait;
+use snafu::OptionExt;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
 use edo::{
     context::{Addr, Context, Element, FromElement, Handle, Log},
     environment::{Environment, Vfs},
     source::Source,
-    storage::{Artifact, ArtifactStageOptions, Compression, Config, Id, LayerOptions, MediaType},
+    storage::{
+        Artifact, ArtifactStageOptions, Compression, Config, Digest, Id, LayerOptions, MediaType,
+    },
     transform::{TransformError, TransformImpl, TransformResult, TransformStatus},
 };
-use sha2::{Digest, Sha256};
-use snafu::OptionExt;
-use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
 
 #[derive(serde::Deserialize, Debug, Clone)]
 #[serde(deny_unknown_fields)]
@@ -112,10 +114,10 @@ impl TransformImpl for GoVendorTransform {
     /// Computes a deterministic id from the environment address and the
     /// source's unique id. Changing either invalidates the cached output.
     async fn get_unique_id(&self, _ctx: &Handle) -> TransformResult<Id> {
-        let mut hash = Sha256::new();
+        let mut hash = Digest::builder();
         hash.update(self.environment.to_string().as_bytes());
         let source_id = self.source.get_unique_id().await?;
-        hash.update(source_id.digest().as_bytes());
+        hash.update(source_id.digest().hash());
         for module in self.modules.iter() {
             hash.update(module.to_string_lossy().as_bytes());
         }
@@ -126,10 +128,9 @@ impl TransformImpl for GoVendorTransform {
             hash.update(v.as_bytes());
             hash.update(b"\0");
         }
-        let digest = hash.finalize();
         let id = Id::builder()
             .name(self.addr.to_id())
-            .digest(base16::encode_lower(digest.as_slice()))
+            .digest(hash.build())
             .build();
         trace!(subsystem = "transform", component = "go-vendor", id = %id, "calculated id");
         Ok(id.clone())
@@ -233,8 +234,7 @@ impl TransformImpl for GoVendorTransform {
                         // Invoke via `env` so extra variables (e.g. GO_MAJOR)
                         // are exported for the `go` process. Keys are already
                         // ordered thanks to BTreeMap.
-                        let mut args: Vec<String> =
-                            Vec::with_capacity(self.env.len() + 3);
+                        let mut args: Vec<String> = Vec::with_capacity(self.env.len() + 3);
                         for (k, v) in self.env.iter() {
                             args.push(format!("{k}={v}"));
                         }

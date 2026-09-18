@@ -2,7 +2,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::storage::{Artifact, Id, Layer};
+use super::{
+    artifact::{Artifact, Layer},
+    digest::Digest,
+    id::Id,
+};
 
 /// In-memory index of stored artifacts and their reference-counted blobs.
 ///
@@ -16,7 +20,7 @@ pub struct Catalog {
     /// Used by [`Self::list_all`] and [`Self::matching`].
     prefix_index: BTreeMap<String, BTreeSet<Id>>,
     manifests: BTreeMap<Id, Artifact>,
-    blob_counts: BTreeMap<String, i64>,
+    blob_counts: BTreeMap<Digest, i64>,
 }
 
 impl Catalog {
@@ -56,22 +60,22 @@ impl Catalog {
             .insert(id.clone());
         self.manifests.insert(id.clone(), artifact.clone());
         for layer in artifact.layers() {
-            let digest = layer.digest().digest();
-            *self.blob_counts.entry(digest).or_default() += 1;
+            let digest = layer.digest();
+            *self.blob_counts.entry(digest.clone()).or_default() += 1;
         }
     }
 
     /// Return the reference count for the blob backing `layer`.
     pub fn count(&self, layer: &Layer) -> i64 {
-        let digest = layer.digest().digest();
-        self.blob_counts.get(&digest).cloned().unwrap_or(0)
+        let digest = layer.digest();
+        self.blob_counts.get(digest).cloned().unwrap_or(0)
     }
 
     /// Reports whether any saved manifest references a blob with this bare
     /// hex digest. This is purely an in-memory hint — callers that need
     /// a stronger guarantee (e.g. that the blob actually exists on disk)
     /// must perform their own filesystem-level check.
-    pub fn has_blob(&self, digest: &str) -> bool {
+    pub fn has_blob(&self, digest: &Digest) -> bool {
         self.blob_counts.contains_key(digest)
     }
 
@@ -86,7 +90,7 @@ impl Catalog {
         }
         if let Some(artifact) = self.manifests.remove(id) {
             for layer in artifact.layers() {
-                let digest = layer.digest().digest();
+                let digest = layer.digest();
                 if let Some(blob_count) = self.blob_counts.get_mut(&digest) {
                     *blob_count -= 1;
                     if *blob_count <= 0 {
@@ -101,12 +105,18 @@ impl Catalog {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{Artifact, Compression, Config, Layer, MediaType};
+    use crate::storage::{Artifact, Compression, Config, Digest, Layer, MediaType};
 
-    fn artifact(name: &str, digest: &str, layer_digests: &[&str]) -> Artifact {
+    fn hash(text: &str) -> Digest {
+        let mut h = Digest::builder();
+        h.update(text.as_bytes());
+        h.build()
+    }
+
+    fn artifact(name: &str, digest: &str, layer_digests: &[Digest]) -> Artifact {
         let id = Id::builder()
             .name(name.to_string())
-            .digest(digest.to_string())
+            .digest(hash(digest))
             .build();
         let mut a = Artifact::builder()
             .media_type(MediaType::Manifest)
@@ -116,7 +126,7 @@ mod tests {
             a.layers_mut().push(
                 Layer::builder()
                     .media_type(MediaType::File(Compression::None))
-                    .digest((*d).to_string())
+                    .digest(d.clone())
                     .size(0usize)
                     .build(),
             );
@@ -127,13 +137,13 @@ mod tests {
     #[test]
     fn add_then_del_returns_to_empty_state() {
         let mut c = Catalog::default();
-        let a = artifact("foo", "deadbeef", &["aaaa"]);
+        let a = artifact("foo", "deadbeef", &[hash("aaaa")]);
         c.add(&a);
         assert!(c.has(a.config().id()));
-        assert!(c.has_blob("aaaa"));
+        assert!(c.has_blob(&hash("aaaa")));
         c.del(a.config().id());
         assert!(!c.has(a.config().id()));
-        assert!(!c.has_blob("aaaa"), "blob count should be removed");
+        assert!(!c.has_blob(&hash("aaaa")), "blob count should be removed");
         assert!(
             !c.list_all().iter().any(|x| x == a.config().id()),
             "id should be gone from list_all"
@@ -143,22 +153,22 @@ mod tests {
     #[test]
     fn shared_blob_refcount_tracked() {
         let mut c = Catalog::default();
-        let a = artifact("foo", "111", &["shared"]);
-        let b = artifact("bar", "222", &["shared"]);
+        let a = artifact("foo", "111", &[hash("shared")]);
+        let b = artifact("bar", "222", &[hash("shared")]);
         c.add(&a);
         c.add(&b);
         let probe = Layer::builder()
             .media_type(MediaType::File(Compression::None))
-            .digest("shared".to_string())
+            .digest(hash("shared"))
             .size(0usize)
             .build();
         assert_eq!(c.count(&probe), 2);
         c.del(a.config().id());
         assert_eq!(c.count(&probe), 1);
-        assert!(c.has_blob("shared"));
+        assert!(c.has_blob(&hash("shared")));
         c.del(b.config().id());
         assert_eq!(c.count(&probe), 0);
-        assert!(!c.has_blob("shared"));
+        assert!(!c.has_blob(&hash("shared")));
     }
 
     #[test]
@@ -183,13 +193,13 @@ mod tests {
         const D1: &str = "1111111111111111111111111111111111111111111111111111111111111111";
         const D2: &str = "2222222222222222222222222222222222222222222222222222222222222222";
         let mut c = Catalog::default();
-        c.add(&artifact("foo", D1, &["aaa"]));
-        c.add(&artifact("bar", D2, &["bbb", "ccc"]));
+        c.add(&artifact("foo", D1, &[hash("aaa")]));
+        c.add(&artifact("bar", D2, &[hash("bbb"), hash("ccc")]));
         let bytes = serde_json::to_vec(&c).expect("serialize");
         let back: Catalog = serde_json::from_slice(&bytes).expect("deserialize");
         assert_eq!(back.list_all().len(), 2);
-        assert!(back.has_blob("aaa"));
-        assert!(back.has_blob("bbb"));
-        assert!(back.has_blob("ccc"));
+        assert!(back.has_blob(&hash("aaa")));
+        assert!(back.has_blob(&hash("bbb")));
+        assert!(back.has_blob(&hash("ccc")));
     }
 }

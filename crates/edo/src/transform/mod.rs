@@ -9,14 +9,17 @@
 //! All fallible operations return [`TransformResult`], with failures modelled
 //! by [`TransformError`].
 
-use crate::context::{Addr, Handle, Log};
-use crate::environment::Environment;
-use crate::storage::{Artifact, Id};
 use arc_handle::arc_handle;
 use async_trait::async_trait;
 #[cfg(test)]
 use mockall::automock;
 use std::path::PathBuf;
+
+use crate::{
+    context::{Addr, Handle, Log},
+    environment::Environment,
+    storage::{Artifact, Id},
+};
 
 /// Convenience result alias for fallible transform operations.
 pub type TransformResult<T> = std::result::Result<T, error::TransformError>;

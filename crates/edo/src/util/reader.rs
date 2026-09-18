@@ -3,13 +3,12 @@ use async_compression::tokio::bufread::{
     LzmaEncoder, XzDecoder, XzEncoder, ZstdDecoder, ZstdEncoder,
 };
 use parking_lot::Mutex;
-use sha2::{Digest, Sha256};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::Poll;
 use tokio::io::{AsyncRead, BufReader};
 
-use crate::storage::Compression;
+use crate::storage::{Compression, Digest, DigestBuilder};
 
 /// An async reader wrapper that computes a SHA256 hash of all bytes read.
 ///
@@ -33,7 +32,7 @@ impl Reader {
         Self {
             inner: Arc::new(Mutex::new(Inner {
                 reader: Box::pin(reader),
-                hash: Sha256::new(),
+                hash: Digest::builder(),
                 pos: 0,
             })),
         }
@@ -56,7 +55,7 @@ impl Reader {
                     Compression::Zstd => Box::pin(ZstdEncoder::new(buffered)),
                     Compression::None => Box::pin(buffered),
                 },
-                hash: Sha256::new(),
+                hash: Digest::builder(),
                 pos: 0,
             })),
         }
@@ -79,24 +78,22 @@ impl Reader {
                     Compression::Zstd => Box::pin(ZstdDecoder::new(buffered)),
                     Compression::None => Box::pin(buffered),
                 },
-                hash: Sha256::new(),
+                hash: Digest::builder(),
                 pos: 0,
             })),
         }
     }
 
     /// Finalize the hash and return the hex-encoded SHA256 digest of all bytes read so far.
-    pub fn finish(&self) -> String {
+    pub fn finish(&self) -> Digest {
         let lock = self.inner.lock();
-        let hash = lock.hash.clone().finalize();
-
-        base16::encode_lower(hash.as_slice())
+        lock.hash.build()
     }
 }
 
 struct Inner {
     reader: Pin<Box<dyn AsyncRead + Send>>,
-    hash: Sha256,
+    hash: DigestBuilder,
     pos: usize,
 }
 

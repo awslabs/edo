@@ -52,12 +52,12 @@ use tokio::task::{JoinError, JoinHandle};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
-use crate::context::{Addr, Context, Handle, IdCache};
-use crate::storage::{Artifact, Id};
-use crate::transform::Transform;
-
-use super::node::Node;
-use super::{Result, error};
+use super::{Result, error, node::Node};
+use crate::{
+    context::{Addr, Context, Handle, IdCache},
+    storage::{Artifact, Id},
+    transform::Transform,
+};
 
 /// Lifecycle phase tag used as the `operation` field in tui task events.
 ///
@@ -1135,7 +1135,9 @@ pub(crate) mod tests {
     use super::*;
     use crate::context::{Addr, Context, LogVerbosity};
     use crate::environment::{Environment, Farm, MockEnvironmentImpl, MockFarmImpl};
-    use crate::storage::{Artifact as StorageArtifact, Config as ArtifactConfig, Id, MediaType};
+    use crate::storage::{
+        Artifact as StorageArtifact, Config as ArtifactConfig, Digest, Id, MediaType,
+    };
     use crate::transform::{MockTransformImpl, Transform, TransformStatus};
     use std::collections::HashMap;
     use std::path::Path;
@@ -1236,10 +1238,10 @@ pub(crate) mod tests {
         FailInStage,
     }
 
-    fn make_artifact(digest: &str) -> StorageArtifact {
+    fn make_artifact(digest: &Digest) -> StorageArtifact {
         let id = Id::builder()
             .name("mock".to_string())
-            .digest(digest.to_string())
+            .digest(digest.clone())
             .build();
         StorageArtifact::builder()
             .media_type(MediaType::File(crate::storage::Compression::None))
@@ -1279,7 +1281,7 @@ pub(crate) mod tests {
         }
         {
             let addr = addr.clone();
-            let digest = digest.clone();
+            let digest = Digest::builder().update(digest.clone().as_bytes()).build();
             m.expect_get_unique_id().returning(move |_ctx| {
                 Ok(Id::builder()
                     .name(addr.to_string())
@@ -1318,7 +1320,7 @@ pub(crate) mod tests {
             let max_inflight = max_inflight.clone();
             let order_log = order_log.clone();
             let addr_for_log = addr.clone();
-            let digest_for_status = digest.clone();
+            let digest_for_status = Digest::builder().update(digest.clone().as_bytes()).build();
             m.expect_transform().returning(move |_log, _ctx, _env| {
                 transform_called.fetch_add(1, AtomicOrdering::SeqCst);
                 let now = inflight.fetch_add(1, AtomicOrdering::SeqCst) + 1;
@@ -1452,7 +1454,9 @@ pub(crate) mod tests {
             .map(|s| Addr::parse(s).expect("dep addr"))
             .collect();
         let env_addr = Addr::parse("//default").unwrap();
-        let digest = format!("{:064x}", fxhash(addr_str));
+        let digest = Digest::builder()
+            .update(format!("{:064x}", fxhash(addr_str)).as_bytes())
+            .build();
         let prepare_called = Arc::new(AtomicUsize::new(0));
         let stage_called = Arc::new(AtomicUsize::new(0));
         let transform_called = Arc::new(AtomicUsize::new(0));
@@ -1525,7 +1529,9 @@ pub(crate) mod tests {
             .map(|s| Addr::parse(s).expect("dep addr"))
             .collect();
         let env_addr = Addr::parse("//default").unwrap();
-        let digest = format!("{:064x}", fxhash(addr_str));
+        let digest = Digest::builder()
+            .update(format!("{:064x}", fxhash(addr_str)).as_bytes())
+            .build();
         let prepare_called = Arc::new(AtomicUsize::new(0));
         let stage_called = Arc::new(AtomicUsize::new(0));
         let transform_called = Arc::new(AtomicUsize::new(0));
@@ -1592,7 +1598,9 @@ pub(crate) mod tests {
     ) -> MockHandles {
         let addr = Addr::parse(addr_str).unwrap();
         let env_addr = Addr::parse("//default").unwrap();
-        let digest = format!("{:064x}", fxhash(addr_str));
+        let digest = Digest::builder()
+            .update(format!("{:064x}", fxhash(addr_str)).as_bytes())
+            .build();
         let prepare_called = Arc::new(AtomicUsize::new(0));
         let stage_called = Arc::new(AtomicUsize::new(0));
         let transform_called = Arc::new(AtomicUsize::new(0));

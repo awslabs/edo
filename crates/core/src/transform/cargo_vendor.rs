@@ -15,17 +15,19 @@
 //! [`crate::register_core`](crate::register_core).
 
 use async_trait::async_trait;
+use snafu::OptionExt;
+use std::{collections::BTreeMap, path::Path};
+use std::{collections::VecDeque, path::PathBuf};
+
 use edo::{
     context::{Addr, Context, Element, FromElement, Handle, Log},
     environment::{Environment, Vfs},
     source::Source,
-    storage::{Artifact, ArtifactStageOptions, Compression, Config, Id, LayerOptions, MediaType},
+    storage::{
+        Artifact, ArtifactStageOptions, Compression, Config, Digest, Id, LayerOptions, MediaType,
+    },
     transform::{TransformError, TransformImpl, TransformResult, TransformStatus},
 };
-use sha2::{Digest, Sha256};
-use snafu::OptionExt;
-use std::{collections::BTreeMap, path::Path};
-use std::{collections::VecDeque, path::PathBuf};
 
 /// User configurable options for the CargoVendorTransform
 #[derive(serde::Deserialize, Debug, Clone)]
@@ -106,11 +108,11 @@ impl TransformImpl for CargoVendorTransform {
     /// unique ids of every input source. Changing any source (or the
     /// environment) invalidates the cached output.
     async fn get_unique_id(&self, _ctx: &Handle) -> TransformResult<Id> {
-        let mut hash = Sha256::new();
+        let mut hash = Digest::builder();
         hash.update(self.environment.to_string().as_bytes());
         for source in self.sources.values() {
             let source_id = source.get_unique_id().await?;
-            hash.update(source_id.digest().as_bytes());
+            hash.update(source_id.digest().hash());
         }
 
         // We need to hash the cargo_tomls as a change in this field
@@ -122,10 +124,9 @@ impl TransformImpl for CargoVendorTransform {
             }
         }
 
-        let digest = hash.finalize();
         let id = Id::builder()
             .name(self.addr.to_id())
-            .digest(base16::encode_lower(digest.as_slice()))
+            .digest(hash.build())
             .build();
         trace!(subsystem = "transform", component = "cargo-vendor", id = %id, "calculated id");
         Ok(id.clone())

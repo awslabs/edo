@@ -4,10 +4,10 @@
 //! identified by an [`Addr`] — a slash-separated path such as `//project/build`.
 //! The [`Addressable`] trait provides a uniform way to query the address,
 //! name, and kind of any addressable entity.
-
-use super::ContextResult as Result;
 use serde::{Deserialize, Serialize};
 use std::fmt;
+
+use super::ContextResult as Result;
 
 /// A trait for entities that can be identified by an [`Addr`].
 pub trait Addressable {

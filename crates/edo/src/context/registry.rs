@@ -6,6 +6,12 @@
 //! generic [`Handler`] trait, which is auto-implemented for any
 //! `Fn(Element, Context) -> Future<Output = ContextResult<T>>`.
 
+use dashmap::DashMap;
+use futures::future::BoxFuture;
+use snafu::OptionExt;
+use std::sync::Arc;
+
+use super::ContextResult;
 use crate::{
     context::{Context, Element, error},
     environment::Farm,
@@ -13,12 +19,6 @@ use crate::{
     storage::Backend,
     transform::Transform,
 };
-use dashmap::DashMap;
-use futures::future::BoxFuture;
-use snafu::OptionExt;
-use std::sync::Arc;
-
-use super::ContextResult;
 
 /// Type-erased async factory for a plugin component.
 ///

@@ -1,11 +1,12 @@
-use super::SourceResult;
-use crate::context::Element;
 use arc_handle::arc_handle;
 use async_trait::async_trait;
 #[cfg(test)]
 use mockall::automock;
 use semver::{Version, VersionReq};
 use std::collections::{HashMap, HashSet};
+
+use super::SourceResult;
+use crate::context::Element;
 
 /// A remote package registry that provides versioned source artifacts.
 ///

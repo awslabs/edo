@@ -6,17 +6,16 @@ use resolvo::{
     UnsolvableOrCancelled, VersionSetId, VersionSetUnionId,
 };
 use semver::Version;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 use tokio::runtime::Handle;
-
-use crate::context::Addr;
 
 use super::require::Dependency;
 use super::version::EdoVersion;
 use super::version::EdoVersionSet;
 use super::{SourceResult as Result, Vendor, error};
-use std::collections::{HashMap, HashSet};
+use crate::context::Addr;
 
 /// Semver-based dependency resolver backed by [`resolvo`].
 ///

@@ -96,7 +96,7 @@ impl Checkout {
                     let filename = match artifact.config().path_hint_for(layer.digest()) {
                         Some(hint) => sanitize_path_hint(hint)
                             .ok_or_else(|| error::Error::UnsafePathHint { hint: hint.clone() })?,
-                        None => PathBuf::from(layer.digest().digest()),
+                        None => layer.digest().as_path(),
                     };
                     let dest = self.output.join(filename);
                     if let Some(parent) = dest.parent() {

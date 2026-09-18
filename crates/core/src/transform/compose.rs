@@ -1,13 +1,15 @@
 use async_trait::async_trait;
+use snafu::OptionExt;
+use std::path::Path;
+
 use edo::{
     context::{Addr, Context, Element, FromElement, Handle, Log},
     environment::Environment,
-    storage::{Artifact, ArtifactStageOptions, Compression, Config, Id, LayerOptions, MediaType},
+    storage::{
+        Artifact, ArtifactStageOptions, Compression, Config, Digest, Id, LayerOptions, MediaType,
+    },
     transform::{TransformImpl, TransformResult, TransformStatus},
 };
-use sha2::{Digest, Sha256};
-use snafu::OptionExt;
-use std::path::Path;
 
 #[derive(serde::Deserialize, Debug, Clone)]
 #[serde(deny_unknown_fields)]
@@ -53,7 +55,7 @@ impl TransformImpl for ComposeTransform {
     }
 
     async fn get_unique_id(&self, ctx: &Handle) -> TransformResult<Id> {
-        let mut hash = Sha256::new();
+        let mut hash = Digest::builder();
         let mut depend = self.depends.clone();
         depend.sort();
         for depend in depend.iter() {
@@ -63,14 +65,12 @@ impl TransformImpl for ComposeTransform {
                 addr: depend.clone(),
             })?;
             let id = t.cached_unique_id(ctx, depend).await?;
-            hash.update(id.digest().as_bytes());
+            hash.update(id.digest().hash());
         }
-        let hash_bytes = hash.finalize();
-        let digest = base16::encode_lower(hash_bytes.as_slice());
 
         let id = Id::builder()
             .name(self.addr.to_id())
-            .digest(digest)
+            .digest(hash.build())
             .maybe_arch(self.arch.clone())
             .build();
         trace!(

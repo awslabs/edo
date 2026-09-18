@@ -1,14 +1,16 @@
 use async_trait::async_trait;
-use edo::context::{Context, Element, FromElement, Log};
-use edo::record;
-use edo::source::{SourceImpl, SourceResult};
-use edo::storage::{Artifact, Compression, Config, Id, LayerOptions, MediaType, Storage};
 use merkle_hash::MerkleTree;
-use sha2::{Digest, Sha256};
 use snafu::ResultExt;
 use std::path::{PathBuf, absolute};
 use tokio::{fs::File, io::AsyncWriteExt};
 use tokio_tar::Builder;
+
+use edo::{
+    context::{Context, Element, FromElement, Log},
+    record,
+    source::{SourceImpl, SourceResult},
+    storage::{Artifact, Compression, Config, Digest, Id, LayerOptions, MediaType, Storage},
+};
 
 /// A source backed by a local filesystem path.
 #[derive(serde::Deserialize, Debug, Clone)]
@@ -49,10 +51,10 @@ impl SourceImpl for LocalSource {
         // Fold `out` into the manifest digest so `out` changes invalidate
         // the cached manifest. The blob itself is still derived purely
         // from the file content; only the *manifest* id changes.
-        let mut hasher = Sha256::new();
-        hasher.update(hash.as_slice());
-        hasher.update(&out_bytes(self.out.as_ref()));
-        let digest = base16::encode_lower(hasher.finalize().as_slice());
+        let mut digest = Digest::builder();
+        digest
+            .update(hash.as_slice())
+            .update(&out_bytes(self.out.as_ref()));
 
         let id = Id::builder()
             .name(
@@ -62,7 +64,7 @@ impl SourceImpl for LocalSource {
                     .to_string_lossy()
                     .into_owned(),
             )
-            .digest(digest)
+            .digest(digest.build())
             .build();
         trace!(subsystem = "source", component = "local", id = %id, "calculated id");
         Ok(id)
@@ -146,7 +148,7 @@ impl SourceImpl for LocalSource {
             artifact
                 .config_mut()
                 .path_hints_mut()
-                .insert(layer.digest().digest(), hint);
+                .insert(layer.digest().clone(), hint);
         }
         artifact.layers_mut().push(layer);
         // Save the artifact

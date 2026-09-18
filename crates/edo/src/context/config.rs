@@ -4,14 +4,13 @@
 //! `~/.config/edo.toml` (or a custom path). It is passed to component
 //! constructors (`FromElement::new` / `FromElementNoContext::new`) so they
 //! can read user-scoped settings keyed by component kind.
-
-use crate::context::ArcMap;
-
-use super::{ContextResult as Result, error};
 use dashmap::DashMap;
 use home::home_dir;
 use snafu::{OptionExt, ResultExt};
 use std::{collections::BTreeMap, path::Path, sync::Arc};
+
+use super::{ContextResult as Result, error};
+use crate::context::ArcMap;
 
 /// User-level configuration loaded from `~/.config/edo.toml` (or a custom path).
 #[derive(Clone, Default)]

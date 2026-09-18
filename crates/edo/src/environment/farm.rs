@@ -1,12 +1,11 @@
-use super::EnvResult;
-use super::Environment;
-use crate::context::Log;
-use crate::storage::Storage;
 use arc_handle::arc_handle;
 use async_trait::async_trait;
 #[cfg(test)]
 use mockall::automock;
 use std::path::Path;
+
+use super::{EnvResult, Environment};
+use crate::{context::Log, storage::Storage};
 
 /// An Environment farm determines how to create new build environments for a transform
 /// to run in. Implementations should implement FarmImpl

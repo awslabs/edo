@@ -2,18 +2,23 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::str::FromStr;
 
 use async_trait::async_trait;
-use edo::context::{Addr, Context, Element, FromElement};
-use edo::source::{SourceResult, VendorImpl};
-use edo::storage::Artifact;
-use ocilot::index::Index;
-use ocilot::registry::Registry;
-use ocilot::repository::Repository;
-use ocilot::uri::{Reference, RegistryUri, Uri};
 use semver::{Version, VersionReq};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use snafu::{ResultExt, ensure};
 use tokio::io::AsyncReadExt;
+
+use edo::{
+    context::{Addr, Context, Element, FromElement},
+    source::{SourceResult, VendorImpl},
+    storage::Artifact,
+};
+use ocilot::{
+    index::Index,
+    registry::Registry,
+    repository::Repository,
+    uri::{Reference, RegistryUri, Uri},
+};
 
 #[derive(serde::Deserialize, Debug, Clone)]
 #[serde(deny_unknown_fields)]

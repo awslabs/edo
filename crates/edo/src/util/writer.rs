@@ -1,10 +1,9 @@
-use crate::storage::Compression;
+use crate::storage::{Compression, Digest};
 use async_compression::tokio::write::{
     BzDecoder, BzEncoder, GzipDecoder, GzipEncoder, Lz4Decoder, Lz4Encoder, LzmaDecoder,
     LzmaEncoder, XzDecoder, XzEncoder, ZstdDecoder, ZstdEncoder,
 };
 use parking_lot::Mutex;
-use sha2::{Digest, Sha256};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::Poll;
@@ -25,7 +24,7 @@ impl Writer {
         Self {
             inner: Arc::new(Mutex::new(Inner {
                 writer: Box::pin(writer),
-                hash: Sha256::new(),
+                hash: Digest::builder(),
                 digest: None,
                 size: 0,
                 target,
@@ -50,7 +49,7 @@ impl Writer {
                     Compression::Zstd => Box::pin(ZstdEncoder::new(writer)),
                     Compression::None => Box::pin(writer),
                 },
-                hash: Sha256::new(),
+                hash: Digest::builder(),
                 digest: None,
                 size: 0,
                 target,
@@ -75,7 +74,7 @@ impl Writer {
                     Compression::Zstd => Box::pin(ZstdDecoder::new(writer)),
                     Compression::None => Box::pin(writer),
                 },
-                hash: Sha256::new(),
+                hash: Digest::builder(),
                 digest: None,
                 size: 0,
                 target,
@@ -102,18 +101,15 @@ impl Writer {
     ///
     /// If a digest was set manually via [`Writer::set_digest`], that value is
     /// returned instead.
-    pub async fn finish(&self) -> String {
+    pub async fn finish(&self) -> Digest {
         let lock = self.inner.lock();
-        let hash = lock.hash.clone().finalize();
-        let digest = base16::encode_lower(hash.as_slice());
-
-        lock.digest.clone().unwrap_or(digest)
+        lock.hash.build()
     }
 }
 
 struct Inner {
     writer: Pin<Box<dyn AsyncWrite + Send + Sync>>,
-    hash: Sha256,
+    hash: crate::storage::DigestBuilder,
     digest: Option<String>,
     size: usize,
     target: String,

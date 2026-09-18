@@ -1,10 +1,11 @@
-use super::error;
 use bon::Builder;
 use regex::Regex;
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use snafu::{OptionExt, ResultExt};
 use std::{fmt, str::FromStr, sync::LazyLock};
+
+use super::{digest::Digest, error};
 
 const UNSUPPORTED_CHARS: &[char] = &['@', ':', '.', '-', '/'];
 const UNSUPPORTED_PREFIX: &[&str] = &["http://", "https://"];
@@ -80,14 +81,12 @@ impl fmt::Display for Name {
 /// version, an optional architecture tag, and a SHA256 content digest.
 /// Serializes to the format `<name>[.arch][@<version>]:<digest>`.
 #[derive(Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Debug, Builder)]
+#[builder(on(_, into))]
 pub struct Id {
-    #[builder(into)]
     name: Name,
-    #[builder(into)]
     version: Option<Version>,
-    #[builder(into)]
     arch: Option<String>,
-    digest: String,
+    digest: Digest,
 }
 
 impl Id {
@@ -97,7 +96,7 @@ impl Id {
     }
 
     /// Return a reference to the SHA256 hex digest.
-    pub fn digest(&self) -> &String {
+    pub fn digest(&self) -> &Digest {
         &self.digest
     }
 
@@ -112,8 +111,8 @@ impl Id {
     }
 
     /// Replace the digest with a new value.
-    pub fn set_digest(&mut self, digest: &str) {
-        self.digest = digest.to_string();
+    pub fn set_digest(&mut self, digest: Digest) {
+        self.digest = digest.clone();
     }
 
     /// Set the semver version.
@@ -167,7 +166,7 @@ impl FromStr for Id {
             name: name.into(),
             version,
             arch,
-            digest: digest.to_string(),
+            digest: digest.try_into()?,
         })
     }
 }
@@ -184,7 +183,7 @@ impl fmt::Display for Id {
             f.write_str(version.to_string().as_str())?;
         }
         f.write_str(":")?;
-        f.write_str(self.digest())
+        f.write_str(&self.digest().to_string())
     }
 }
 

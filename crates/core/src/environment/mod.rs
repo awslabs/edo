@@ -3,14 +3,14 @@ pub mod container;
 /// Local environment implementation.
 pub mod local;
 
-pub use container::{Container, ContainerConfig, ContainerFarm};
-pub use local::{LocalEnv, LocalFarm};
-
-use edo::util::Reader;
 use futures::AsyncReadExt as FuturesAsyncReadExt;
 use snafu::{ResultExt, Snafu};
 use std::path::{Component, Path, PathBuf};
 use tokio::io::{AsyncWriteExt, BufReader};
+
+pub use container::{Container, ContainerConfig, ContainerFarm};
+use edo::util::Reader;
+pub use local::{LocalEnv, LocalFarm};
 
 /// Errors produced while extracting a zip archive into an environment.
 #[derive(Debug, Snafu)]

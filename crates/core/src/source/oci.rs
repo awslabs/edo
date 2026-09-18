@@ -1,15 +1,15 @@
 use async_trait::async_trait;
-use edo::record;
-use ocilot::progress::SharedProgress;
-use ocilot::{index::Index, models::Platform, uri::Uri};
-use sha2::{Digest, Sha256};
 use snafu::ResultExt;
 use snafu::ensure;
 use std::collections::BTreeSet;
 
-use edo::context::{Context, Element, FromElement, Log};
-use edo::source::{SourceImpl, SourceResult};
-use edo::storage::{Artifact, Compression, Config, Id, LayerOptions, MediaType, Storage};
+use edo::{
+    context::{Context, Element, FromElement, Log},
+    record,
+    source::{SourceImpl, SourceResult},
+    storage::{Artifact, Compression, Config, Digest, Id, LayerOptions, MediaType, Storage},
+};
+use ocilot::{index::Index, models::Platform, progress::SharedProgress, uri::Uri};
 
 /// A OCI Image source is used to fetch
 /// an oci image to use as a container image
@@ -18,7 +18,7 @@ use edo::storage::{Artifact, Compression, Config, Id, LayerOptions, MediaType, S
 pub struct ImageSource {
     uri: String,
     #[serde(rename = "ref")]
-    digest: String,
+    digest: Digest,
     platform: Option<Platform>,
 }
 
@@ -53,12 +53,11 @@ impl SourceImpl for ImageSource {
         // and then handle staging as a filesystem ourself
         let index = Index::fetch(&uri).await.context(error::OciSnafu)?;
         // The actual digest that should be used, should be a merkle digest of the manifests
-        let mut hasher = Sha256::new();
+        let mut digest = Digest::with_algorithm(self.digest.algorithm());
         for manifest in index.manifests().iter() {
-            hasher.update(manifest.digest().as_bytes());
+            digest.update(manifest.digest().as_bytes());
         }
-        let hash_bytes = hasher.finalize();
-        let digest = base16::encode_lower(hash_bytes.as_slice());
+        let digest = digest.build();
         ensure!(
             *id.digest() == digest,
             error::DigestSnafu {
@@ -117,6 +116,7 @@ pub mod error {
     use edo::{
         context::{Addr, error::ContextError},
         source::SourceError,
+        storage::Digest,
     };
 
     #[derive(Snafu, Debug)]
@@ -128,7 +128,7 @@ pub mod error {
             source: Box<edo::context::ContextError>,
         },
         #[snafu(display("image has digest '{actual}' when expecting '{expected}"))]
-        Digest { actual: String, expected: String },
+        Digest { actual: Digest, expected: Digest },
         #[snafu(display("image source oci error: {source}"))]
         Oci { source: ocilot::error::Error },
         #[snafu(display("invalid image source at {addr}: {source}"))]

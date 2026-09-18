@@ -1,6 +1,6 @@
-use super::error;
 use semver::VersionReq;
 
+use super::error;
 use crate::context::{Addr, Context, Requirement};
 
 /// A resolved dependency requirement parsed from an `edo.toml`

@@ -3,7 +3,6 @@ use std::fs::OpenOptions as StdOpenOptions;
 use std::path::{Path, PathBuf};
 
 use crate::context::{Config, Element, FromElementNoContext};
-use crate::storage::{Artifact, BackendImpl, Id, Layer, LayerOptions, StorageResult};
 use crate::util::{Reader, Writer};
 use async_trait::async_trait;
 use rustix::fs::{FlockOperation, flock};
@@ -13,7 +12,14 @@ use tokio::fs::{File, OpenOptions};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
-use super::catalog::Catalog;
+use super::{
+    artifact::{Artifact, Layer, LayerOptions},
+    backend::BackendImpl,
+    catalog::Catalog,
+    digest::Digest,
+    error::StorageResult,
+    id::Id,
+};
 
 /// Local filesystem storage backend.
 ///
@@ -255,13 +261,13 @@ impl BackendImpl for LocalBackend {
         let _lock = Self::lock_catalog(&guard.lock_path).await?;
         guard.catalog = Self::load_at(&guard.path).await?;
         for layer in artifact.layers() {
-            let blob_path = self.layer_dir.join(layer.digest().digest());
+            let blob_path = self.layer_dir.join(layer.digest().as_path());
             ensure!(
                 tokio::fs::try_exists(&blob_path)
                     .await
                     .context(error::ReadSnafu)?,
                 error::LayerMissingSnafu {
-                    digest: layer.digest().digest()
+                    digest: layer.digest().clone()
                 }
             );
         }
@@ -300,8 +306,8 @@ impl BackendImpl for LocalBackend {
             if guard.catalog.count(layer) > 0 {
                 continue;
             }
-            let digest = layer.digest().digest();
-            let blob_path = self.layer_dir.join(&digest);
+            let digest = layer.digest();
+            let blob_path = self.layer_dir.join(digest.as_path());
             if tokio::fs::try_exists(&blob_path)
                 .await
                 .context(error::RemoveSnafu)?
@@ -410,8 +416,8 @@ impl BackendImpl for LocalBackend {
 
     async fn read(&self, layer: &Layer) -> StorageResult<Reader> {
         // A Read is a pretty simple operation, we just want to load the correct blob file
-        let blob_digest = layer.digest().digest();
-        let blob_file = self.layer_dir.join(blob_digest);
+        let blob_digest = layer.digest();
+        let blob_file = self.layer_dir.join(blob_digest.as_path());
         Ok(Reader::new(
             File::open(&blob_file).await.context(error::ReadSnafu)?,
         ))
@@ -438,7 +444,7 @@ impl BackendImpl for LocalBackend {
         let tmp_path = self.layer_dir.join(writer.target());
         // Now we want to calculate the digest
         let digest = writer.finish().await;
-        let target_path = self.layer_dir.join(digest.clone());
+        let target_path = self.layer_dir.join(digest.as_path());
         let layer = options.create(digest, writer.size());
 
         // Copy the layer to the appropriate place
@@ -453,7 +459,7 @@ impl BackendImpl for LocalBackend {
         Ok(layer)
     }
 
-    async fn has_blob(&self, digest: &str) -> StorageResult<bool> {
+    async fn has_blob(&self, digest: &Digest) -> StorageResult<bool> {
         // Treat the catalog as a hint, not an authority: confirm the
         // file actually exists on disk before reporting `true`. This
         // closes the gap where the catalog and filesystem disagree
@@ -463,14 +469,14 @@ impl BackendImpl for LocalBackend {
         if !self.catalog.read().await.catalog.has_blob(digest) {
             return Ok(false);
         }
-        let path = self.layer_dir.join(digest);
+        let path = self.layer_dir.join(digest.as_path());
         Ok(tokio::fs::try_exists(&path)
             .await
             .context(error::ReadSnafu)?)
     }
 
-    async fn blob_size(&self, digest: &str) -> StorageResult<Option<u64>> {
-        let path = self.layer_dir.join(digest);
+    async fn blob_size(&self, digest: &Digest) -> StorageResult<Option<u64>> {
+        let path = self.layer_dir.join(digest.as_path());
         match tokio::fs::metadata(&path).await {
             Ok(meta) => Ok(Some(meta.len())),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -482,7 +488,10 @@ impl BackendImpl for LocalBackend {
 pub(crate) mod error {
     use snafu::Snafu;
 
-    use crate::{context::Addr, storage::StorageError};
+    use crate::{
+        context::Addr,
+        storage::{Digest, StorageError},
+    };
 
     #[derive(Snafu, Debug)]
     #[snafu(visibility(pub(crate)))]
@@ -499,7 +508,7 @@ pub(crate) mod error {
         #[snafu(display("failed to create temporary file for new layer: {source}"))]
         Create { source: std::io::Error },
         #[snafu(display("cannot save an artifact that is missing a layer with digest '{digest}'"))]
-        LayerMissing { digest: String },
+        LayerMissing { digest: Digest },
         #[snafu(display("failed to create new local storage backend: {source}"))]
         New { source: std::io::Error },
         #[snafu(display("storage backend does not contain an artifact with id: {id}"))]
@@ -534,7 +543,7 @@ pub(crate) mod error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{Config as ArtifactConfig, MediaType};
+    use crate::storage::{Config as ArtifactConfig, Digest, MediaType};
     use tempfile::TempDir;
 
     async fn setup() -> (TempDir, LocalBackend) {
@@ -543,10 +552,16 @@ mod tests {
         (dir, backend)
     }
 
+    fn hash(text: &str) -> Digest {
+        let mut h = Digest::builder();
+        h.update(text.as_bytes());
+        h.build()
+    }
+
     fn artifact(name: &str, digest: &str) -> Artifact {
         let id = Id::builder()
             .name(name.to_string())
-            .digest(digest.to_string())
+            .digest(hash(digest))
             .build();
         Artifact::builder()
             .media_type(MediaType::Manifest)

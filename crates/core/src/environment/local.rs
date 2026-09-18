@@ -1,16 +1,18 @@
 use async_trait::async_trait;
 use dashmap::DashMap;
-use edo::context::{Context, Element, FromElement, Log};
-use edo::environment::{EnvResult, Environment, EnvironmentImpl, FarmImpl};
-use edo::record;
-use edo::storage::{Id, MediaType, Storage};
-use edo::util::{Reader, Writer, cmd_noinput, cmd_noredirect, from_dash};
 use snafu::{ResultExt, ensure};
 use std::path::absolute;
 use std::path::{Path, PathBuf};
 use tokio::fs::File;
 use tokio::fs::create_dir_all;
-use tracing::Instrument;
+
+use edo::{
+    context::{Context, Element, FromElement, Log},
+    environment::{EnvResult, Environment, EnvironmentImpl, FarmImpl},
+    record,
+    storage::{Id, MediaType, Storage},
+    util::{Reader, Writer, cmd_noinput, cmd_noredirect, from_dash},
+};
 
 /// A farm that creates local (host-native) build environments.
 #[derive(Default)]
@@ -304,7 +306,7 @@ impl EnvironmentImpl for LocalEnv {
         Ok(())
     }
 
-    async fn execute(&self, log: &Log, id: &Id, path: &Path, cmd: &str) -> EnvResult<bool> {
+    async fn execute(&self, log: &Log, _id: &Id, path: &Path, cmd: &str) -> EnvResult<bool> {
         let work_dir = self.path.join(path);
         trace!(
             subsystem = "environment",

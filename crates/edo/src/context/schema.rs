@@ -11,11 +11,11 @@
 //! the three TOML shapes accepted for an element's `source` field:
 //! a single address, a list of addresses, or a map from scope to address
 //! list.
-
-use crate::context::{Addr, ContextResult, Element};
 use semver::VersionReq;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+
+use crate::context::{Addr, ContextResult, Element};
 
 /// A single `[requires.<addr>]` entry: a kind plus a semver constraint.
 #[derive(Serialize, Deserialize, Debug, Clone)]

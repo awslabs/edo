@@ -13,9 +13,8 @@
 //! [`Vfs::entry`] to obtain a child [`Vfs`] rooted at a nested path without
 //! mutating the original.
 
-use std::path::{Path, PathBuf};
-
 use snafu::ResultExt;
+use std::path::{Path, PathBuf};
 
 use crate::{
     context::Log,

@@ -13,7 +13,9 @@ async-compression  = { workspace = true }
 async-recursion    = { workspace = true }
 async-trait        = { workspace = true }
 base16             = { workspace = true }
+base64             = { workspace = true }
 bimap              = { workspace = true }
+blake3             = { workspace = true }
 bon                = { workspace = true }
 daggy              = { workspace = true }
 dashmap            = { workspace = true }
@@ -27,6 +29,7 @@ indexmap           = { workspace = true }
 indicatif          = { workspace = true }
 jiff               = { workspace = true }
 names              = { workspace = true }
+nutype             = { workspace = true }
 ocilot             = { workspace = true }
 os_pipe            = { workspace = true }
 owo-colors         = { workspace = true }
