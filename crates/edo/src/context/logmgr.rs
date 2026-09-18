@@ -54,6 +54,11 @@
 //! [`TaskLayer`] uses to route it to a progress bar instead of a
 //! printed line.
 
+use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
+use jiff::ZonedDateTime;
+use owo_colors::{OwoColorize, Stream};
+use parking_lot::{Mutex, MutexGuard};
+use snafu::ResultExt;
 use std::{
     collections::{HashMap, hash_map::Entry},
     convert::Infallible,
@@ -66,12 +71,6 @@ use std::{
     },
     time::{Duration, Instant},
 };
-
-use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
-use jiff::ZonedDateTime;
-use owo_colors::{OwoColorize, Stream};
-use parking_lot::{Mutex, MutexGuard};
-use snafu::ResultExt;
 use tokio::{
     fs::{create_dir_all, remove_dir_all},
     sync::OnceCell,

@@ -6,18 +6,14 @@
 //! (writing/reading `edo.lock.json` along the way), and finally registers
 //! the resulting caches, environments, sources, and transforms with the
 //! [`Context`].
-
-use super::Context;
-use super::address::Addr;
-use super::lock::Lock;
-use super::{ContextResult as Result, error};
-use crate::context::schema::Schema;
-use crate::source::{Dependency, Resolver};
 use sha2::{Digest, Sha256};
 use snafu::{OptionExt, ResultExt};
 use std::collections::HashMap;
 use std::fs::{File, read_dir};
 use std::path::{Path, PathBuf};
+
+use super::{Context, ContextResult as Result, address::Addr, error, lock::Lock, schema::Schema};
+use crate::source::{Dependency, Resolver};
 
 /// Intermediate representation of a loaded edo project.
 ///

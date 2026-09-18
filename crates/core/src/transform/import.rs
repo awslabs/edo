@@ -1,15 +1,17 @@
 use async_trait::async_trait;
-use edo::context::{Addr, Context, Element, FromElement, Handle, Log};
-use edo::environment::Environment;
-use edo::source::Source;
-use edo::storage::{
-    Artifact, ArtifactStageOptions, Compression, Config, Id, LayerOptions, MediaType,
-};
-use edo::transform::{TransformImpl, TransformResult, TransformStatus};
 use indexmap::IndexMap;
-use sha2::{Digest, Sha256};
 use snafu::OptionExt;
 use std::path::Path;
+
+use edo::{
+    context::{Addr, Context, Element, FromElement, Handle, Log},
+    environment::Environment,
+    source::Source,
+    storage::{
+        Artifact, ArtifactStageOptions, Compression, Config, Digest, Id, LayerOptions, MediaType,
+    },
+    transform::{TransformImpl, TransformResult, TransformStatus},
+};
 
 /// A transform that imports sources directly into the build environment as an artifact.
 ///
@@ -56,14 +58,12 @@ impl TransformImpl for ImportTransform {
     }
 
     async fn get_unique_id(&self, ctx: &Handle) -> TransformResult<Id> {
-        let mut hash = Sha256::new();
+        let mut hash = Digest::builder();
         for source_list in self.sources.values() {
             for source in source_list {
-                hash.update(source.cached_unique_id(ctx).await?.digest().as_bytes());
+                hash.update(source.cached_unique_id(ctx).await?.digest().hash());
             }
         }
-        let hash_bytes = hash.finalize();
-        let digest = base16::encode_lower(hash_bytes.as_slice());
         let id = Id::builder()
             .name(
                 self.addr
@@ -72,7 +72,7 @@ impl TransformImpl for ImportTransform {
                     .unwrap()
                     .to_string(),
             )
-            .digest(digest)
+            .digest(hash.build())
             .build();
         trace!(subsystem = "transform", component = "import", id = %id, "calculated id");
         Ok(id)

@@ -9,10 +9,6 @@
 //! All fallible operations return [`SourceResult`], with failures modelled by
 //! [`SourceError`].
 
-use crate::context::{Handle, Log};
-use crate::environment::Environment;
-use crate::storage::{Artifact, Id, Storage};
-use crate::util::Reader;
 use arc_handle::arc_handle;
 use async_trait::async_trait;
 use dashmap::DashMap;
@@ -23,6 +19,13 @@ use mockall::automock;
 use snafu::ensure;
 use std::path::Path;
 use std::sync::{Arc, LazyLock, Weak};
+
+use crate::{
+    context::{Handle, Log},
+    environment::Environment,
+    storage::{Artifact, Id, Storage},
+    util::Reader,
+};
 
 mod error;
 mod require;
@@ -170,7 +173,7 @@ mod tests {
     use super::*;
     use crate::context::logmgr::test_support::shared_log_manager;
     use crate::context::{Addr, Config, Element, FromElementNoContext, Log};
-    use crate::storage::{Backend, LocalBackend, Storage};
+    use crate::storage::{Backend, Digest, LocalBackend, Storage};
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
@@ -249,9 +252,10 @@ mod tests {
         let logmgr = shared_log_manager().await;
         let log = logmgr.create("singleflight-test").await.expect("log");
 
+        let digest = Digest::builder().update("0".repeat(64).as_bytes()).build();
         let id = Id::builder()
             .name("singleflight_test")
-            .digest("0".repeat(64))
+            .digest(digest)
             .build();
         let calls = Arc::new(AtomicUsize::new(0));
         let gate = Arc::new(tokio::sync::Notify::new());
@@ -312,7 +316,7 @@ mod tests {
             .unwrap();
         let id = Id::builder()
             .name("singleflight_error")
-            .digest("1".repeat(64))
+            .digest(Digest::builder().update("1".repeat(64).as_bytes()).build())
             .build();
         let calls = Arc::new(AtomicUsize::new(0));
         let gate = Arc::new(tokio::sync::Notify::new());
@@ -364,7 +368,7 @@ mod tests {
             .unwrap();
         let id = Id::builder()
             .name("singleflight_cancel")
-            .digest("2".repeat(64))
+            .digest(Digest::builder().update("2".repeat(64).as_bytes()).build())
             .build();
         let source = Source::new(CountingSource {
             id: id.clone(),
@@ -393,7 +397,7 @@ mod tests {
             .unwrap();
         let id = Id::builder()
             .name("singleflight_remote")
-            .digest("3".repeat(64))
+            .digest(Digest::builder().update("3".repeat(64).as_bytes()).build())
             .build();
         let calls = Arc::new(AtomicUsize::new(0));
         let source = Source::new(CountingSource {

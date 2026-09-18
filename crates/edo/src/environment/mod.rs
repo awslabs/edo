@@ -9,17 +9,17 @@
 //! All fallible operations return [`EnvResult`], with failures modelled by
 //! [`EnvironmentError`] in [`error`].
 
-use super::storage::Id;
-use super::storage::Storage;
-use crate::context::Handle;
-use crate::context::Log;
-use crate::storage::{ArtifactStageOptions, MediaType};
-use crate::util::{Reader, Writer};
 use arc_handle::arc_handle;
 use async_trait::async_trait;
 #[cfg(test)]
 use mockall::automock;
 use std::path::{Component, Path, PathBuf};
+
+use crate::{
+    context::{Handle, Log},
+    storage::{ArtifactStageOptions, Id, MediaType, Storage},
+    util::{Reader, Writer},
+};
 
 /// Archive suffixes recognized by [`resolved_stage_subpath`], ordered
 /// longest-first so compound suffixes like `.tar.gz` win over their base
@@ -194,7 +194,7 @@ impl Environment {
                 // we do this by seeing if a filename has been set
                 let mut filepath = options.path().to_path_buf();
                 if !options.ignore_artifact_path() {
-                    let filename = safe_hint.unwrap_or(PathBuf::from(layer.digest().digest()));
+                    let filename = safe_hint.unwrap_or(layer.digest().as_path());
                     filepath = filepath.join(filename);
                 }
 

@@ -50,4 +50,19 @@ pub enum StorageError {
     /// A semver version string could not be parsed.
     #[snafu(display("invalid semantic version: {source}"))]
     Semver { source: semver::Error },
+    /// No algorithm defined in the digest
+    #[snafu(display("digest references require its hash algorithm as a prefix: algorithm:hash"))]
+    DigestNoAlgorithm,
+    #[snafu(display("invalid base16 encoded string: {source}"))]
+    InvalidBase16 { source: base16::DecodeError },
+    #[snafu(display("invalid base64 encoded string: {source}"))]
+    InvalidBase64 { source: base64::DecodeError },
+    #[snafu(display("failed to translate to oci digest: {source}"))]
+    OCITranslate { source: ocilot::error::Error },
+    /// Unsupported hashing algorithm
+    #[snafu(display("unsupported digest algorithm: {algo}"))]
+    UnsupportedAlgorithm { algo: String },
+    /// Unknown encoding
+    #[snafu(display("could not detect base encoding of {input}"))]
+    UnknownEncoding { input: String },
 }

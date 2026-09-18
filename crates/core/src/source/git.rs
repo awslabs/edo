@@ -1,14 +1,16 @@
 use async_trait::async_trait;
-use edo::context::{Context, Element, FromElement, Log};
-use edo::record;
-use edo::source::{SourceImpl, SourceResult};
-use edo::storage::{Artifact, Compression, Config, Id, LayerOptions, MediaType, Storage};
-use edo::util::cmd_noinput;
-use sha2::{Digest, Sha256};
 use snafu::{ResultExt, ensure};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use tempfile::tempdir;
+
+use edo::{
+    context::{Context, Element, FromElement, Log},
+    record,
+    source::{SourceImpl, SourceResult},
+    storage::{Artifact, Compression, Config, Digest, Id, LayerOptions, MediaType, Storage},
+    util::cmd_noinput,
+};
 
 /// A source that clones a Git repository at a specific reference.
 #[derive(serde::Deserialize, Debug, Clone)]
@@ -33,17 +35,16 @@ impl FromElement for GitSource {
 impl SourceImpl for GitSource {
     async fn get_unique_id(&self) -> SourceResult<Id> {
         // Separate staging variants for prefix-based cache eviction.
-        let mut hasher = Sha256::new();
-        hasher.update(self.reference.as_bytes());
+        let mut digest = Digest::builder();
+        digest.update(self.reference.as_bytes());
         if let Some(out) = &self.out {
-            hasher.update(out.as_os_str().as_encoded_bytes());
+            digest.update(out.as_os_str().as_encoded_bytes());
         }
-        let digest = base16::encode_lower(hasher.finalize().as_slice());
         let name = match &self.out {
             Some(out) => format!("{}@{}-{}", self.url, self.reference, out.to_string_lossy()),
             None => format!("{}@{}", self.url, self.reference),
         };
-        let id = Id::builder().name(name).digest(digest).build();
+        let id = Id::builder().name(name).digest(digest.build()).build();
         trace!(subsystem = "source", component = "git", id = %id, "calculated id");
         Ok(id)
     }
@@ -106,7 +107,7 @@ impl SourceImpl for GitSource {
             artifact
                 .config_mut()
                 .path_hints_mut()
-                .insert(layer.digest().digest(), hint);
+                .insert(layer.digest().clone(), hint);
         }
         artifact.layers_mut().push(layer);
         storage.safe_save(&artifact).await?;
@@ -131,7 +132,7 @@ mod tests {
         let id = source(None).get_unique_id().await.unwrap();
         let expected = Id::builder()
             .name("https://example.com/repo@main")
-            .digest(base16::encode_lower(Sha256::digest(b"main").as_slice()))
+            .digest(Digest::builder().update(b"main").build())
             .build();
         assert_eq!(id, expected);
     }

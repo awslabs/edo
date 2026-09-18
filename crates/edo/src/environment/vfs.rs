@@ -659,7 +659,7 @@ mod tests {
         let log = Log::new(&shared_log_manager().await, dir.path().join("vfs.log")).unwrap();
         let id = Id::builder()
             .name("vfs-test".to_string())
-            .digest("0".to_string())
+            .digest(crate::storage::Digest::builder().update(b"0").build())
             .build();
         Vfs::new(&id, &shell_env(&root), &log).await.unwrap()
     }

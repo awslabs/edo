@@ -1,20 +1,21 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use edo::context::{Addr, Context, Element, FromElement, Handle, Log};
-use edo::environment::{Environment, Vfs};
-use edo::source::Source;
-use edo::storage::{
-    Artifact, ArtifactStageOptions, Compression, Config, Id, LayerOptions, MediaType,
-};
-use edo::transform::{TransformError, TransformImpl, TransformResult, TransformStatus};
-
 use async_trait::async_trait;
 use handlebars::Handlebars;
 use indexmap::IndexMap;
 use ocilot::models::Platform;
-use sha2::{Digest, Sha256};
 use snafu::ResultExt;
+
+use edo::{
+    context::{Addr, Context, Element, FromElement, Handle, Log},
+    environment::{Environment, Vfs},
+    source::Source,
+    storage::{
+        Artifact, ArtifactStageOptions, Compression, Config, Digest, Id, LayerOptions, MediaType,
+    },
+    transform::{TransformError, TransformImpl, TransformResult, TransformStatus},
+};
 
 #[derive(serde::Deserialize, Debug, Clone)]
 #[serde(deny_unknown_fields)]
@@ -88,26 +89,24 @@ impl TransformImpl for ScriptTransform {
     async fn get_unique_id(&self, ctx: &Handle) -> TransformResult<Id> {
         // Digest will be a merkle hash of:
         // all sources digest + script contents
-        let mut hash = Sha256::new();
+        let mut hash = Digest::builder();
         let mut depends = self.options.depends.clone();
         depends.sort();
         for depend in depends.iter() {
             let id = ctx.unique_id_of(depend).await?;
-            hash.update(id.digest().as_bytes());
+            hash.update(id.digest().hash());
         }
         for source_list in self.sources.values() {
             for source in source_list {
                 let source_id = source.cached_unique_id(ctx).await?;
-                hash.update(source_id.digest().as_bytes());
+                hash.update(source_id.digest().hash());
             }
         }
         let script = self.options.commands.join("\n");
         hash.update(script.as_bytes());
-        let hash_bytes = hash.finalize();
-        let digest = base16::encode_lower(hash_bytes.as_slice());
         let id = Id::builder()
             .name(self.addr.to_id())
-            .digest(digest)
+            .digest(hash.build())
             .maybe_arch(self.options.arch.clone())
             .build();
         trace!(subsystem = "transform", component = "script", id = %id, "calculated id");

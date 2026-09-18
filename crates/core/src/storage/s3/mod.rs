@@ -5,11 +5,6 @@ use aws_sdk_s3::{
     primitives::ByteStream,
     types::{CompletedMultipartUpload, CompletedPart},
 };
-use edo::{
-    context::{Config, Element, FromElementNoContext},
-    storage::{Artifact, BackendImpl, Id, Layer, LayerOptions, StorageResult},
-    util::{Reader, Writer},
-};
 use snafu::{IntoError, OptionExt, ResultExt};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -18,7 +13,11 @@ use std::time::Duration;
 use tokio::{fs::OpenOptions, io::AsyncReadExt};
 use uuid::Uuid;
 
-use edo::storage::Catalog;
+use edo::{
+    context::{Config, Element, FromElementNoContext},
+    storage::{Artifact, BackendImpl, Catalog, Digest, Id, Layer, LayerOptions, StorageResult},
+    util::{Reader, Writer},
+};
 
 mod error;
 mod reader;
@@ -253,8 +252,8 @@ impl BackendImpl for S3Backend {
         catalog.del(id);
         self.flush(&catalog).await?;
         for layer in artifact.layers() {
-            let digest = layer.digest().digest();
-            let key = self.blob_key().join(digest);
+            let digest = layer.digest();
+            let key = self.blob_key().join(digest.as_path());
             if catalog.count(layer) <= 0 {
                 self.client
                     .delete_object()
@@ -313,8 +312,8 @@ impl BackendImpl for S3Backend {
 
     async fn read(&self, layer: &Layer) -> StorageResult<Reader> {
         // A Read is a pretty simple operation, we just want to load the correct blob file
-        let blob_digest = layer.digest().digest();
-        let blob_file = self.blob_key().join(blob_digest);
+        let blob_digest = layer.digest();
+        let blob_file = self.blob_key().join(blob_digest.as_path());
         Ok(Reader::new(
             reader::ObjectReader::new(
                 self.client.clone(),
@@ -348,7 +347,7 @@ impl BackendImpl for S3Backend {
         let tmp_path = std::env::temp_dir().join(writer.target());
         // Now we want to calculate the digest
         let digest = writer.finish().await;
-        let target_path = self.blob_key().join(digest.clone());
+        let target_path = self.blob_key().join(digest.as_path());
         let layer = options.create(digest, writer.size());
 
         let mut file = tokio::fs::File::open(&tmp_path)
@@ -434,7 +433,7 @@ impl BackendImpl for S3Backend {
         Ok(layer)
     }
 
-    async fn has_blob(&self, digest: &str) -> StorageResult<bool> {
+    async fn has_blob(&self, digest: &Digest) -> StorageResult<bool> {
         // The catalog is the source of truth for what this backend has
         // committed. Mirrors `has` for ids — we deliberately avoid a
         // round-trip HEAD on the blob key because S3 list-after-write is
@@ -444,8 +443,8 @@ impl BackendImpl for S3Backend {
         Ok(catalog.has_blob(digest))
     }
 
-    async fn blob_size(&self, digest: &str) -> StorageResult<Option<u64>> {
-        let key = self.blob_key().join(digest);
+    async fn blob_size(&self, digest: &Digest) -> StorageResult<Option<u64>> {
+        let key = self.blob_key().join(digest.as_path());
         let key_str = key.to_str().unwrap().to_string();
         match self
             .client

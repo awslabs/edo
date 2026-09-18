@@ -1,5 +1,13 @@
 //! Read-only build context snapshots for transforms.
 
+use dashmap::DashMap;
+use snafu::OptionExt;
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::Arc;
+use tokio::sync::OnceCell;
+use tokio_util::sync::CancellationToken;
+
 use super::{Addr, ContextResult, Log, LogManager, error};
 use crate::{
     context::Config,
@@ -8,13 +16,6 @@ use crate::{
     storage::{Id, Storage},
     transform::{Transform, TransformResult},
 };
-use dashmap::DashMap;
-use snafu::OptionExt;
-use std::collections::HashMap;
-use std::path::Path;
-use std::sync::Arc;
-use tokio::sync::OnceCell;
-use tokio_util::sync::CancellationToken;
 
 type SourceIdEntry = (Source, Arc<OnceCell<Id>>);
 
@@ -178,7 +179,7 @@ mod tests {
     use crate::context::{Addr, Config, Element, FromElementNoContext, error::ContextError};
     use crate::source::{MockSourceImpl, Source, SourceError};
     use crate::storage::{
-        Artifact, Backend, Config as ArtifactConfig, Id, LocalBackend, MediaType, Storage,
+        Artifact, Backend, Config as ArtifactConfig, Digest, Id, LocalBackend, MediaType, Storage,
     };
     use std::collections::{BTreeMap, HashMap};
     use tempfile::TempDir;
@@ -246,7 +247,7 @@ mod tests {
                 let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Ok(Id::builder()
                     .name("source")
-                    .digest(format!("{n:064x}"))
+                    .digest(Digest::builder().update(n.to_le_bytes()).build())
                     .build())
             }
         });
@@ -280,7 +281,10 @@ mod tests {
             tokio_util::sync::CancellationToken::new(),
         )
         .with_id_cache(IdCache::new());
-        let id = Id::builder().name("source").digest("a".repeat(64)).build();
+        let id = Id::builder()
+            .name("source")
+            .digest(Digest::builder().update(b"a").build())
+            .build();
         let artifact = Artifact::builder()
             .media_type(MediaType::Manifest)
             .config(ArtifactConfig::builder().id(id.clone()).build())
@@ -322,8 +326,14 @@ mod tests {
             tokio_util::sync::CancellationToken::new(),
         )
         .with_id_cache(IdCache::new());
-        let memoized = Id::builder().name("source").digest("a".repeat(64)).build();
-        let changed = Id::builder().name("source").digest("b".repeat(64)).build();
+        let memoized = Id::builder()
+            .name("source")
+            .digest(Digest::builder().update(b"a").build())
+            .build();
+        let changed = Id::builder()
+            .name("source")
+            .digest(Digest::builder().update(b"b").build())
+            .build();
         let artifact = Artifact::builder()
             .media_type(MediaType::Manifest)
             .config(ArtifactConfig::builder().id(changed.clone()).build())

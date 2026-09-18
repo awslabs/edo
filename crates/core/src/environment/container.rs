@@ -1,13 +1,5 @@
 use async_trait::async_trait;
 use dashmap::DashMap;
-use edo::context::{Addr, Context, Element, FromElement, Log};
-use edo::environment::{EnvResult, Environment, EnvironmentImpl, FarmImpl};
-use edo::record;
-use edo::source::Source;
-use edo::storage::{Id, MediaType, Storage};
-use edo::util::{
-    Reader, Writer, cmd_collect_out, cmd_noinput, cmd_noredirect, cmd_nulled, from_dash,
-};
 use regex::Regex;
 use snafu::ResultExt;
 use snafu::{OptionExt, ensure};
@@ -18,6 +10,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tempfile::NamedTempFile;
 use tokio::fs::{File, create_dir_all};
 use which::which;
+
+use edo::{
+    context::{Addr, Context, Element, FromElement, Log},
+    environment::{EnvResult, Environment, EnvironmentImpl, FarmImpl},
+    record,
+    source::Source,
+    storage::{Id, MediaType, Storage},
+    util::{Reader, Writer, cmd_collect_out, cmd_noinput, cmd_noredirect, cmd_nulled, from_dash},
+};
 
 static SHA256_EXTRACT: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new("sha256:[a-fA-F0-9]{64}").expect("the image digest regex is valid")

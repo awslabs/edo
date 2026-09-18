@@ -1,4 +1,3 @@
-use super::error;
 use bon::Builder;
 use regex::Regex;
 use semver::Version;
@@ -6,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use snafu::{OptionExt, ResultExt};
 use std::{fmt, str::FromStr, sync::LazyLock};
 
+use super::{digest::Digest, error};
 const UNSUPPORTED_PREFIX: &[&str] = &["http://", "https://"];
 static ID_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
@@ -23,7 +23,7 @@ static ID_REGEX: LazyLock<Regex> = LazyLock::new(|| {
             )?
             (?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?          # +build
         ))?
-        :(?P<digest>[0-9a-f]{64})
+        :(?P<digest>(?:sha256:[0-9a-f]{64}|sha512:[0-9a-f]{128}|blake3:[0-9a-f]{64}))
         $
     ",
     )
@@ -83,14 +83,13 @@ impl fmt::Display for Name {
 ///
 /// Serializes to the format `<name>[.arch][@<version>]:<digest>`.
 #[derive(Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Debug, Builder)]
+#[builder(on(_, into))]
 pub struct Id {
-    #[builder(into)]
     name: Name,
-    #[builder(into)]
     version: Option<Version>,
     #[builder(with = |arch: impl Into<String>| Name::parse(&arch.into()).to_string())]
     arch: Option<String>,
-    digest: String,
+    digest: Digest,
 }
 
 impl Id {
@@ -100,7 +99,7 @@ impl Id {
     }
 
     /// Return a reference to the SHA256 hex digest.
-    pub fn digest(&self) -> &String {
+    pub fn digest(&self) -> &Digest {
         &self.digest
     }
 
@@ -115,8 +114,8 @@ impl Id {
     }
 
     /// Replace the digest with a new value.
-    pub fn set_digest(&mut self, digest: &str) {
-        self.digest = digest.to_string();
+    pub fn set_digest(&mut self, digest: Digest) {
+        self.digest = digest.clone();
     }
 
     /// Set the semver version.
@@ -168,7 +167,7 @@ impl FromStr for Id {
             name: name.into(),
             version,
             arch,
-            digest: digest.to_string(),
+            digest: digest.try_into()?,
         })
     }
 }
@@ -185,7 +184,7 @@ impl fmt::Display for Id {
             f.write_str(version.to_string().as_str())?;
         }
         f.write_str(":")?;
-        f.write_str(self.digest())
+        f.write_str(&self.digest().to_string())
     }
 }
 
@@ -231,7 +230,9 @@ mod tests {
                     .name(name)
                     .maybe_arch(arch)
                     .version(Version::parse("1.2.3-rc.1+build.2").unwrap())
-                    .digest("a".repeat(64))
+                    .digest(
+                        Digest::try_from(format!("sha256:{}", "a".repeat(64)).as_str()).unwrap(),
+                    )
                     .build();
                 assert_eq!(Id::from_str(&id.to_string()).unwrap(), id);
                 let json = serde_json::to_string(&id).unwrap();

@@ -46,8 +46,6 @@
 //! a user-driven `quit` from [`execute::execute`] both flip the same
 //! switch.
 
-use super::context::Context;
-use crate::context::{Addr, Config};
 use graph::Graph;
 use snafu::ResultExt;
 use std::{
@@ -55,6 +53,9 @@ use std::{
     sync::Arc,
 };
 use tokio::fs::create_dir_all;
+
+use super::context::Context;
+use crate::context::{Addr, Config};
 
 /// Error types for the scheduler subsystem.
 pub mod error;
