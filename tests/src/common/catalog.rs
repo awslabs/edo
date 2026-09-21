@@ -56,7 +56,8 @@ pub fn read_path_hints_by_prefix(storage: &Path, prefix: &str) -> Vec<BTreeMap<S
         .collect()
 }
 
-/// Counts the number of blob files under `<storage>/storage/blobs/sha256`.
+/// Counts the number of blob files under `<storage>/storage/blobs/sha256`
+/// (the sha256 subdirectory is contributed by `Digest::as_path()`).
 ///
 /// Filters to filenames matching the SHA256 digest format (64 hex chars)
 /// so leftover `.tmp` files from in-flight or aborted writes do not cause

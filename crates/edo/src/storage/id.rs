@@ -25,7 +25,7 @@ static ID_REGEX: LazyLock<Regex> = LazyLock::new(|| {
             )?
             (?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?          # +build
         ))?
-        :(?P<digest>[0-9a-f]{64})
+        :(?P<digest>(?:sha256|sha512|blake3):[0-9a-f]+)
         $
     ",
     )
@@ -77,9 +77,6 @@ impl fmt::Display for Name {
 
 /// The unique identifier for an artifact in storage.
 ///
-/// Composed of a [`Name`], an optional package name, an optional semver
-/// version, an optional architecture tag, and a SHA256 content digest.
-/// Serializes to the format `<name>[.arch][@<version>]:<digest>`.
 #[derive(Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Debug, Builder)]
 #[builder(on(_, into))]
 pub struct Id {
@@ -95,7 +92,7 @@ impl Id {
         self.name.clone().to_string()
     }
 
-    /// Return a reference to the SHA256 hex digest.
+    /// Return a reference to the content digest.
     pub fn digest(&self) -> &Digest {
         &self.digest
     }

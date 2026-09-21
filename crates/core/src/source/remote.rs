@@ -40,7 +40,7 @@ impl SourceImpl for RemoteSource {
         // Hash the user-supplied content digest together with `out` so a
         // change to `out` invalidates the cached *manifest*, even though
         // the blob itself is still content-addressed by `self.digest`.
-        let mut digest = Digest::builder();
+        let mut digest = Digest::with_algorithm(self.digest.algorithm());
         digest.update(self.digest.hash());
         digest.update(
             self.out
@@ -125,6 +125,7 @@ impl SourceImpl for RemoteSource {
 
                 // Remote sources are stored in a single layer of the artifact
                 let mut writer = storage.safe_start_layer().await?;
+                writer.set_algorithm(blob_digest.algorithm());
                 tokio::io::copy(&mut reader, &mut writer)
                     .await
                     .context(error::IoSnafu)?;

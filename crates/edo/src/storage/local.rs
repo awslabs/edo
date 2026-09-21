@@ -23,7 +23,7 @@ use super::{
 
 /// Local filesystem storage backend.
 ///
-/// Layers are stored as individual blobs under `blobs/sha256/<digest>` and
+/// Layers are stored as individual blobs under `blobs/<algorithm>/<digest>` and
 /// manifests are tracked in a JSON catalog file. The shared blob layout means
 /// copy operations are metadata-only.
 ///
@@ -128,7 +128,7 @@ impl LocalBackend {
         }
         let catalog_file = path.join("catalog.json");
         let lock_file = path.join("catalog.lock");
-        let layer_dir = path.join("blobs/sha256");
+        let layer_dir = path.join("blobs");
         if !layer_dir.exists() {
             tokio::fs::create_dir_all(&layer_dir)
                 .await
@@ -445,6 +445,13 @@ impl BackendImpl for LocalBackend {
         // Now we want to calculate the digest
         let digest = writer.finish().await;
         let target_path = self.layer_dir.join(digest.as_path());
+        if let Some(parent) = target_path.parent()
+            && !parent.exists()
+        {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .context(error::CreateSnafu)?;
+        }
         let layer = options.create(digest, writer.size());
 
         // Copy the layer to the appropriate place

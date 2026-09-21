@@ -4,14 +4,13 @@ use std::str::FromStr;
 use async_trait::async_trait;
 use semver::{Version, VersionReq};
 use serde_json::json;
-use sha2::{Digest, Sha256};
 use snafu::{ResultExt, ensure};
 use tokio::io::AsyncReadExt;
 
 use edo::{
     context::{Addr, Context, Element, FromElement},
     source::{SourceResult, VendorImpl},
-    storage::Artifact,
+    storage::{Artifact, Digest},
 };
 use ocilot::{
     index::Index,
@@ -79,18 +78,17 @@ impl VendorImpl for ImageVendor {
         );
         let index = index.unwrap();
         // The actual digest that should be used, should be a merkle digest of the manifests
-        let mut hasher = Sha256::new();
+        let mut hasher = Digest::builder();
         for manifest in index.manifests().iter() {
             hasher.update(manifest.digest().as_bytes());
         }
-        let hash_bytes = hasher.finalize();
-        let digest = base16::encode_lower(hash_bytes.as_slice());
+        let digest = hasher.build();
         Ok(Element::builder()
             .addr(Addr::parse(name)?)
             .kind("image")
             .config([
                 ("uri".to_string(), json!(&uri.to_string())),
-                ("ref".to_string(), json!(digest)),
+                ("ref".to_string(), json!(&digest.to_string())),
             ])
             .build())
     }

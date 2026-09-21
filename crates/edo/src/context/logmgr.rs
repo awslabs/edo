@@ -97,6 +97,7 @@ const TRACE_ONLY: &[&str] = &[
     "cranelift",
     "cranelift_codegen",
     "cranelift-codegen",
+    "h2",
     "hyper",
     "rustls",
     "wasmtime",

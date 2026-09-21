@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::task::Poll;
 use tokio::io::{AsyncRead, BufReader};
 
-use crate::storage::{Compression, Digest, DigestBuilder};
+use crate::storage::{Algorithm, Compression, Digest, DigestBuilder};
 
 /// An async reader wrapper that computes a SHA256 hash of all bytes read.
 ///
@@ -82,6 +82,11 @@ impl Reader {
                 pos: 0,
             })),
         }
+    }
+
+    /// Override the hashing algorithm
+    pub fn set_algorithm(&self, algorithm: &Algorithm) {
+        self.inner.lock().hash = Digest::with_algorithm(algorithm);
     }
 
     /// Finalize the hash and return the hex-encoded SHA256 digest of all bytes read so far.
