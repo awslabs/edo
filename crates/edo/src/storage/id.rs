@@ -98,7 +98,7 @@ impl Id {
         self.name.clone().to_string()
     }
 
-    /// Return a reference to the SHA256 hex digest.
+    /// Return a reference to the content digest.
     pub fn digest(&self) -> &Digest {
         &self.digest
     }

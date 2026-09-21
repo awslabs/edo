@@ -92,11 +92,16 @@ impl S3Backend {
     }
 
     /// Returns the S3 key prefix for blob storage.
+    ///
+    /// The algorithm segment (e.g. `sha256/`) is contributed by
+    /// `Digest::as_path()`, so this prefix stops at the top-level
+    /// `blobs/` directory. Appending `sha256/` here would double up
+    /// the algorithm segment and produce `blobs/sha256/sha256/<hex>`.
     pub fn blob_key(&self) -> PathBuf {
         if let Some(prefix) = self.prefix.as_ref() {
-            prefix.join("blobs/sha256")
+            prefix.join("blobs")
         } else {
-            PathBuf::from("blobs/sha256")
+            PathBuf::from("blobs")
         }
     }
 

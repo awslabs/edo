@@ -1,4 +1,4 @@
-use crate::storage::{Compression, Digest};
+use crate::storage::{Algorithm, Compression, Digest};
 use async_compression::tokio::write::{
     BzDecoder, BzEncoder, GzipDecoder, GzipEncoder, Lz4Decoder, Lz4Encoder, LzmaDecoder,
     LzmaEncoder, XzDecoder, XzEncoder, ZstdDecoder, ZstdEncoder,
@@ -25,7 +25,6 @@ impl Writer {
             inner: Arc::new(Mutex::new(Inner {
                 writer: Box::pin(writer),
                 hash: Digest::builder(),
-                digest: None,
                 size: 0,
                 target,
             })),
@@ -50,7 +49,6 @@ impl Writer {
                     Compression::None => Box::pin(writer),
                 },
                 hash: Digest::builder(),
-                digest: None,
                 size: 0,
                 target,
             })),
@@ -75,7 +73,6 @@ impl Writer {
                     Compression::None => Box::pin(writer),
                 },
                 hash: Digest::builder(),
-                digest: None,
                 size: 0,
                 target,
             })),
@@ -87,9 +84,9 @@ impl Writer {
         self.inner.lock().size
     }
 
-    /// Override the computed digest with a predetermined value.
-    pub fn set_digest(&self, digest: &str) {
-        self.inner.lock().digest = Some(digest.to_string());
+    /// Override the hashing algorithm
+    pub fn set_algorithm(&self, algorithm: &Algorithm) {
+        self.inner.lock().hash = Digest::with_algorithm(algorithm);
     }
 
     /// Return the target name supplied at construction time.
@@ -110,7 +107,6 @@ impl Writer {
 struct Inner {
     writer: Pin<Box<dyn AsyncWrite + Send + Sync>>,
     hash: crate::storage::DigestBuilder,
-    digest: Option<String>,
     size: usize,
     target: String,
 }
