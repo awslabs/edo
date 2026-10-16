@@ -413,31 +413,65 @@ impl Vfs {
         A: IntoIterator<Item = I>,
         I: AsRef<str>,
     {
+        self.run_command(action, program, args, false).await
+    }
+
+    /// Like [`Vfs::command`], but dispatched through
+    /// [`Environment::execute_privileged`] for operations that need elevated
+    /// privileges inside the environment (e.g. `dnf install`).
+    pub async fn command_privileged<S, A, I>(
+        &self,
+        action: &str,
+        program: S,
+        args: A,
+    ) -> EnvResult<()>
+    where
+        S: AsRef<str>,
+        A: IntoIterator<Item = I>,
+        I: AsRef<str>,
+    {
+        self.run_command(action, program, args, true).await
+    }
+
+    async fn run_command<S, A, I>(
+        &self,
+        action: &str,
+        program: S,
+        args: A,
+        privileged: bool,
+    ) -> EnvResult<()>
+    where
+        S: AsRef<str>,
+        A: IntoIterator<Item = I>,
+        I: AsRef<str>,
+    {
         trace!(
             subsystem = "environment",
             component = "vfs",
             op = "command",
             action = action,
+            privileged = privileged,
             "executing command in environment: {}",
             program.as_ref(),
         );
-        if !self
-            .env
-            .execute(
-                &self.log,
-                &self.id,
-                &self.path,
-                &format!(
-                    "{} {}",
-                    program.as_ref(),
-                    args.into_iter()
-                        .map(|x| x.as_ref().to_string())
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                ),
-            )
-            .await?
-        {
+        let command = format!(
+            "{} {}",
+            program.as_ref(),
+            args.into_iter()
+                .map(|x| x.as_ref().to_string())
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        let success = if privileged {
+            self.env
+                .execute_privileged(&self.log, &self.id, &self.path, &command)
+                .await?
+        } else {
+            self.env
+                .execute(&self.log, &self.id, &self.path, &command)
+                .await?
+        };
+        if !success {
             return error::VfsSnafu { action }.fail();
         }
         Ok(())
