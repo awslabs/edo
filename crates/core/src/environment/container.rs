@@ -555,6 +555,9 @@ impl EnvironmentImpl for Container {
             return Ok(());
         }
         let cli = self.config.cli.as_ref().unwrap();
+        // `exec`: docker mounts `--tmpfs` noexec by default (podman doesn't),
+        // which breaks self-extracting installers (e.g. makeself-based NVIDIA
+        // `.run` files) that execute scripts out of `$TMPDIR`.
         let mut args = vec![
             "run".to_string(),
             "-it".to_string(),
@@ -562,7 +565,7 @@ impl EnvironmentImpl for Container {
             "--security-opt".to_string(),
             "label=disable".to_string(),
             "--tmpfs".to_string(),
-            "/tmp".to_string(),
+            "/tmp:exec".to_string(),
         ];
         if !self.config.network {
             args.push("--network=none".to_string());
