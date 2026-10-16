@@ -117,6 +117,15 @@ pub trait Environment {
     async fn read_bytes(&self, path: &Path) -> EnvResult<Vec<u8>>;
     async fn read_stream(&self, path: &Path, writer: Writer) -> EnvResult<()>;
     async fn execute(&self, log: &Log, id: &Id, path: &Path, command: &str) -> EnvResult<bool>;
+    async fn execute_privileged(
+        &self,
+        log: &Log,
+        id: &Id,
+        path: &Path,
+        command: &str,
+    ) -> EnvResult<bool> {
+        self.execute(log, id, path, command).await
+    }
     /// Open a shell in the environment
     fn shell(&self, path: &Path) -> EnvResult<()>;
 }

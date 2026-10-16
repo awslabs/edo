@@ -5,9 +5,11 @@ use snafu::ResultExt;
 use snafu::{OptionExt, ensure};
 use std::collections::HashMap;
 use std::env;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 use tokio::fs::{File, create_dir_all, remove_file};
 use uuid::Uuid;
 use which::which;
@@ -50,6 +52,12 @@ pub struct ContainerConfig {
     /// `"nofile=1048576"`). Defaults to empty (runtime defaults apply).
     #[serde(default)]
     ulimits: Vec<String>,
+    /// Run unprivileged commands in `user = "root"` environments as the host
+    /// user's `uid:gid` (with `HOME=/root`) rather than as root; only
+    /// [`EnvironmentImpl::execute_privileged`] runs as root. `None` (the
+    /// default) enables it for rootful runtimes.
+    #[serde(default)]
+    map_host_user: Option<bool>,
 }
 
 fn default_pids_limit() -> Option<i64> {
@@ -67,6 +75,76 @@ fn detect_runtime() -> Option<(&'static str, PathBuf)> {
     } else {
         None
     }
+}
+
+const RUNTIME_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+static ROOTFUL_CACHE: LazyLock<DashMap<(String, PathBuf), bool>> = LazyLock::new(DashMap::new);
+
+/// Whether `runtime` runs containers with real root privileges, in which case
+/// files created by container root on a bind mount are owned by host root.
+///
+/// Detection failures are treated as rootless. Only Linux hosts talking to a
+/// local daemon can be rootful.
+async fn runtime_is_rootful(runtime: &str, cli: &Path) -> bool {
+    if !cfg!(target_os = "linux") {
+        return false;
+    }
+    let key = (runtime.to_string(), cli.to_path_buf());
+    if let Some(rootful) = ROOTFUL_CACHE.get(&key) {
+        return *rootful;
+    }
+    let rootful = match runtime {
+        "docker" | "finch" => probe_info(cli, DOCKER_INFO_FORMAT)
+            .await
+            .is_some_and(|x| docker_info_is_rootful(&x)),
+        "podman" => probe_info(cli, PODMAN_INFO_FORMAT)
+            .await
+            .is_some_and(|x| podman_info_is_rootful(&x)),
+        _ => false,
+    };
+    ROOTFUL_CACHE.insert(key, rootful);
+    rootful
+}
+
+/// Run `<cli> info --format <format>`, returning its trimmed stdout on success.
+async fn probe_info(cli: &Path, format: &str) -> Option<String> {
+    let output = tokio::time::timeout(
+        RUNTIME_PROBE_TIMEOUT,
+        tokio::process::Command::new(cli)
+            .args(["info", "--format", format])
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+const DOCKER_INFO_FORMAT: &str = "{{.OperatingSystem}}\t{{json .SecurityOptions}}";
+
+/// Parse [`DOCKER_INFO_FORMAT`] output. Docker Desktop runs its daemon in a VM
+/// whose file sharing already maps ownership to the host user.
+fn docker_info_is_rootful(info: &str) -> bool {
+    let Some((os, security)) = info.split_once('\t') else {
+        return false;
+    };
+    os != "Docker Desktop" && !security.contains("rootless")
+}
+
+const PODMAN_INFO_FORMAT: &str = "{{.Host.Security.Rootless}}\t{{.Host.ServiceIsRemote}}";
+
+/// Parse [`PODMAN_INFO_FORMAT`] output. A remote service (e.g. `podman
+/// machine`) shares host directories through a VM that maps ownership.
+fn podman_info_is_rootful(info: &str) -> bool {
+    info.split_once('\t')
+        .is_some_and(|(rootless, remote)| rootless == "false" && remote == "false")
 }
 
 /// Options for a Container environment
@@ -124,6 +202,22 @@ impl FromElement for ContainerFarm {
             // SAFETY: runtime is Some at this point.
             let runtime = config.runtime.as_deref().unwrap();
             config.cli = Some(which(runtime).ok().context(error::NoRuntimeSnafu)?);
+        }
+        if config.map_host_user.is_none() {
+            // SAFETY: runtime and cli are Some at this point.
+            let rootful = runtime_is_rootful(
+                config.runtime.as_deref().unwrap(),
+                config.cli.as_ref().unwrap(),
+            )
+            .await;
+            debug!(
+                subsystem = "environment",
+                component = "container",
+                op = "runtime-detect",
+                rootful = rootful,
+                "detected container runtime privilege mode"
+            );
+            config.map_host_user = Some(rootful);
         }
         let src_element = element
             .source
@@ -289,6 +383,104 @@ unsafe impl Send for Container {}
 unsafe impl Sync for Container {}
 
 impl Container {
+    /// Whether unprivileged commands run as the host user instead of root.
+    fn maps_host_user(&self) -> bool {
+        self.user == "root" && self.config.map_host_user.unwrap_or(false)
+    }
+
+    /// The host `uid`/`gid` owning the workspace, which edo itself created.
+    fn host_ids(&self) -> EnvResult<(u32, u32)> {
+        let metadata = std::fs::metadata(&self.path).context(error::WorkspaceOwnerSnafu {
+            path: self.path.clone(),
+        })?;
+        Ok((metadata.uid(), metadata.gid()))
+    }
+
+    /// `docker exec` arguments selecting the user a command runs as.
+    fn user_args(&self, privileged: bool) -> EnvResult<Vec<String>> {
+        if privileged || (self.user == "root" && !self.maps_host_user()) {
+            return Ok(vec!["-u".into(), "0:0".into()]);
+        }
+        if self.user != "root" {
+            return Ok(Vec::new());
+        }
+        let (uid, gid) = self.host_ids()?;
+        Ok(vec![
+            "-u".into(),
+            format!("{uid}:{gid}"),
+            "--env".into(),
+            "HOME=/root".into(),
+        ])
+    }
+
+    /// The container path the workspace is mounted at.
+    fn home(&self) -> String {
+        if self.user == "root" {
+            "/root".into()
+        } else {
+            format!("/home/{}", self.user)
+        }
+    }
+
+    /// The `chown` owner to restore the workspace to after a privileged
+    /// command, or `None` when unprivileged commands run as root anyway.
+    fn workspace_owner(&self, privileged: bool) -> EnvResult<Option<String>> {
+        if !privileged {
+            return Ok(None);
+        }
+        if self.user != "root" {
+            let user = &self.user;
+            return Ok(Some(format!("$(id -u {user}):$(id -g {user})")));
+        }
+        if self.maps_host_user() {
+            let (uid, gid) = self.host_ids()?;
+            return Ok(Some(format!("{uid}:{gid}")));
+        }
+        Ok(None)
+    }
+
+    async fn exec(&self, log: &Log, path: &Path, cmd: &str, privileged: bool) -> EnvResult<bool> {
+        let work_dir = Path::new("/root").join(path);
+        trace!(
+            subsystem = "environment",
+            component = "container",
+            op = "exec",
+            path = %work_dir.display(),
+            privileged = privileged,
+            "running command"
+        );
+        let cli = self.config.cli.as_ref().unwrap();
+        // No `-i`: stdin is /dev/null for build commands (see
+        // `edo::util::cmd_noinput`), and an attached stdin would make the
+        // runtime pump the user's terminal, stealing keystrokes from the
+        // scheduler's interactive failure prompt.
+        let mut args = vec![
+            "exec".to_string(),
+            "--workdir".to_string(),
+            format!("{}", work_dir.display()),
+        ];
+        args.extend(self.user_args(privileged)?);
+        for entry in self.env.iter() {
+            args.push("--env".into());
+            args.push(format!("{}={}", entry.key(), entry.value()));
+        }
+        args.push(self.name.clone());
+        // A privileged command may leave root-owned files in the workspace;
+        // hand them back to whoever runs unprivileged commands.
+        let cmd = match self.workspace_owner(privileged)? {
+            Some(owner) => privileged_wrapper(cmd, &owner, &self.home()),
+            None => cmd.to_string(),
+        };
+        let mut run_args = args.clone();
+        run_args.push("sh".into());
+        run_args.push("-c".into());
+        run_args.push(cmd);
+        record!(log, "exec", "{:?} {}", cli, run_args.join(" "));
+        let status = edo::util::cmd_noinput(".", log, cli, run_args, &from_dash(&self.env))
+            .context(error::RuntimeSnafu)?;
+        Ok(status)
+    }
+
     fn local_path(&self, path: &Path) -> PathBuf {
         if self.user == "root"
             && let Ok(stripped) = path.strip_prefix("/root")
@@ -300,6 +492,15 @@ impl Container {
             path.to_path_buf()
         }
     }
+}
+
+/// Wrap `cmd` so `dir` is chowned to `owner` afterwards. The command runs in a
+/// subshell so an `exit` inside it can't skip the chown, and its exit status
+/// is preserved.
+fn privileged_wrapper(cmd: &str, owner: &str, dir: &str) -> String {
+    format!(
+        "(\n{cmd}\n); rc=$?; chown -hR {owner} {dir} || echo 'edo: failed to restore workspace ownership' >&2; exit $rc"
+    )
 }
 
 #[async_trait]
@@ -625,10 +826,7 @@ impl EnvironmentImpl for Container {
             "--workdir".to_string(),
             format!("{}", work_dir.display()),
         ];
-        if self.user == "root" {
-            args.push("-u".into());
-            args.push("0:0".into());
-        }
+        args.extend(self.user_args(false)?);
         for entry in self.env.iter() {
             args.push("--env".into());
             args.push(format!("{}={}", entry.key(), entry.value()));
@@ -643,41 +841,17 @@ impl EnvironmentImpl for Container {
     }
 
     async fn execute(&self, log: &Log, _id: &Id, path: &Path, cmd: &str) -> EnvResult<bool> {
-        let work_dir = Path::new("/root").join(path);
-        trace!(
-            subsystem = "environment",
-            component = "container",
-            op = "exec",
-            path = %work_dir.display(),
-            "running command"
-        );
-        let cli = self.config.cli.as_ref().unwrap();
-        // No `-i`: stdin is /dev/null for build commands (see
-        // `edo::util::cmd_noinput`), and an attached stdin would make the
-        // runtime pump the user's terminal, stealing keystrokes from the
-        // scheduler's interactive failure prompt.
-        let mut args = vec![
-            "exec".to_string(),
-            "--workdir".to_string(),
-            format!("{}", work_dir.display()),
-        ];
-        if self.user == "root" {
-            args.push("-u".into());
-            args.push("0:0".into());
-        }
-        for entry in self.env.iter() {
-            args.push("--env".into());
-            args.push(format!("{}={}", entry.key(), entry.value()));
-        }
-        args.push(self.name.clone());
-        let mut run_args = args.clone();
-        run_args.push("sh".into());
-        run_args.push("-c".into());
-        run_args.push(cmd.into());
-        record!(log, "exec", "{:?} {}", cli, run_args.join(" "));
-        let status = edo::util::cmd_noinput(".", log, cli, run_args, &from_dash(&self.env))
-            .context(error::RuntimeSnafu)?;
-        Ok(status)
+        self.exec(log, path, cmd, false).await
+    }
+
+    async fn execute_privileged(
+        &self,
+        log: &Log,
+        _id: &Id,
+        path: &Path,
+        cmd: &str,
+    ) -> EnvResult<bool> {
+        self.exec(log, path, cmd, true).await
     }
 }
 
@@ -748,6 +922,11 @@ pub mod error {
         TagMissing,
         #[snafu(display("failed to create workspace directory: {source}"))]
         Workspace { source: std::io::Error },
+        #[snafu(display("failed to stat workspace {}: {source}", path.display()))]
+        WorkspaceOwner {
+            path: PathBuf,
+            source: std::io::Error,
+        },
         #[snafu(display("failed to write to file: {source}"))]
         WriteFile { source: std::io::Error },
     }
@@ -766,5 +945,149 @@ pub mod error {
                 source: Box::new(value),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn container(user: &str, map_host_user: bool, path: &Path) -> Container {
+        Container {
+            config: ContainerConfig {
+                map_host_user: Some(map_host_user),
+                ..Default::default()
+            },
+            name: "test".into(),
+            user: user.into(),
+            path: path.to_path_buf(),
+            tag: "test".into(),
+            running: AtomicBool::new(false),
+            env: DashMap::new(),
+        }
+    }
+
+    fn root_args() -> Vec<String> {
+        vec!["-u".into(), "0:0".into()]
+    }
+
+    #[test]
+    fn user_args_decision_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let metadata = std::fs::metadata(dir.path()).unwrap();
+        let host = format!("{}:{}", metadata.uid(), metadata.gid());
+
+        let root = container("root", false, dir.path());
+        assert_eq!(root.user_args(false).unwrap(), root_args());
+        assert_eq!(root.user_args(true).unwrap(), root_args());
+
+        let mapped = container("root", true, dir.path());
+        assert_eq!(
+            mapped.user_args(false).unwrap(),
+            vec!["-u".to_string(), host, "--env".into(), "HOME=/root".into()]
+        );
+        assert_eq!(mapped.user_args(true).unwrap(), root_args());
+
+        for map_host_user in [false, true] {
+            let user = container("builder", map_host_user, dir.path());
+            assert!(user.user_args(false).unwrap().is_empty());
+            assert_eq!(user.user_args(true).unwrap(), root_args());
+        }
+    }
+
+    #[test]
+    fn workspace_owner_decision_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let metadata = std::fs::metadata(dir.path()).unwrap();
+        let host = format!("{}:{}", metadata.uid(), metadata.gid());
+
+        for (user, map_host_user) in [("root", false), ("root", true), ("builder", true)] {
+            let env = container(user, map_host_user, dir.path());
+            assert_eq!(env.workspace_owner(false).unwrap(), None);
+        }
+        assert_eq!(
+            container("root", false, dir.path())
+                .workspace_owner(true)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            container("root", true, dir.path())
+                .workspace_owner(true)
+                .unwrap(),
+            Some(host)
+        );
+        assert_eq!(
+            container("builder", false, dir.path())
+                .workspace_owner(true)
+                .unwrap(),
+            Some("$(id -u builder):$(id -g builder)".into())
+        );
+    }
+
+    #[test]
+    fn host_ids_missing_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = container("root", true, &dir.path().join("missing"));
+        let err = env.user_args(false).unwrap_err().to_string();
+        assert!(err.contains("failed to stat workspace"), "{err}");
+    }
+
+    fn run_wrapper(cmd: &str, dir: &Path) -> std::process::Output {
+        let id = |flag| {
+            let out = std::process::Command::new("id").arg(flag).output().unwrap();
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        };
+        let owner = format!("{}:{}", id("-u"), id("-g"));
+        std::process::Command::new("sh")
+            .arg("-c")
+            .arg(privileged_wrapper(cmd, &owner, dir.to_str().unwrap()))
+            .output()
+            .unwrap()
+    }
+
+    #[test]
+    fn privileged_wrapper_preserves_status() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(run_wrapper("true", dir.path()).status.code(), Some(0));
+        assert_eq!(run_wrapper("false", dir.path()).status.code(), Some(1));
+        let out = run_wrapper("echo hi\nexit 3", dir.path());
+        assert_eq!(out.status.code(), Some(3));
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "hi\n");
+    }
+
+    #[test]
+    fn privileged_wrapper_chowns_after_exit() {
+        // A missing directory makes the chown observable through its error.
+        let dir = tempfile::tempdir().unwrap();
+        let out = run_wrapper("exit 4", &dir.path().join("missing"));
+        assert_eq!(out.status.code(), Some(4));
+        assert!(
+            String::from_utf8_lossy(&out.stderr)
+                .contains("edo: failed to restore workspace ownership")
+        );
+    }
+
+    #[test]
+    fn docker_info_detection() {
+        assert!(docker_info_is_rootful(
+            "Fedora Linux 44\t[\"name=seccomp,profile=builtin\",\"name=selinux\"]"
+        ));
+        assert!(!docker_info_is_rootful(
+            "Fedora Linux 44\t[\"name=seccomp,profile=builtin\",\"name=rootless\"]"
+        ));
+        assert!(!docker_info_is_rootful(
+            "Docker Desktop\t[\"name=seccomp,profile=builtin\"]"
+        ));
+        assert!(!docker_info_is_rootful(""));
+    }
+
+    #[test]
+    fn podman_info_detection() {
+        assert!(podman_info_is_rootful("false\tfalse"));
+        assert!(!podman_info_is_rootful("true\tfalse"));
+        assert!(!podman_info_is_rootful("false\ttrue"));
+        assert!(!podman_info_is_rootful("false"));
+        assert!(!podman_info_is_rootful(""));
     }
 }
