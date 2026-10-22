@@ -12,7 +12,7 @@ use snafu::ResultExt;
 use snafu::{OptionExt, ensure};
 use std::collections::HashMap;
 use std::env;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::fs::{File, create_dir_all, remove_file};
 use tracing::Instrument;
@@ -113,8 +113,7 @@ impl ContainerConfig {
     }
 }
 
-/// Container environment farm creates environments that run inside of a container
-/// on a container engine like: finch, podman or docker
+/// Creates environments using a container runtime.
 pub struct ContainerFarm {
     addr: Addr,
     config: ResolvedContainerConfig,
@@ -156,7 +155,6 @@ impl FromElement for ContainerFarm {
 #[async_trait]
 impl FarmImpl for ContainerFarm {
     async fn setup(&self, log: &Log, storage: &Storage) -> EnvResult<()> {
-        // Fetch our source image
         trace!(component = "environment", type = "container", "fetching image for environments");
         let artifact = self
             .source
@@ -164,7 +162,6 @@ impl FarmImpl for ContainerFarm {
             .await
             .context(error::SourceSnafu)?;
 
-        // Get the image name tag
         let name = format!(
             "edo-{}",
             self.addr
@@ -173,7 +170,7 @@ impl FarmImpl for ContainerFarm {
                 .unwrap_or(self.addr.to_string().as_str())
                 .replace('/', "-")
         );
-        // First we want to check if the image already exists, if so skip the next step
+        // Reuse an image already loaded in the runtime.
         trace!(component = "environment", type = "container", "check if the image is already loaded into the container runtime");
         let cli = &self.config.cli;
         if cmd_nulled(
@@ -187,7 +184,7 @@ impl FarmImpl for ContainerFarm {
             info!(component = "environment", type = "container", "image already loaded into container engine, if this is incorrect please remove {name} first.");
             return Ok(());
         }
-        // The image source stores an oci image as an oci archive in the first layer
+        // The first source layer is an OCI archive.
         let layer = artifact.layers().first().unwrap();
         let mut reader = storage.safe_read(layer).await?;
 
@@ -199,7 +196,7 @@ impl FarmImpl for ContainerFarm {
         drop(archive);
 
         async move {
-            // Now we can load the image into the runtime using docker load then tag it accordingly
+            // Load and tag the image.
             record!(log, "load_image", "{:?} load -i {path:?}", cli);
             let output = cmd_collect_out(
                 ".",
@@ -209,7 +206,7 @@ impl FarmImpl for ContainerFarm {
                 &HashMap::new(),
             )
             .context(error::RuntimeSnafu)?;
-            // The return will be the image digest
+            // Extract the loaded image digest.
             let string = String::from_utf8_lossy(output.as_slice());
             let string = string
                 .strip_prefix("Loaded image: sha256:")
@@ -238,7 +235,6 @@ impl FarmImpl for ContainerFarm {
 
     async fn create(&self, _log: &Log, path: &Path) -> EnvResult<Environment> {
         trace!(component = "environment", type = "container", "creating new container environment with workspace at {}", path.display());
-        // Generate a random name
         let mut generator = names::Generator::default();
         let name = generator.next().unwrap();
         let image_tag = format!(
@@ -275,6 +271,33 @@ pub struct Container {
 unsafe impl Send for Container {}
 unsafe impl Sync for Container {}
 
+impl Container {
+    fn local_path(&self, path: &Path) -> EnvResult<PathBuf> {
+        let home = if self.user == "root" {
+            PathBuf::from("/root")
+        } else {
+            PathBuf::from(format!("/home/{}", self.user))
+        };
+        let relative = path.strip_prefix(home).unwrap_or(path);
+        let mut local = PathBuf::new();
+        for component in relative.components() {
+            match component {
+                Component::Normal(part) => local.push(part),
+                Component::CurDir => {}
+                Component::ParentDir if local.pop() => {}
+                _ => {
+                    return error::OutsideWorkspaceSnafu {
+                        path: path.to_path_buf(),
+                    }
+                    .fail()
+                    .map_err(Into::into);
+                }
+            }
+        }
+        Ok(local)
+    }
+}
+
 #[async_trait]
 impl EnvironmentImpl for Container {
     async fn expand(&self, path: &Path) -> EnvResult<PathBuf> {
@@ -298,7 +321,6 @@ impl EnvironmentImpl for Container {
     }
 
     async fn setup(&self, log: &Log, _storage: &Storage) -> EnvResult<()> {
-        // make the directory we want exists
         if !self.path.exists() {
             trace!(component = "environment", type = "container", "creating workspace directory at {}", self.path.display());
             record!(log, "create_dir", "{:?}", self.path);
@@ -400,7 +422,6 @@ impl EnvironmentImpl for Container {
         )
         .context(error::RuntimeSnafu)?;
         self.running.store(false, Ordering::SeqCst);
-        // No spindown needed for a finch environment
         Ok(())
     }
 
@@ -409,6 +430,7 @@ impl EnvironmentImpl for Container {
     }
 
     async fn create_dir(&self, path: &Path) -> EnvResult<()> {
+        let path = self.local_path(path)?;
         let path = self.path.join(path);
         trace!(component = "environment", type = "container", "creating directory at {}", path.display());
         create_dir_all(path)
@@ -418,7 +440,8 @@ impl EnvironmentImpl for Container {
     }
 
     async fn write_bytes(&self, path: &Path, buffer: &[u8]) -> EnvResult<()> {
-        let file_path = self.path.join(path);
+        let path = self.local_path(path)?;
+        let file_path = self.path.join(&path);
         if let Some(parent) = file_path.parent()
             && !parent.exists()
         {
@@ -434,7 +457,8 @@ impl EnvironmentImpl for Container {
     }
 
     async fn write_stream(&self, path: &Path, mut reader: Reader) -> EnvResult<()> {
-        let file_path = self.path.join(path);
+        let path = self.local_path(path)?;
+        let file_path = self.path.join(&path);
         if let Some(parent) = file_path.parent()
             && !parent.exists()
         {
@@ -458,7 +482,8 @@ impl EnvironmentImpl for Container {
         media_type: &MediaType,
         reader: Reader,
     ) -> EnvResult<()> {
-        let file_path = self.path.join(path);
+        let path = self.local_path(path)?;
+        let file_path = self.path.join(&path);
         if !file_path.exists() {
             tokio::fs::create_dir_all(&file_path)
                 .await
@@ -484,7 +509,7 @@ impl EnvironmentImpl for Container {
     }
 
     async fn read_stream(&self, path: &Path, mut writer: Writer) -> EnvResult<()> {
-        let file_path = self.path.join(path);
+        let file_path = self.path.join(self.local_path(path)?);
         ensure!(
             file_path.exists(),
             error::NotFoundSnafu {
@@ -510,7 +535,7 @@ impl EnvironmentImpl for Container {
     }
 
     async fn read_bytes(&self, path: &Path) -> EnvResult<Vec<u8>> {
-        let file_path = self.path.join(path);
+        let file_path = self.path.join(self.local_path(path)?);
         ensure!(
             file_path.exists(),
             error::NotFoundSnafu {
@@ -636,6 +661,8 @@ pub mod error {
         NoSource,
         #[snafu(display("file does not exist: {}", path.display()))]
         NotFound { path: PathBuf },
+        #[snafu(display("path is outside the container workspace: {}", path.display()))]
+        OutsideWorkspace { path: PathBuf },
         #[snafu(display("failed to read file: {source}"))]
         ReadFile { source: std::io::Error },
         #[snafu(display("failed to execute runtime: {source}"))]
@@ -682,6 +709,83 @@ mod tests {
 
     fn options(value: serde_json::Value) -> ContainerOptions {
         serde_json::from_value(value).unwrap()
+    }
+
+    fn container(user: &str, path: &Path) -> Container {
+        Container {
+            config: ContainerConfig::default()
+                .resolve(&options(json!({})), |runtime| Some(runtime.into()))
+                .unwrap(),
+            name: "test".into(),
+            user: user.into(),
+            path: path.into(),
+            tag: "test".into(),
+            running: AtomicBool::new(false),
+            env: DashMap::new(),
+        }
+    }
+
+    #[test]
+    fn local_paths_remain_in_the_workspace() {
+        for (user, home) in [("root", "/root"), ("builder", "/home/builder")] {
+            let container = container(user, Path::new("workspace"));
+            for (path, expected) in [
+                (home.to_string(), ""),
+                (format!("{home}/src/file"), "src/file"),
+                ("src/file".into(), "src/file"),
+                ("src/../file".into(), "file"),
+                (".".into(), ""),
+            ] {
+                assert_eq!(
+                    container.local_path(Path::new(&path)).unwrap(),
+                    Path::new(expected)
+                );
+            }
+            for path in [
+                "/opt/out".to_string(),
+                "/usr/local/bin".into(),
+                "/etc/foo".into(),
+                "../out".into(),
+                "src/../../out".into(),
+                format!("{home}/../out"),
+                format!("{home}ish/out"),
+            ] {
+                assert!(container.local_path(Path::new(&path)).is_err(), "{path}");
+            }
+        }
+        assert!(
+            container("builder", Path::new("workspace"))
+                .local_path(Path::new("/root/out"))
+                .is_err()
+        );
+        assert!(
+            container("root", Path::new("workspace"))
+                .local_path(Path::new("/home/root/out"))
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn file_operations_map_home_paths_and_preserve_error_paths() {
+        let workspace = tempfile::tempdir().unwrap();
+        let container = container("builder", workspace.path());
+        container
+            .create_dir(Path::new("/home/builder/src"))
+            .await
+            .unwrap();
+        container
+            .write_bytes(Path::new("/home/builder/src/file"), b"data")
+            .await
+            .unwrap();
+        assert_eq!(
+            container.read_bytes(Path::new("src/file")).await.unwrap(),
+            b"data"
+        );
+        let error = container
+            .read_bytes(Path::new("/home/builder/missing"))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("/home/builder/missing"));
     }
 
     #[test]
