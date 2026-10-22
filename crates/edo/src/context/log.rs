@@ -69,18 +69,15 @@ impl Log {
 
     /// Writes a section header line to the log file.
     pub fn set_subject(&self, subject: &str) {
-        let _ = self
-            .inner
-            .lock()
-            .file
-            .write_fmt(format_args!("\n=== [{subject}] ===\n"));
-        self.inner.lock().subject = subject.to_string();
+        let mut lock = self.inner.lock();
+        let _ = lock.file.write_fmt(format_args!("\n=== [{subject}] ===\n"));
+        lock.subject = subject.to_string();
     }
 
-    /// Writes a dedicated action to the log file
+    /// Writes a dedicated action to the log file.
     pub fn record(&self, action: &str, message: &str) -> Result<()> {
         let mut lock = self.inner.lock();
-        let line = format!("\n> [{}]({action}): {message}\n", lock.subject.clone());
+        let line = format!("\n> [{}]({action}): {message}\n", lock.subject);
         lock.file
             .write_all(line.as_bytes())
             .context(error::IoSnafu)?;

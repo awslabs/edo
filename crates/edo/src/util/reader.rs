@@ -7,15 +7,16 @@ use sha2::{Digest, Sha256};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::Poll;
-use tokio::io::{AsyncRead, AsyncReadExt, BufReader};
+use tokio::io::{AsyncRead, BufReader};
 
 use crate::storage::Compression;
 
 /// An async reader wrapper that computes a SHA256 hash of all bytes read.
 ///
-/// Implements both [`AsyncRead`] and [`std::io::Read`] (blocking via the
-/// current tokio runtime). Use [`Reader::finish`] after all data has been
+/// Implements [`AsyncRead`]. Use [`Reader::finish`] after all data has been
 /// consumed to obtain the hex-encoded digest.
+///
+/// Use [`crate::util::SyncReader`] for synchronous reads.
 #[derive(Clone)]
 pub struct Reader {
     inner: Arc<Mutex<Inner>>,
@@ -92,14 +93,6 @@ struct Inner {
     reader: Pin<Box<dyn AsyncRead + Send>>,
     hash: Sha256,
     pos: usize,
-}
-
-impl std::io::Read for Reader {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let mut lock = self.inner.lock();
-        let handle = tokio::runtime::Handle::current();
-        handle.block_on(lock.reader.read(buf))
-    }
 }
 
 impl AsyncRead for Reader {
