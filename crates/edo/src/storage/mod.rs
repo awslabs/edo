@@ -42,35 +42,23 @@ use tracing::Instrument;
 /// content-addressed by SHA256 digest.
 #[derive(Clone)]
 pub struct Storage {
-    // We protect the implementation inside an arced rwlock as we do
-    // operate with same storage over multiple tokio routines/threads
+    // Serialize cache configuration changes across tasks.
     inner: Arc<RwLock<Inner>>,
 }
 
 struct Inner {
-    // Tne local cache is used for storing all things locally that
-    // will be needed for a transform. Most operations sync from other caches
-    // to this one. It is configurable at the addr //edo-local-cache
+    // Local artifact and blob cache: //edo-local-cache.
     local: Backend,
-    // Source caches handle fetching remote artifacts
-    // that are used as sources, these are configurable at addr pattern
-    // //edo-source-cache/<name>
+    // Ordered source caches: //edo-source-cache/<name>.
     source: IndexMap<String, Backend>,
-    // A remote build cache allows you to re-use built artifacts from
-    // a transform should they exist here.
-    // This is configurable at //edo-build-cache
+    // Optional build cache: //edo-build-cache.
     build: Option<Backend>,
-    // An output cache acts as a publish destination for transform results.
-    // generally this cache should only ever be pushed to. It is configurable at addr
-    // pattern //edo-output-cache
+    // Optional publication destination: //edo-output-cache.
     output: Option<Backend>,
 }
 
-// All methods inside inner are actual implementation methods and should return
-// cache result, error
 impl Inner {
-    // Initialize a storage handler, the path here can override where the storage
-    // will handle files locally. If provided it willb e turned into an absolute path
+    // Initialize the local cache.
     async fn init(backend: Backend) -> StorageResult<Self> {
         Ok(Self {
             local: backend,
@@ -174,7 +162,7 @@ impl Inner {
     }
 
     async fn download(&self, artifact: &Artifact, backend: &Backend) -> StorageResult<()> {
-        // Now we want to in parallel copy all layers
+        // Copy layers concurrently.
         let mut handles = Vec::new();
         for layer in artifact.layers() {
             let backend = backend.clone();
@@ -200,7 +188,7 @@ impl Inner {
     }
 
     async fn upload(&self, artifact: &Artifact, backend: &Backend) -> StorageResult<()> {
-        // Now we want to in parallel copy all layers
+        // Copy layers concurrently.
         let mut handles = Vec::new();
         for layer in artifact.layers() {
             let backend = backend.clone();
@@ -271,7 +259,6 @@ impl Inner {
                 component = "storage",
                 "loading from the local cache as {id} exists already"
             );
-            // No need to sync as its already in the local cache
             return Ok(Some(self.local.open(id).await?));
         }
 
@@ -283,16 +270,13 @@ impl Inner {
             if sync {
                 self.download(&artifact, build).await?;
             }
-            // Otherwise open it direct from the build cache
             return Ok(Some(artifact));
         }
-        // None found
         Ok(None)
     }
 
     // upload a build artifact if it exists
     async fn upload_build(&self, id: &Id) -> StorageResult<()> {
-        // This only occurs if a build cache is registered
         if let Some(build) = self.build.as_ref() {
             debug!(component = "storage", "build cache detected uploading {id}");
             let artifact = self.local.open(id).await?;
@@ -304,7 +288,6 @@ impl Inner {
     // upload an output artifact if registered to
     #[allow(dead_code)]
     async fn upload_output(&self, id: &Id) -> StorageResult<()> {
-        // This only occurs if an output cache is registered
         if let Some(output) = self.output.as_ref() {
             debug!(component = "output cache detected, uploading {id}");
             let artifact = self.local.open(id).await?;
@@ -319,6 +302,22 @@ impl Inner {
 
     pub async fn prune_local_all(&self) -> StorageResult<()> {
         self.local.prune_all().await
+    }
+
+    pub async fn drop_local(&self, id: &Id) -> StorageResult<()> {
+        self.local.del(id).await
+    }
+
+    pub async fn drop_local_matching(&self, id: &Id) -> StorageResult<()> {
+        // Release the listing lock before deleting entries.
+        let matching = self.local.list().await?;
+        let prefix = id.prefix();
+        for entry in matching {
+            if entry.prefix() == prefix {
+                self.local.del(&entry).await?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -355,34 +354,17 @@ impl Storage {
         self.inner.write().await.set_output_cache(cache);
     }
 
-    /// Reports whether `id` is present in the **local** cache only.
-    ///
-    /// Cheap, side-effect-free probe: never touches networked source or
-    /// build caches. Used by [`Source::is_cached`](crate::source::Source::is_cached)
-    /// and the scheduler's fetch-phase short-circuit to avoid spawning
-    /// per-node prepare tasks when every input is already on disk.
-    ///
-    /// **safe operation** No network IO.
+    /// Checks whether `id` is cached locally without network access.
     pub async fn has_local(&self, id: &Id) -> StorageResult<bool> {
         self.inner.read().await.local.has(id).await
     }
 
-    /// Reports whether the **local** cache already stores a blob with the
-    /// given bare hex digest. Used by content-addressed sources (e.g.
-    /// [`RemoteSource`](https://example.com)) to skip the network fetch when
-    /// only the manifest id changed (e.g. because `out` changed) but the
-    /// underlying blob is unchanged.
-    ///
-    /// **safe operation** No network IO.
+    /// Checks for a local blob by bare hex digest without network access.
     pub async fn has_local_blob(&self, digest: &str) -> StorageResult<bool> {
         self.inner.read().await.local.has_blob(digest).await
     }
 
-    /// Returns the on-disk size of a blob in the **local** cache, if
-    /// present. Used by content-addressed sources to populate the
-    /// accurate `Layer::size` when reusing an existing blob.
-    ///
-    /// **safe operation** No network IO.
+    /// Returns a local blob's size, if present, without network access.
     pub async fn local_blob_size(&self, digest: &str) -> StorageResult<Option<u64>> {
         self.inner.read().await.local.blob_size(digest).await
     }
@@ -392,16 +374,12 @@ impl Storage {
         self.inner.read().await.safe_list().await
     }
 
-    /// Open an artifact stored in the local cache
-    /// **safe operation** This operation is safe to call in a networkless environment or in the
-    /// build stages as it will make no network calls
+    /// Opens a local artifact without network access.
     pub async fn safe_open(&self, id: &Id) -> StorageResult<Artifact> {
         self.inner.read().await.safe_open(id).await
     }
 
-    /// Open a layer stored in the local cache
-    /// **safe operation** This operation is safe to call in a networkless environment or in the
-    /// build stages as it will make no network calls
+    /// Opens a local layer without network access.
     pub async fn safe_read(&self, layer: &Layer) -> StorageResult<Reader> {
         self.inner.read().await.safe_read(layer).await
     }
@@ -429,24 +407,17 @@ impl Storage {
         self.inner.read().await.safe_save(artifact).await
     }
 
-    /// Fetch a source to local cache and open it for any uses
-    /// needed.
-    /// **unsafe operation** This operation is unsafe because it could reach out to a networked back source
-    /// cache.
+    /// Fetches and opens a source locally; may access networked caches.
     pub async fn fetch_source(&self, id: &Id) -> StorageResult<Option<Artifact>> {
         self.inner.read().await.fetch_source(id).await
     }
 
-    /// Find a source in the source caches
-    /// **unsafe operation** This operation is unsafe because it could reach out to a networked back source
-    /// cache.
+    /// Finds a source in priority order; may access networked caches.
     pub async fn find_source(&self, id: &Id) -> StorageResult<Option<(Artifact, Backend)>> {
         self.inner.read().await.find_source(id).await
     }
 
-    /// Check for a build artifact
-    /// **unsafe operation** This operation is unsafe because it could reach out to a remotely backed
-    /// build cache.
+    /// Finds a build artifact; may access the networked build cache.
     pub async fn find_build(&self, id: &Id, sync: bool) -> StorageResult<Option<Artifact>> {
         self.inner.read().await.find_build(id, sync).await
     }
@@ -456,7 +427,6 @@ impl Storage {
         self.inner.read().await.upload_build(id).await
     }
 
-    /// Prune the local cache of rerun artifacts
     /// Prune the local cache of all artifacts sharing a prefix with `id` except `id` itself.
     pub async fn prune_local(&self, id: &Id) -> StorageResult<()> {
         self.inner.read().await.prune_local(id).await
@@ -465,6 +435,16 @@ impl Storage {
     /// Remove all artifacts and blobs from the local cache.
     pub async fn prune_local_all(&self) -> StorageResult<()> {
         self.inner.read().await.prune_local_all().await
+    }
+
+    /// Removes `id` from the local cache, retaining shared blobs; missing ids are a no-op.
+    pub async fn drop_local(&self, id: &Id) -> StorageResult<()> {
+        self.inner.read().await.drop_local(id).await
+    }
+
+    /// Removes all local artifacts sharing `id`'s prefix, retaining shared blobs.
+    pub async fn drop_local_matching(&self, id: &Id) -> StorageResult<()> {
+        self.inner.read().await.drop_local_matching(id).await
     }
 }
 
