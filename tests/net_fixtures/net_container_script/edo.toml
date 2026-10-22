@@ -13,9 +13,9 @@ kind   = "container"
 source = ["//net_container_script/gcc"]
 
 [source.code]
-kind       = "local"
-path       = "net_container_script/code"
-out        = "."
+kind = "local"
+path = "net_container_script/code"
+out  = "."
 
 [transform.build]
 kind        = "script"

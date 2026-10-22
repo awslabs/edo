@@ -1,9 +1,9 @@
 schema-version = "1"
 
 [source.src]
-kind       = "local"
-path       = "rust_src"
-out        = "."
+kind = "local"
+path = "rust_src"
+out  = "."
 
 [transform.vendor]
 kind   = "cargo-vendor"

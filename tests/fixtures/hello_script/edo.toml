@@ -1,9 +1,9 @@
 schema-version = "1"
 
 [source.src]
-kind       = "local"
-path       = "hello_script/files"
-out        = "."
+kind = "local"
+path = "hello_script/files"
+out  = "."
 
 [transform.build]
 kind        = "script"
