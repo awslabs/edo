@@ -310,6 +310,10 @@ by `CorePlugin::create_source` in `crates/plugins/edo-core-plugin/src/lib.rs`.
   `is_archive = true`, in which case it passes through).
 - **`GitSource`** (`git.rs`): shells out to `git` to clone and checkout
   `ref`, then tars the working tree.
+  Sources with an `out` path use separate cache prefixes for each staging
+  destination. Existing entries for these sources must be rebuilt; old prefixes
+  are not removed by prefix-based pruning. Sources without `out` retain their
+  existing cache IDs.
 - **`RemoteSource`** (`remote.rs`): streams an HTTP(S) URL into an
   artifact, verifying against the supplied digest (`ref`).
 - **`ImageSource`** (`oci.rs`): fetches an OCI manifest/index via `ocilot`

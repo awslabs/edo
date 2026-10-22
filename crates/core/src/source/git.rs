@@ -34,23 +34,18 @@ impl FromElement for GitSource {
 #[async_trait]
 impl SourceImpl for GitSource {
     async fn get_unique_id(&self) -> SourceResult<Id> {
-        // Fold `out` into the digest so changing the staging path
-        // invalidates the cached manifest. The name is kept stable
-        // (no longer embeds `out`) so the human-facing id stays clean.
+        // Separate staging variants for prefix-based cache eviction.
         let mut hasher = Sha256::new();
         hasher.update(self.reference.as_bytes());
-        hasher.update(
-            self.out
-                .as_ref()
-                .and_then(|p| p.to_str())
-                .unwrap_or("")
-                .as_bytes(),
-        );
+        if let Some(out) = &self.out {
+            hasher.update(out.as_os_str().as_encoded_bytes());
+        }
         let digest = base16::encode_lower(hasher.finalize().as_slice());
-        let id = Id::builder()
-            .name(format!("{}@{}", self.url, self.reference))
-            .digest(digest)
-            .build();
+        let name = match &self.out {
+            Some(out) => format!("{}@{}-{}", self.url, self.reference, out.to_string_lossy()),
+            None => format!("{}@{}", self.url, self.reference),
+        };
+        let id = Id::builder().name(name).digest(digest).build();
         trace!(component = "source", type = "git", "calculated id to be {id}");
         Ok(id)
     }
@@ -76,7 +71,6 @@ impl SourceImpl for GitSource {
                 &HashMap::new(),
             )
             .context(error::GitSnafu)?;
-            // Make our initial artifact manifest
             let mut artifact = Artifact::builder()
                 .media_type(MediaType::Manifest)
                 .config(
@@ -90,7 +84,7 @@ impl SourceImpl for GitSource {
                 )
                 .build();
 
-            // Now we want to open a single layer which we will archive the source
+            // Archive the checkout as a single layer.
             let mut writer = storage.safe_start_layer().await?;
             let mut archive = tokio_tar::Builder::new(writer.clone());
             archive
@@ -99,7 +93,6 @@ impl SourceImpl for GitSource {
                 .context(error::ArchiveSnafu)?;
             writer.flush().await.context(error::ArchiveSnafu)?;
             archive.finish().await.context(error::ArchiveSnafu)?;
-            // Now we can add the the layer to the artifact
             let layer = storage
                 .safe_finish_layer(
                     &writer,
@@ -108,8 +101,7 @@ impl SourceImpl for GitSource {
                         .build(),
                 )
                 .await?;
-            // Record `out` as the artifact-level staging hint keyed by
-            // the layer's digest. See `Config::path_hints`.
+            // Associate the staging path with the layer digest.
             if let Some(hint) = self.out.clone() {
                 artifact
                     .config_mut()
@@ -117,7 +109,6 @@ impl SourceImpl for GitSource {
                     .insert(layer.digest().digest(), hint);
             }
             artifact.layers_mut().push(layer);
-            // Now save the artifact itself
             storage.safe_save(&artifact).await?;
             Ok(artifact.clone())
         }
@@ -128,6 +119,61 @@ impl SourceImpl for GitSource {
             component = "source"
         ))
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn source(out: Option<PathBuf>) -> GitSource {
+        GitSource {
+            url: "https://example.com/repo".into(),
+            reference: "main".into(),
+            out,
+        }
+    }
+
+    #[tokio::test]
+    async fn no_output_path_preserves_the_existing_cache_id() {
+        let id = source(None).get_unique_id().await.unwrap();
+        let expected = Id::builder()
+            .name("https://example.com/repo@main")
+            .digest(base16::encode_lower(Sha256::digest(b"main").as_slice()))
+            .build();
+        assert_eq!(id, expected);
+    }
+
+    #[tokio::test]
+    async fn output_paths_have_distinct_cache_prefixes() {
+        let first = source(Some("src/first".into()))
+            .get_unique_id()
+            .await
+            .unwrap();
+        let second = source(Some("src/second".into()))
+            .get_unique_id()
+            .await
+            .unwrap();
+        assert_eq!(first.name(), "example_com_repo_main_src_first");
+        assert_ne!(first.prefix(), second.prefix());
+        assert_ne!(first.digest(), second.digest());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn non_utf8_output_paths_have_distinct_digests() {
+        use std::os::unix::ffi::OsStringExt;
+        let first = source(Some(std::ffi::OsString::from_vec(vec![0xff]).into()))
+            .get_unique_id()
+            .await
+            .unwrap();
+        let second = source(Some(std::ffi::OsString::from_vec(vec![0xfe]).into()))
+            .get_unique_id()
+            .await
+            .unwrap();
+        let none = source(None).get_unique_id().await.unwrap();
+        assert_ne!(first.digest(), second.digest());
+        assert_ne!(first.digest(), none.digest());
     }
 }
 
