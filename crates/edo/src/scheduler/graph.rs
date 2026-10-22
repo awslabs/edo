@@ -46,7 +46,7 @@ use std::{
     sync::Arc,
 };
 use tempfile::TempDir;
-use tokio::sync::{Mutex, Semaphore, mpsc::channel};
+use tokio::sync::Semaphore;
 use tokio::task::{JoinError, JoinHandle};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
@@ -527,19 +527,21 @@ impl Graph {
         }
 
         // ── Step 4: spawn the worker pool. ────────────────────────────────
-        // Two MPSC channels:
+        // Two flume channels:
         //   - work_tx/work_rx: driver -> workers, carries NodeIndex.
         //   - done_tx/done_rx: workers -> driver, carries (idx, result).
         // Capacities equal `batch_size` so the driver never blocks on send
         // while the pool has free slots.
         //
-        // `work_rx` is wrapped in `Arc<Mutex<_>>` because tokio's MPSC
-        // receiver isn't `Clone`; the lock is held only across `recv()`
-        // and contention is rare (workers are usually busy executing).
-        let (work_tx, work_rx) = channel::<NodeIndex>(self.batch_size as usize);
-        let (done_tx, mut done_rx) =
-            channel::<(NodeIndex, Result<Artifact>)>(self.batch_size as usize);
-        let work_rx = Arc::new(Mutex::new(work_rx));
+        // flume's `Receiver` is `Clone` and MPMC-native, so every worker
+        // can `recv_async().await` in parallel with no shared mutex. The
+        // previous `Arc<Mutex<work_rx>>` briefly serialized worker
+        // wakeups: only one worker could be parked on `recv` at a time,
+        // so a burst of `try_send`s from the driver woke workers one at
+        // a time instead of fanning out.
+        let (work_tx, work_rx) = flume::bounded::<NodeIndex>(self.batch_size as usize);
+        let (done_tx, done_rx) =
+            flume::bounded::<(NodeIndex, Result<Artifact>)>(self.batch_size as usize);
 
         let mut worker_handles: Vec<JoinHandle<Result<()>>> = Vec::new();
         for _ in 0..self.batch_size {
@@ -551,15 +553,9 @@ impl Graph {
             let token = token.clone();
             worker_handles.push(tokio::spawn(async move {
                 loop {
-                    // Briefly hold the receive lock just long enough to
-                    // pull one item — releasing it before the (long-running)
-                    // transform lifecycle so siblings can pick up new work.
-                    let next = {
-                        let mut guard = work_rx.lock().await;
-                        guard.recv().await
-                    };
-                    // `None` means the driver dropped `work_tx`; we're done.
-                    let Some(idx) = next else {
+                    // `Err(RecvError::Disconnected)` means every `work_tx`
+                    // clone has been dropped by the driver; we're done.
+                    let Ok(idx) = work_rx.recv_async().await else {
                         return Ok::<(), error::SchedulerError>(());
                     };
                     let node = graph.index(idx).clone();
@@ -569,7 +565,7 @@ impl Graph {
                             // Vanishingly unlikely (the transform was here
                             // when `add` ran) but report it cleanly anyway.
                             let _ = done_tx
-                                .send((
+                                .send_async((
                                     idx,
                                     error::ProjectTransformSnafu {
                                         addr: node.addr.clone(),
@@ -590,7 +586,7 @@ impl Graph {
                     .await;
                     // If the driver has gone away (done_rx dropped) there's
                     // nobody left to report to — exit quietly.
-                    if done_tx.send((idx, result)).await.is_err() {
+                    if done_tx.send_async((idx, result)).await.is_err() {
                         return Ok::<(), error::SchedulerError>(());
                     }
                 }
@@ -626,6 +622,11 @@ impl Graph {
                 self.graph.index(n).set_running();
                 // `try_send` is infallible here: channel capacity is
                 // `batch_size` and `inflight < batch_size` guarantees space.
+                // flume's `TrySendError::Disconnected` is only reachable if
+                // every receiver clone dropped, which requires every
+                // worker task to have finished — but we've established
+                // above that `inflight < batch_size` and workers only
+                // exit when `work_tx` is dropped (below).
                 work_tx.try_send(n).ok().context(error::InfallableSnafu)?;
                 inflight += 1;
             }
@@ -638,10 +639,15 @@ impl Graph {
                 break;
             }
 
-            // Block on the next completion. `unwrap` is safe because we
-            // hold the original `work_tx`, so `done_tx` clones held by
-            // workers stay alive while there's anything to wait for.
-            let (idx, res) = done_rx.recv().await.context(error::InfallableSnafu)?;
+            // Block on the next completion. `Err(Disconnected)` is
+            // treated as an invariant violation: we still hold the
+            // original `work_tx`, so worker clones of `done_tx` stay
+            // alive while there's anything to wait for.
+            let (idx, res) = done_rx
+                .recv_async()
+                .await
+                .ok()
+                .context(error::InfallableSnafu)?;
             inflight -= 1;
             let node = self.graph.index(idx);
             match res {
