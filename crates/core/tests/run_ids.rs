@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
-use edo::context::{Addr, Context, Element, LogVerbosity, SourceMap};
+use edo::context::{Addr, Context, Element, EventLog, LogVerbosity, SourceMap};
 use edo::scheduler::graph::Graph;
 use edo::storage::ArtifactStageOptions;
 use edo_core::register_core;
@@ -18,6 +18,7 @@ async fn local_source_changes_after_fetch_preserve_staged_and_output_ids() {
         Some(dir.path().join("config.toml")),
         HashMap::new(),
         LogVerbosity::Info,
+        EventLog::Disabled,
     )
     .await
     .unwrap();

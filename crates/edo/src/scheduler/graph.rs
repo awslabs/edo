@@ -17,11 +17,25 @@ use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 use crate::context::{Addr, Context, Handle, IdCache};
+use crate::log::TaskStatus;
 use crate::storage::{Artifact, Id};
 use crate::transform::Transform;
 
 use super::node::Node;
 use super::{Result, error};
+
+/// Lifecycle phase names recorded as the `phase` field of task events.
+mod phase {
+    pub const FETCH: &str = "fetch";
+    pub const FETCHED: &str = "fetched";
+    pub const CREATE_ENV: &str = "create-env";
+    pub const SETUP: &str = "setup";
+    pub const SPIN_UP: &str = "spin-up";
+    pub const STAGE: &str = "stage";
+    pub const EXECUTE: &str = "execute";
+    pub const SPIN_DOWN: &str = "spin-down";
+    pub const CLEAN: &str = "clean";
+}
 
 /// Execution DAG with per-target dependency and dispatch metadata.
 ///
@@ -63,6 +77,12 @@ impl Graph {
         }
     }
 
+    /// Returns the size of the reachable subgraph for `addr`, or 0 if
+    /// `addr` was never added.
+    pub fn subgraph_size(&self, addr: &Addr) -> usize {
+        self.subgraphs.get(addr).map(|s| s.len()).unwrap_or(0)
+    }
+
     /// Adds a transform's dependency subtree, reusing already indexed nodes.
     #[async_recursion]
     async fn add_recursive(&mut self, ctx: &Context, addr: &Addr) -> Result<NodeIndex> {
@@ -70,7 +90,7 @@ impl Graph {
         if let Some(index) = self.index.get_by_left(addr) {
             return Ok(*index);
         }
-        trace!(subsystem = "scheduler", op = "add-node", addr = %addr, "adding execution node");
+        trace!(subsystem = "scheduler", component = "graph", op = "add-node", addr = %addr, "adding execution node");
         let transform = ctx
             .get_transform(addr)
             .context(error::ProjectTransformSnafu { addr: addr.clone() })?;
@@ -80,7 +100,7 @@ impl Graph {
         // Dependency edges are validated for cycles.
         for dep in transform.depends().await? {
             let child = self.add_recursive(ctx, &dep).await?;
-            trace!(subsystem = "scheduler", op = "add-edge", from = %dep, to = %addr, "adding edge");
+            trace!(subsystem = "scheduler", component = "graph", op = "add-edge", from = %dep, to = %addr, "adding edge");
             self.graph
                 .add_edge(child, node_index, format!("{dep}->{addr}"))
                 .context(error::GraphSnafu)?;
@@ -164,6 +184,14 @@ impl Graph {
                 Ok(Some(_)) => {
                     info!("skipped fetch for built entry {}", node.addr);
                     node.set_cache_hit(true);
+                    crate::ui_start_task!(
+                        subsystem = "transform",
+                        component = "scheduler",
+                        op = "fetch";
+                        &node.addr.to_string(),
+                        crate::log::TaskStatus::Cached,
+                        Some("cache-hit".into())
+                    );
                     continue;
                 }
                 Ok(None) => {}
@@ -172,17 +200,46 @@ impl Graph {
                     break 'outer;
                 }
             }
+            crate::ui_start_task!(
+                subsystem = "transform",
+                component = "scheduler",
+                op = "fetch";
+                &node.addr.to_string(),
+                crate::log::TaskStatus::Wait,
+                Some("queued".into())
+            );
 
+            // Skip the spawn when `prepare` has nothing to do (e.g. every
+            // input source is already in the local cache).
             match transform.needs_prepare(&ctx).await {
-                Ok(false) => continue,
+                Ok(false) => {
+                    crate::ui_update_task!(
+                        subsystem = "transform",
+                        component = "scheduler",
+                        op = "fetch";
+                        &node.addr.to_string(),
+                        crate::log::TaskStatus::Wait,
+                        None
+                    );
+                    continue;
+                }
                 Ok(true) => {}
                 Err(e) => {
+                    crate::ui_update_task!(
+                        subsystem = "transform",
+                        component = "scheduler",
+                        op = "fetch";
+                        &node.addr.to_string(),
+                        crate::log::TaskStatus::Failed,
+                        Some(e.to_string())
+                    );
                     sync_error = Some(e.into());
                     break 'outer;
                 }
             }
 
             let task_ctx = ctx.clone();
+            let node_for_task = node.clone();
             let task_token = token.clone();
             let addr_for_task = node.addr.clone();
             // Apply backpressure before spawning.
@@ -196,6 +253,14 @@ impl Graph {
                 Ok(p) => p,
                 Err(e) => {
                     sync_error = Some(e);
+                    crate::ui_update_task!(
+                        subsystem = "transform",
+                        component = "scheduler",
+                        op = "fetch";
+                        &node.addr.to_string(),
+                        crate::log::TaskStatus::Failed,
+                        None
+                    );
                     break 'outer;
                 }
             };
@@ -204,18 +269,51 @@ impl Graph {
                 tokio::spawn(async move {
                     if task_token.is_cancelled() {
                         drop(permit);
+                        crate::ui_update_task!(
+                            subsystem = "transform",
+                            component = "scheduler",
+                            op = "fetch";
+                            &node_for_task.addr.to_string(),
+                            TaskStatus::Canceled,
+                            None
+                        );
                         return error::CancelledSnafu.fail();
                     }
                     let result: Result<()> = async {
                         let logf = task_ctx.log().create(format!("{id}").as_str()).await?;
                         logf.set_subject("fetch");
+                        crate::ui_update_task!(
+                            subsystem = "transform",
+                            component = "scheduler",
+                            op = "fetch";
+                            &node_for_task.addr.to_string(),
+                            crate::log::TaskStatus::Running,
+                            Some(phase::FETCH.into())
+                        );
                         transform.prepare(&logf, &task_ctx).await?;
-                        info!("pulled sources and artifacts for {}", addr_for_task);
                         Ok(())
                     }
                     .await;
-                    if result.is_err() {
+                    if let Err(e) = &result {
                         task_token.cancel();
+                        crate::ui_update_task!(
+                            subsystem = "transform",
+                            component = "scheduler",
+                            op = "fetch";
+                            &node_for_task.addr.to_string(),
+                            crate::log::TaskStatus::Failed,
+                            Some(e.to_string())
+                        );
+                    } else {
+                        // Not terminal: the build outcome is reported by `run`.
+                        crate::ui_update_task!(
+                            subsystem = "transform",
+                            component = "scheduler",
+                            op = "fetch";
+                            &node_for_task.addr.to_string(),
+                            TaskStatus::Wait,
+                            Some(phase::FETCHED.into())
+                        );
                     }
                     drop(permit);
                     result
@@ -237,12 +335,27 @@ impl Graph {
                 Ok(Err(e)) => {
                     // Exclude peer cancellation from root-cause errors.
                     if !matches!(e, error::SchedulerError::Cancelled) {
-                        error!(%addr, error = %e, "fetch failed");
                         failures.push(e);
                     }
                 }
                 Err(join_err) => {
-                    error!(%addr, error = %join_err, "fetch task failed");
+                    // The task died without reporting a terminal status.
+                    error!(
+                        subsystem = "scheduler",
+                        component = "graph",
+                        op = "fetch",
+                        addr = %addr,
+                        error = %join_err,
+                        "fetch task failed"
+                    );
+                    crate::ui_update_task!(
+                        subsystem = "transform",
+                        component = "scheduler",
+                        op = "fetch";
+                        &addr.to_string(),
+                        TaskStatus::Failed,
+                        Some(join_err.to_string())
+                    );
                     failures.push(error::JoinSnafu.into_error(join_err));
                 }
             }
@@ -259,6 +372,7 @@ impl Graph {
         };
 
         if let Some(e) = final_error {
+            crate::ui_finish_build!();
             return Err(e);
         }
         Ok(())
@@ -278,7 +392,7 @@ impl Graph {
 
         // A cached target requires no dependency execution.
         if root_node.is_cache_hit() {
-            info!("{addr} is already built, skipping...");
+            crate::ui_finish_build!();
             return Ok(());
         }
 
@@ -341,6 +455,14 @@ impl Graph {
                     let transform = match ctx_clone.get(&node.addr) {
                         Some(t) => t,
                         None => {
+                            crate::ui_update_task!(
+                                subsystem = "transform",
+                                component = "scheduler",
+                                op = "execution";
+                                &node.addr,
+                                TaskStatus::Failed,
+                                Some("transform not registered".into())
+                            );
                             let _ = done_tx
                                 .send_async((
                                     idx,
@@ -354,10 +476,16 @@ impl Graph {
                         }
                     };
                     let id = node.id().context(error::InfallableSnafu)?.clone();
+                    let log_name = format!("{id}.log");
                     let result = run_transform_lifecycle(
-                        &ctx_clone, &path_buf, &node, &transform, &id, &token,
+                        &ctx_clone, &path_buf, &node.addr, &transform, &id, &token,
                     )
-                    .instrument(info_span!("transform", subsystem = "scheduler", addr = %node.addr))
+                    .instrument(info_span!(
+                        "transform",
+                        subsystem = "scheduler",
+                        addr = %node.addr,
+                        log = %log_name
+                    ))
                     .await;
                     if done_tx.send_async((idx, result)).await.is_err() {
                         return Ok::<(), error::SchedulerError>(());
@@ -428,7 +556,17 @@ impl Graph {
                 }
                 Err(e) => {
                     // Preserve the first failure and drain in-flight work.
-                    error!(subsystem = "scheduler", addr = %node.addr, "{} failed: {e}", node.addr);
+                    // The lifecycle already reported the terminal status.
+                    if !matches!(e, error::SchedulerError::Cancelled) {
+                        crate::ui_error!(
+                            subsystem = "transform",
+                            component = "scheduler",
+                            op = "execution",
+                            id = node.addr;
+                            "{} failed: {e}",
+                            node.addr
+                        );
+                    }
                     node.set_failed();
                     if first_error.is_none() {
                         first_error = Some(e);
@@ -458,12 +596,15 @@ impl Graph {
 
         // Report the root failure before peer cancellation.
         if let Some(e) = first_error {
+            crate::ui_finish_build!();
             return Err(e);
         }
         if token.is_cancelled() {
+            crate::ui_finish_build!();
             return error::CancelledSnafu.fail();
         }
 
+        crate::ui_finish_build!();
         Ok(())
     }
 }
@@ -491,94 +632,129 @@ async fn next_completion(
     }
 }
 
-/// Runs one transform, checking cancellation between stages and tearing down after spinup.
+/// Runs one transform and reports its terminal task status.
+///
+/// This is the only place an execution task's terminal status is emitted,
+/// so every exit path — including early setup failures — produces exactly
+/// one `success` / `failed` / `canceled` record, tagged with the last
+/// stage entered.
 async fn run_transform_lifecycle(
     ctx: &Handle,
     workspace: &Path,
-    node: &Arc<Node>,
+    addr: &Addr,
     transform: &Transform,
     id: &Id,
     token: &CancellationToken,
 ) -> Result<Artifact> {
+    let mut reached = phase::CREATE_ENV;
+    let outcome =
+        drive_transform_lifecycle(ctx, workspace, addr, transform, id, token, &mut reached).await;
+    let status = match &outcome {
+        Ok(_) => TaskStatus::Success,
+        Err(error::SchedulerError::Cancelled) => TaskStatus::Canceled,
+        Err(_) => TaskStatus::Failed,
+    };
+    crate::ui_update_task!(
+        subsystem = "transform",
+        component = "scheduler",
+        op = "execution";
+        addr,
+        status,
+        Some(reached.into())
+    );
+    outcome
+}
+
+/// Runs the transform's stages, checking cancellation between them and
+/// tearing down after spinup. `reached` tracks the last stage entered;
+/// teardown does not update it, so it names the stage the outcome came
+/// from.
+async fn drive_transform_lifecycle(
+    ctx: &Handle,
+    workspace: &Path,
+    addr: &Addr,
+    transform: &Transform,
+    id: &Id,
+    token: &CancellationToken,
+    reached: &mut &'static str,
+) -> Result<Artifact> {
+    let task_id = addr.to_string();
+    let task_id = task_id.as_str();
     // Remove scratch data on return.
     let temp = TempDir::new_in(workspace).context(error::TemporaryDirectorySnafu)?;
     let logf = ctx.log().create(format!("{id}").as_str()).await?;
 
     logf.set_subject("create-environment");
+    enter_phase(task_id, reached, phase::CREATE_ENV);
     let env_addr = transform.environment().await?;
     let environment = ctx
         .create_environment(&logf, &env_addr, temp.path())
         .instrument(info_span!(
             "env-create",
             subsystem = "environment",
-            addr = %node.addr
+            addr = %addr
         ))
         .await?;
-
-    if token.is_cancelled() {
-        return error::CancelledSnafu.fail();
-    }
+    ensure_not_cancelled(token)?;
 
     logf.set_subject("setup-environment");
-    environment
-        .setup(&logf, ctx.storage())
-        .instrument(info_span!(
-            "env-setup",
-            subsystem = "environment",
-            addr = %node.addr
-        ))
-        .await?;
-
-    if token.is_cancelled() {
-        return error::CancelledSnafu.fail();
-    }
+    enter_phase(task_id, reached, phase::SETUP);
+    environment.setup(&logf, ctx.storage()).await?;
+    ensure_not_cancelled(token)?;
 
     logf.set_subject("spinup environment");
+    enter_phase(task_id, reached, phase::SPIN_UP);
     environment.up(&logf).await?;
 
     // Every outcome after spinup must pass through teardown.
     let outcome: Result<Artifact> = async {
-        if token.is_cancelled() {
-            return error::CancelledSnafu.fail();
-        }
+        ensure_not_cancelled(token)?;
         logf.set_subject("staging");
-        transform
-            .stage(&logf, ctx, &environment)
-            .instrument(info_span!(
-                "transform-stage",
-                subsystem = "transform",
-                addr = %node.addr
-            ))
-            .await?;
+        enter_phase(task_id, reached, phase::STAGE);
+        transform.stage(&logf, ctx, &environment).await?;
 
-        if token.is_cancelled() {
-            return error::CancelledSnafu.fail();
-        }
+        ensure_not_cancelled(token)?;
         logf.set_subject("execution");
-        super::execute::execute(&logf, ctx, transform, &environment).await
+        enter_phase(task_id, reached, phase::EXECUTE);
+        super::execute::execute(&logf, ctx, addr, transform, &environment).await
     }
     .await;
 
     // Teardown failures must not replace the build outcome.
     logf.set_subject("spindown environment");
+    report_running(task_id, phase::SPIN_DOWN);
     let _ = environment.down(&logf).await;
-    logf.set_subject("clean environment");
-    let _ = environment
-        .clean(&logf)
-        .instrument(info_span!("env-clean", subsystem = "environment", addr = %node.addr))
-        .await;
 
-    drop(logf);
-    match outcome {
-        Ok(artifact) => {
-            info!("transformation complete");
-            Ok(artifact)
-        }
-        Err(e) => {
-            error!("transformation failed: {e}");
-            Err(e)
-        }
+    logf.set_subject("clean environment");
+    report_running(task_id, phase::CLEAN);
+    let _ = environment.clean(&logf).await;
+
+    outcome
+}
+
+/// Records `phase` as the last stage entered and reports it as running.
+fn enter_phase(task_id: &str, reached: &mut &'static str, phase: &'static str) {
+    *reached = phase;
+    report_running(task_id, phase);
+}
+
+/// Reports `phase` as the running stage of execution task `task_id`.
+fn report_running(task_id: &str, phase: &'static str) {
+    crate::ui_update_task!(
+        subsystem = "transform",
+        component = "scheduler",
+        op = "execution";
+        task_id,
+        TaskStatus::Running,
+        Some(phase.into())
+    );
+}
+
+fn ensure_not_cancelled(token: &CancellationToken) -> Result<()> {
+    if token.is_cancelled() {
+        return error::CancelledSnafu.fail();
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -649,7 +825,7 @@ pub(crate) mod tests {
     /// Returns the shared context, or `None` if tracing is already initialized elsewhere.
     pub(crate) async fn try_shared_context() -> Option<Context> {
         if let Some((ctx, _)) = SHARED.get() {
-            return Some(ctx.clone());
+            return Some(ctx.clone().with_fresh_cancellation_for_test());
         }
         let dir = TempDir::new().expect("tempdir");
         match Context::init::<&Path, &Path>(
@@ -657,12 +833,19 @@ pub(crate) mod tests {
             None,
             HashMap::new(),
             LogVerbosity::Info,
+            crate::context::EventLog::Disabled,
         )
         .await
         {
             Ok(ctx) => {
                 let _ = SHARED.set((ctx.clone(), Arc::new(dir)));
-                Some(SHARED.get().map(|(c, _)| c.clone()).unwrap_or(ctx))
+                Some(
+                    SHARED
+                        .get()
+                        .map(|(c, _)| c.clone())
+                        .unwrap_or(ctx)
+                        .with_fresh_cancellation_for_test(),
+                )
             }
             Err(crate::context::ContextError::Log { .. }) => None,
             Err(e) => panic!("unexpected Context::init error: {e}"),
@@ -1281,7 +1464,7 @@ pub(crate) mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial_test::serial(log_manager)]
-    async fn graph_fetch_failure_cancels_peers() {
+    async fn graph_fetch_failure_emits_build_finished_and_cancels_peers() {
         let ctx = ctx_or_skip!();
         ensure_default_farm(&ctx);
 
@@ -1302,6 +1485,7 @@ pub(crate) mod tests {
         register_mock_no_prepare(&ctx, "//gfail/reversed", &["//gfail/slow", "//gfail/fail"]);
 
         for root in ["//gfail/root", "//gfail/reversed"] {
+            let ctx = ctx.clone().with_fresh_cancellation_for_test();
             let mut g = Graph::new(4);
             g.add(&ctx, &Addr::parse(root).unwrap()).await.unwrap();
             let err = g.fetch(&ctx).await.expect_err("fetch must fail");

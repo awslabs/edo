@@ -154,6 +154,10 @@ impl Inner {
     pub async fn run(&self, ctx: &Context, addr: &Addr) -> Result<()> {
         let mut graph = Graph::new(self.workers);
         graph.add(ctx, addr).await?;
+
+        // Must precede `fetch` so it precedes task-start events.
+        crate::ui_start_build!(&addr.to_string(), graph.subgraph_size(addr));
+
         graph.fetch(ctx).await?;
         let graph_ref = Arc::new(graph);
         graph_ref.run(&self.path, ctx, addr).await?;

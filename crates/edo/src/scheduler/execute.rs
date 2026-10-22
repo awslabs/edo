@@ -1,7 +1,7 @@
 //! Interactive transform executor with error recovery.
 //!
-//! Handles running a single transform, catching failures, and prompting the
-//! user with options to view logs, retry, open a shell, or abort.
+//! Handles running a single transform, catching failures, and prompting
+//! the user with options to view logs, retry, open a shell, or abort.
 
 use super::{Result, error};
 use crate::{
@@ -13,16 +13,32 @@ use crate::{
 use dialoguer::{Editor, Select};
 use snafu::ResultExt;
 use std::fs::read_to_string;
-use tracing_indicatif::suspend_tracing_indicatif;
+
+/// Runs a blocking prompt without pinning a multi-thread runtime worker.
+fn run_blocking<F, R>(f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    use tokio::runtime::{Handle, RuntimeFlavor};
+    match Handle::try_current().map(|handle| handle.runtime_flavor()) {
+        Ok(RuntimeFlavor::MultiThread) => tokio::task::block_in_place(f),
+        _ => f(),
+    }
+}
 
 /// Executes a transform with interactive error recovery.
 ///
 /// Runs the given transform within the provided environment. On failure,
-/// prompts the user with options to view logs, retry, open a shell, or quit.
+/// prompts the user with `view log` / `retry` / `shell` / `quit` options
+/// via the `dialoguer` crate. The prompt runs under
+/// [`LogManager::prompt`](crate::context::LogManager::prompt), which
+/// gives it exclusive ownership of the terminal while the remaining
+/// transforms keep running.
 /// On success, uploads the resulting artifact to the build cache.
 pub async fn execute(
     log: &Log,
     ctx: &Handle,
+    addr: &crate::context::Addr,
     transform: &Transform,
     env: &Environment,
 ) -> Result<Artifact> {
@@ -32,17 +48,21 @@ pub async fn execute(
         // Make an attempt
         let attempt_result = transform.transform(log, ctx, env).await;
         match &attempt_result {
-            // If the attempt was successful exit out and return the resulting artifact
             TransformStatus::Success(artifact) => {
                 result = Ok(artifact.clone());
                 break 'transform;
             }
-            // If the attempt failed for any reason we need to prompt the user what
-            // we should do about it.
             TransformStatus::Retryable(log_file, e) | TransformStatus::Failed(log_file, e) => {
-                error!(target: "transform", "transformation failed: {}", e.to_string());
-                // Collect the valid options to present the user with
-                let mut options = Vec::new();
+                crate::ui_error!(
+                    subsystem = "transform",
+                    component = "scheduler",
+                    op = "execution",
+                    id = addr;
+                    "transformation failed: {}",
+                    e.to_string()
+                );
+
+                let mut options: Vec<&'static str> = Vec::new();
                 if log_file.is_some() {
                     options.push("view log");
                 }
@@ -53,47 +73,46 @@ pub async fn execute(
                     options.push("shell");
                 }
                 options.push("quit");
-                // IMPORTANT! We need to susppend our progress bars to ask the
-                // user for what to do.
-                let should_quit = suspend_tracing_indicatif(|| {
-                    // Acquire an exclusive lock on the console through
-                    // the log manager
-                    let console_lock = ctx.log().acquire();
-                    'prompt: loop {
-                        let index = Select::new()
-                            .items(options.as_slice())
-                            .default(0)
-                            .interact()
-                            .context(error::InquireSnafu)?;
-                        let ans = options[index];
-                        match ans {
-                            "view log" => {
-                                let log_text =
-                                    read_to_string(log_file.as_ref().expect(
+
+                // Hand the terminal to the prompt: bar rows are cleared,
+                // bar redraws stop and sibling log lines are buffered
+                // until `Select` is done, so nothing interleaves onto
+                // stderr and nothing else reads the keyboard. Sibling
+                // transforms keep running throughout — `block_in_place`
+                // releases this tokio worker so their tasks are not
+                // starved while we wait on the user.
+                let should_quit = run_blocking(|| {
+                    ctx.log().prompt(|| {
+                        'prompt: loop {
+                            let index = Select::new()
+                                .items(options.as_slice())
+                                .default(0)
+                                .interact()
+                                .context(error::InquireSnafu)?;
+                            match options[index] {
+                                "view log" => {
+                                    let log_text = read_to_string(log_file.as_ref().expect(
                                         "log_file is Some when 'view log' option is present",
                                     ))
                                     .context(error::IoSnafu)?;
-                                Editor::new().edit(&log_text).context(error::InquireSnafu)?;
-                                continue 'prompt;
-                            }
-                            "shell" => {
-                                transform.shell(env)?;
-                                continue 'prompt;
-                            }
-                            "retry" => {
-                                return Ok(false);
-                            }
-                            "quit" => {
-                                ctx.cancellation().cancel();
-                                break 'prompt;
-                            }
-                            _ => {
-                                return Ok(false);
+                                    Editor::new().edit(&log_text).context(error::InquireSnafu)?;
+                                    continue 'prompt;
+                                }
+                                "shell" => {
+                                    transform.shell(env)?;
+                                    continue 'prompt;
+                                }
+                                "retry" => {
+                                    break 'prompt Ok::<bool, error::SchedulerError>(false);
+                                }
+                                "quit" => {
+                                    ctx.cancellation().cancel();
+                                    break 'prompt Ok(true);
+                                }
+                                _ => break 'prompt Ok(true),
                             }
                         }
-                    }
-                    drop(console_lock);
-                    Ok::<bool, error::SchedulerError>(true)
+                    })
                 })?;
                 if should_quit {
                     result = error::PassthroughSnafu {
@@ -102,6 +121,7 @@ pub async fn execute(
                     .fail();
                     break 'transform;
                 }
+                continue 'transform;
             }
         }
     }
@@ -119,14 +139,8 @@ pub async fn execute(
 mod tests {
     //! Tests for `execute`.
     //!
-    //! Scope: success-path only. `TransformStatus::Retryable` and
-    //! `TransformStatus::Failed` both route through `dialoguer::Select::interact`
-    //! which requires an interactive TTY and cannot be driven from a unit
-    //! test without a harness we do not have.
-    //!
-    //! Mocks come from `mockall::automock` on the trait definitions; the
-    //! builders below configure them with the minimal pass-through behavior
-    //! required by `execute`.
+    //! Scope: success-path only. Failure paths drive an interactive
+    //! `dialoguer` prompt, which requires a TTY harness we do not have.
 
     use super::*;
     use crate::context::{Addr, Context, LogVerbosity};
@@ -156,6 +170,7 @@ mod tests {
             None,
             HashMap::new(),
             LogVerbosity::Info,
+            crate::context::EventLog::Disabled,
         )
         .await
         {
@@ -210,7 +225,6 @@ mod tests {
             });
         }
         t.expect_depends().returning(|| Ok(Vec::new()));
-        t.expect_needs_prepare().returning(|_ctx| Ok(true));
         t.expect_prepare().returning(|_, _| Ok(()));
         t.expect_stage().returning(|_, _, _| Ok(()));
         {
@@ -250,9 +264,15 @@ mod tests {
         let env = farm.create(&log, Path::new("/")).await.expect("env");
         let transform = success_transform("deadbeef");
 
-        let artifact = execute(&log, &handle, &transform, &env)
-            .await
-            .expect("execute success");
+        let artifact = execute(
+            &log,
+            &handle,
+            &Addr::parse("//exec/test").unwrap(),
+            &transform,
+            &env,
+        )
+        .await
+        .expect("execute success");
         assert_eq!(artifact.config().id().digest(), "deadbeef");
         assert_eq!(artifact.config().id().name(), "exec_mock");
     }

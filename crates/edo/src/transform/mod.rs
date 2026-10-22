@@ -120,8 +120,8 @@ macro_rules! transform_err {
         match $expr {
             Ok(data) => data,
             Err(e) => {
-                error!("wrapped error occured: {e}");
-                return TransformStatus::Failed(None, e.into());
+                $crate::__tracing::debug!(subsystem = "transform", "wrapped error occurred: {e}");
+                return $crate::transform::TransformStatus::Failed(None, e.into());
             }
         }
     };

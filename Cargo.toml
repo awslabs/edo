@@ -44,7 +44,7 @@ handlebars           = "6.4"
 home                 = "0.5"
 indexmap             = "2.14"
 indicatif            = "0.18"
-jiff                 = "0.2"
+jiff                 = { version = "0.2", features = ["serde"] }
 keyring              = "4.2"
 merkle_hash          = "3.9"
 mockall              = "0.15"
@@ -54,7 +54,6 @@ os_pipe              = "1.2"
 owo-colors           = { version = "4.4", features = ["supports-colors"] }
 parking_lot          = { version = "0.13", features = ["send_guard"] }
 predicates           = "3"
-rand                 = "0.10"
 rayon                = "1.12"
 regex                = "1.13"
 reqwest              = { version = "0.13", default-features = false, features = ["json", "stream"] }
@@ -71,8 +70,8 @@ tokio                = { version = "1", features = ["full", "parking_lot", "rt-m
 tokio-util           = "0.7"
 toml                 = "1"
 tracing              = "0.1"
-tracing-indicatif    = { version = "0.3" }
-tracing-subscriber   = { version = "0.3", features = ["env-filter"] }
+tracing-appender     = "0.2"
+tracing-subscriber   = { version = "0.3", features = ["env-filter", "json"] }
 url                  = { version = "2.5", features = ["serde"] }
 uuid                 = { version = "1", features = ["v7"] }
 which                = "8"

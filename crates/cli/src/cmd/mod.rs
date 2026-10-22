@@ -21,6 +21,7 @@ use crate::Result;
 
 pub async fn create_context(
     args: &Args,
+    target: Option<&str>,
     variables: HashMap<String, String>,
     locked: bool,
 ) -> Result<Context> {
@@ -31,14 +32,32 @@ pub async fn create_context(
     } else {
         LogVerbosity::Info
     };
+    // Only argument names are recorded: values may carry secrets and the
+    // header is persisted to the event log.
+    let mut arg_keys: Vec<String> = variables.keys().cloned().collect();
+    arg_keys.sort_unstable();
     let ctx = Context::init_with_cancellation(
         args.storage.clone(),
         args.config.clone(),
         variables,
         verbosity,
+        args.event_log.clone(),
         args.cancellation.clone(),
     )
     .await?;
+    // Emitted before project loading so every session records which `edo` produced it.
+    let tool = env!("CARGO_PKG_NAME");
+    let version = env!("CARGO_PKG_VERSION");
+    if let Some(target) = target {
+        edo::header!(
+            tool = tool,
+            version = version,
+            target = target,
+            arg_keys = arg_keys
+        );
+    } else {
+        edo::header!(tool = tool, version = version, arg_keys = arg_keys);
+    }
     // Register all core component handlers
     register_core(&ctx);
     // Register a local farm in the project directory

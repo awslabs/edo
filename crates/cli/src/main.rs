@@ -1,5 +1,6 @@
 use clap::Parser;
 use cmd::{Checkout, List, Prune, Run, Update};
+use edo::context::LogManager;
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -62,6 +63,11 @@ pub struct Args {
     config: Option<PathBuf>,
     #[arg(short, long)]
     storage: Option<PathBuf>,
+    /// Path to the JSONL structured log. Pass `none` to disable, `default`
+    /// to write to `<storage>/logs/edo.jsonl`, or any other value as an
+    /// explicit path.
+    #[arg(long, default_value = "default")]
+    event_log: edo::context::EventLog,
     #[clap(subcommand)]
     command: Commands,
     #[arg(skip)]
@@ -90,6 +96,7 @@ async fn main() -> Result<()> {
         }
         sigint_token.cancel();
         if tokio::signal::ctrl_c().await.is_ok() {
+            LogManager::shutdown();
             std::process::exit(130);
         }
     });
@@ -108,7 +115,9 @@ async fn main() -> Result<()> {
             Commands::List(cmd) => cmd.run(args.clone()).await,
         }
     };
-    run_cancellable(command, &args.cancellation, grace).await
+    let result = run_cancellable(command, &args.cancellation, grace).await;
+    LogManager::shutdown();
+    result
 }
 
 async fn run_cancellable(

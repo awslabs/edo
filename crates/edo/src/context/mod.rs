@@ -98,12 +98,21 @@ impl Context {
         config: Option<ConfigPath>,
         args: HashMap<String, String>,
         verbosity: LogVerbosity,
+        event_log: EventLog,
     ) -> ContextResult<Self>
     where
         ProjectPath: AsRef<Path>,
         ConfigPath: AsRef<Path>,
     {
-        Self::init_with_cancellation(path, config, args, verbosity, CancellationToken::new()).await
+        Self::init_with_cancellation(
+            path,
+            config,
+            args,
+            verbosity,
+            event_log,
+            CancellationToken::new(),
+        )
+        .await
     }
 
     /// Initializes a context with an explicit session cancellation token.
@@ -112,6 +121,7 @@ impl Context {
         config: Option<ConfigPath>,
         args: HashMap<String, String>,
         verbosity: LogVerbosity,
+        event_log: EventLog,
         cancellation: CancellationToken,
     ) -> ContextResult<Self>
     where
@@ -129,10 +139,29 @@ impl Context {
         }
         // Isolate logs per workspace.
         let log_path = path.join("logs");
-        let log = LogManager::init(&log_path, verbosity).await?;
+        let log = LogManager::init(&log_path, verbosity, event_log).await?;
+        debug!(
+            subsystem = "context",
+            component = "project",
+            op = "init",
+            "determined project edo target path to be: {path:?}",
+        );
         // Load the configuration
         let config = Config::load(config).await?;
+        debug!(
+            subsystem = "context",
+            component = "project",
+            op = "init",
+            "loaded edo configuration"
+        );
+
         // Initialize the storage with the default local cache
+        debug!(
+            subsystem = "context",
+            component = "project",
+            op = "init",
+            "initializing edo-local-cache and storage engine"
+        );
         let local_backend_addr = Addr::parse("//edo-local-cache")?;
         let storage = Storage::init(&Backend::new(
             LocalBackend::new(
@@ -269,9 +298,12 @@ impl Context {
     /// based on the address.
     pub async fn add_cache(&self, addr: &Addr, element: &Element) -> ContextResult<()> {
         debug!(
-            section = "context",
-            component = "context",
-            "adding a storage backend {addr}"
+            subsystem = "context",
+            component = "project",
+            op = "add-cache",
+            addr = %addr,
+            kind = %element.kind,
+            "adding a storage backend"
         );
         let backend = if element.kind == "local" || element.kind == "edo:local" {
             Backend::new(LocalBackend::new(element, self.config()).await?)
@@ -294,10 +326,12 @@ impl Context {
     /// Creates and registers a transform from the given node using the appropriate plugin.
     pub async fn add_transform(&self, element: &Element) -> ContextResult<()> {
         debug!(
-            section = "context",
-            component = "context",
-            "adding a transform {}",
-            element.addr,
+            subsystem = "context",
+            component = "project",
+            op = "add-transform",
+            addr = %element.addr,
+            kind = %element.kind,
+            "adding a transform"
         );
         self.transforms.insert(
             element.addr.clone(),
@@ -324,10 +358,12 @@ impl Context {
     /// Creates and registers an environment farm from the given node using the appropriate plugin.
     pub async fn add_farm(&self, element: &Element) -> ContextResult<()> {
         debug!(
-            section = "context",
-            component = "context",
-            "adding a farm {}",
-            element.addr,
+            subsystem = "context",
+            component = "project",
+            op = "add-farm",
+            addr = %element.addr,
+            kind = %element.kind,
+            "adding a farm"
         );
         self.farms.insert(
             element.addr.clone(),
@@ -339,10 +375,12 @@ impl Context {
     /// Creates a source fetcher from the given node using the appropriate plugin.
     pub async fn add_source(&self, element: &Element) -> ContextResult<Source> {
         debug!(
-            section = "context",
-            component = "context",
-            "adding a source {}",
-            element.addr,
+            subsystem = "context",
+            component = "project",
+            op = "add-source",
+            addr = %element.addr,
+            kind = %element.kind,
+            "adding a source"
         );
         let result = self.registry().source(element, self).await?;
         Ok(result)
@@ -350,6 +388,14 @@ impl Context {
 
     /// Creates a dependency vendor from the given node using the appropriate plugin.
     pub async fn add_vendor(&self, element: &Element) -> ContextResult<Vendor> {
+        debug!(
+            subsystem = "context",
+            component = "project",
+            op = "add-vendor",
+            addr = %element.addr,
+            kind = %element.kind,
+            "adding a vendor"
+        );
         let result = self.registry().vendor(element, self).await?;
         Ok(result)
     }
@@ -363,15 +409,50 @@ impl Context {
         // Run the initial setup for environments
         let log = self.log.create("setup").await?;
         log.set_subject("environment-setup");
+
+        let total = self.farms.len();
+        crate::ui_info!(
+            subsystem  = "context",
+            component = "project",
+            op = "setup-environment";
+            "setting up {total} environment(s)"
+        );
+
         for entry in self.farms.iter() {
-            entry
+            let addr = entry.key().clone();
+            let id = addr.to_string();
+            crate::ui_start_task!(
+                subsystem = "context",
+                component = "project",
+                op = "setup-environment";
+                &id,
+                crate::log::TaskStatus::Running,
+                None
+            );
+            let result = entry
                 .setup(&log, self.storage())
                 .instrument(info_span!(
-                    target: "context",
-                    "setting up environment",
-                    addr = entry.key().to_string()
+                    "env-setup",
+                    subsystem = "environment",
+                    addr = %addr
                 ))
-                .await?;
+                .await;
+            let status = if result.is_ok() {
+                crate::log::TaskStatus::Success
+            } else {
+                crate::log::TaskStatus::Failed
+            };
+            crate::ui_update_task!(
+                subsystem = "context",
+                component = "project",
+                op = "setup-environment";
+                &id,
+                status,
+                None
+            );
+            if let Err(e) = result {
+                return Err(e.into());
+            }
         }
         Ok(())
     }
@@ -386,6 +467,12 @@ impl Context {
 
 #[cfg(test)]
 impl Context {
+    /// Give each test an independent session while retaining shared logging.
+    pub(crate) fn with_fresh_cancellation_for_test(mut self) -> Self {
+        self.cancellation = CancellationToken::new();
+        self
+    }
+
     /// Inserts a test transform without the plugin registry.
     pub(crate) fn insert_transform_for_test(&self, addr: &Addr, transform: Transform) {
         self.transforms.insert(addr.clone(), transform);
@@ -418,6 +505,7 @@ mod tests {
             None,
             HashMap::new(),
             LogVerbosity::Info,
+            EventLog::Disabled,
         )
         .await
         {

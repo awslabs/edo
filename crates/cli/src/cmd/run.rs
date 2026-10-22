@@ -18,6 +18,7 @@ impl Run {
     pub async fn run(&self, args: Args) -> Result<()> {
         let ctx = super::create_context(
             &args,
+            Some(self.addr.as_str()),
             self.args
                 .clone()
                 .map(HashMap::from_iter)

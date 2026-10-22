@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use edo::context::{Addr, Context, Element, IdCache, LogVerbosity};
+use edo::context::{Addr, Context, Element, EventLog, IdCache, LogVerbosity};
 use edo::source::SourceError;
 use edo_core::register_core;
 use serde_json::json;
@@ -19,6 +19,7 @@ async fn local_source_edited_between_hash_and_fetch_is_rejected() {
         Some(dir.path().join("config.toml")),
         HashMap::new(),
         LogVerbosity::Info,
+        EventLog::Disabled,
     )
     .await
     .unwrap();
