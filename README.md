@@ -59,6 +59,14 @@ Prebuilt binaries for major platforms are available on the [releases page](https
 
 _TODO: Create this section_
 
+### Cancellation
+
+Ctrl+C cancels the current command. Builds have up to five seconds to finish
+cooperative teardown; other commands stop immediately. A second Ctrl+C exits
+with code 130 without cleanup. Forced exit or an expired teardown deadline can
+leave containers and temporary workspaces behind; forced exit can also interrupt
+cache writes.
+
 ## Architecture
 
 Edo is built on four core components that work together to provide a flexible, reproducible build experience:

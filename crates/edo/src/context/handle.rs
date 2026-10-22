@@ -1,9 +1,4 @@
-//! Read-only handle passed to transforms during execution.
-//!
-//! A [`Handle`] is a snapshot of the build context that gives transforms
-//! access to logging, storage, other transforms, environment farms, and
-//! command-line arguments without holding a reference to the full
-//! [`Context`](super::Context).
+//! Read-only build context snapshots for transforms.
 
 use super::{Addr, ContextResult, Log, LogManager, error};
 use crate::{
@@ -51,8 +46,7 @@ impl IdCache {
     }
 }
 
-/// A handle is passed to transforms where it needs to look up
-/// things in the transform state.
+/// Transform access to build configuration and registered components.
 #[derive(Clone)]
 pub struct Handle {
     log: LogManager,
@@ -62,10 +56,7 @@ pub struct Handle {
     farms: HashMap<Addr, Farm>,
     args: HashMap<String, String>,
     cancellation: CancellationToken,
-    /// Optional per-run id memoization. `None` for handles created outside
-    /// a scheduler run (e.g. `update`, `list`, ad-hoc tooling). The
-    /// scheduler attaches a fresh cache via [`Handle::with_id_cache`] at
-    /// the start of every run.
+    /// Optional per-run id memoization.
     id_cache: Option<IdCache>,
 }
 
@@ -74,6 +65,8 @@ unsafe impl Sync for Handle {}
 
 impl Handle {
     /// Creates a new `Handle` with the given components.
+    ///
+    /// Share `cancellation` within a session; use a fresh token for independent callers.
     pub fn new(
         log: LogManager,
         config: Config,
@@ -81,6 +74,7 @@ impl Handle {
         transforms: HashMap<Addr, Transform>,
         farms: HashMap<Addr, Farm>,
         args: HashMap<String, String>,
+        cancellation: CancellationToken,
     ) -> Self {
         Self {
             log,
@@ -89,17 +83,12 @@ impl Handle {
             transforms,
             farms,
             args,
-            cancellation: CancellationToken::new(),
+            cancellation,
             id_cache: None,
         }
     }
 
-    /// Returns a clone of this handle with the given [`IdCache`] attached.
-    ///
-    /// Callers (the scheduler) use this to bind a fresh cache to the
-    /// handle for the duration of one run. The cache is reachable from
-    /// transforms via [`Handle::id_cache`] so they can memoize recursive
-    /// dependency-id lookups.
+    /// Attaches the given per-run id cache.
     pub fn with_id_cache(mut self, cache: IdCache) -> Self {
         self.id_cache = Some(cache);
         self
@@ -118,6 +107,12 @@ impl Handle {
     /// Returns the cancellation token
     pub fn cancellation(&self) -> CancellationToken {
         self.cancellation.clone()
+    }
+
+    /// Replaces this handle's token without changing the session token.
+    pub(crate) fn with_cancellation(mut self, cancellation: CancellationToken) -> Self {
+        self.cancellation = cancellation;
+        self
     }
 
     /// Returns a reference to the log manager.
@@ -220,6 +215,7 @@ mod tests {
             HashMap::new(),
             HashMap::new(),
             HashMap::new(),
+            tokio_util::sync::CancellationToken::new(),
         );
 
         assert!(handle.transforms().is_empty());
@@ -240,6 +236,7 @@ mod tests {
             HashMap::new(),
             HashMap::new(),
             HashMap::new(),
+            tokio_util::sync::CancellationToken::new(),
         );
         let mut mock = MockSourceImpl::new();
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -280,6 +277,7 @@ mod tests {
             HashMap::new(),
             HashMap::new(),
             HashMap::new(),
+            tokio_util::sync::CancellationToken::new(),
         )
         .with_id_cache(IdCache::new());
         let id = Id::builder().name("source").digest("a".repeat(64)).build();
@@ -321,6 +319,7 @@ mod tests {
             HashMap::new(),
             HashMap::new(),
             HashMap::new(),
+            tokio_util::sync::CancellationToken::new(),
         )
         .with_id_cache(IdCache::new());
         let memoized = Id::builder().name("source").digest("a".repeat(64)).build();
@@ -362,6 +361,7 @@ mod tests {
             HashMap::new(),
             HashMap::new(),
             HashMap::new(),
+            tokio_util::sync::CancellationToken::new(),
         );
 
         let log_path = dir.path().join("test.log");
@@ -371,8 +371,7 @@ mod tests {
 
         let result = handle.create_environment(&log, &addr, &env_path).await;
 
-        // `Environment` doesn't implement Debug so we can't call unwrap_err();
-        // match the result manually instead.
+        // Match manually because `Environment` lacks `Debug`.
         match result {
             Err(ContextError::NoEnvironmentFound { .. }) => {}
             Err(other) => panic!("expected NoEnvironmentFound, got: {other:?}"),

@@ -31,11 +31,12 @@ pub async fn create_context(
     } else {
         LogVerbosity::Info
     };
-    let ctx = Context::init(
+    let ctx = Context::init_with_cancellation(
         args.storage.clone(),
         args.config.clone(),
         variables,
         verbosity,
+        args.cancellation.clone(),
     )
     .await?;
     // Register all core component handlers
@@ -50,7 +51,7 @@ pub async fn create_context(
             .build(),
     )
     .await?;
-    // Now load the current project
+    // Load the current project.
     ctx.load_project(locked).await?;
     Ok(ctx)
 }

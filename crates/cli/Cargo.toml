@@ -17,4 +17,5 @@ edo-core          = { path = "../core" }
 mockall           = { workspace = true }
 snafu             = { workspace = true }
 tokio             = { workspace = true }
+tokio-util        = { workspace = true }
 tracing           = { workspace = true }

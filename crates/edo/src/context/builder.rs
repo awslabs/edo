@@ -479,6 +479,7 @@ mod tests {
             farms: Arc::default(),
             transforms: Arc::default(),
             args: HashMap::default(),
+            cancellation: tokio_util::sync::CancellationToken::new(),
         };
         let calls = Arc::new(AtomicUsize::new(0));
         let count = calls.clone();

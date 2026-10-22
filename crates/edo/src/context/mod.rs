@@ -1,22 +1,4 @@
-//! Build context — the central coordinator for an edo build session.
-//!
-//! The [`Context`] struct ties together configuration, storage, logging,
-//! scheduling, plugins, transforms, and environment farms. It is created
-//! once per invocation via [`Context::init`] and threaded through the
-//! entire build pipeline.
-//!
-//! Sub-modules provide supporting types:
-//! - Addressing — hierarchical [`Addr`] identifiers
-//! - Configuration — user-level [`Config`] loaded from `~/.config/edo.toml`
-//! - Errors — [`ContextError`] and the [`ContextResult`] alias
-//! - Handle — read-only [`Handle`] passed to transforms
-//! - Lock — dependency lock file ([`Lock`])
-//! - Logging — per-task [`Log`] files and [`LogManager`] tracing setup
-//! - Element — [`Element`] plus the [`FromElement`] / [`FromElementNoContext`]
-//!   conversion traits
-//! - Schema — typed `edo.toml` deserialization ([`Schema`], [`Element`])
-//! - Registry — plugin handler registry ([`Registry`], [`Handler`])
-//! - Builder — project loading and dependency resolution ([`Project`])
+//! Build configuration, component registration, and session coordination.
 
 use super::{
     environment::Farm,
@@ -33,6 +15,7 @@ use std::env::current_dir;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::fs::create_dir_all;
+use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 mod address;
@@ -79,11 +62,7 @@ type ArcMap<K, V> = Arc<DashMap<K, V>>;
 /// Default subdirectory name for edo's working data (`.edo`).
 const DEFAULT_PATH: &str = ".edo";
 
-/// Central coordinator for an edo build session.
-///
-/// Holds references to configuration, storage, logging, scheduling, and all
-/// registered plugins, transforms, and environment farms. Created once via
-/// [`Context::init`] and shared (via `Clone`) throughout the build.
+/// Shared state for a build session.
 #[derive(Clone)]
 pub struct Context {
     /// Project directory
@@ -104,6 +83,8 @@ pub struct Context {
     farms: ArcMap<Addr, Farm>,
     /// Command Line Arguments
     args: HashMap<String, String>,
+    /// User cancellation shared across handles.
+    cancellation: CancellationToken,
 }
 
 unsafe impl Send for Context {}
@@ -122,6 +103,21 @@ impl Context {
         ProjectPath: AsRef<Path>,
         ConfigPath: AsRef<Path>,
     {
+        Self::init_with_cancellation(path, config, args, verbosity, CancellationToken::new()).await
+    }
+
+    /// Initializes a context with an explicit session cancellation token.
+    pub async fn init_with_cancellation<ProjectPath, ConfigPath>(
+        path: Option<ProjectPath>,
+        config: Option<ConfigPath>,
+        args: HashMap<String, String>,
+        verbosity: LogVerbosity,
+        cancellation: CancellationToken,
+    ) -> ContextResult<Self>
+    where
+        ProjectPath: AsRef<Path>,
+        ConfigPath: AsRef<Path>,
+    {
         let project_dir = current_dir().context(error::IoSnafu)?;
         let path = if let Some(path) = path.as_ref() {
             path.as_ref().to_path_buf()
@@ -131,8 +127,7 @@ impl Context {
         if !path.exists() {
             create_dir_all(&path).await.context(error::IoSnafu)?;
         }
-        // Logs should be in a project specific folder, so they
-        // do not clash with other project workspaces.
+        // Isolate logs per workspace.
         let log_path = path.join("logs");
         let log = LogManager::init(&log_path, verbosity).await?;
         // Load the configuration
@@ -166,6 +161,7 @@ impl Context {
             scheduler: Scheduler::new(&path.join("env"), &config).await?,
             farms: Arc::new(DashMap::new()),
             transforms: Arc::new(DashMap::new()),
+            cancellation,
         };
         Ok(ctx.clone())
     }
@@ -207,6 +203,7 @@ impl Context {
                 .map(|x| (x.key().clone(), x.value().clone()))
                 .collect(),
             self.args.clone(),
+            self.cancellation.clone(),
         )
     }
 
@@ -227,7 +224,13 @@ impl Context {
                 .map(|x| (x.key().clone(), x.value().clone()))
                 .collect(),
             merged,
+            self.cancellation.clone(),
         )
+    }
+
+    /// Returns the session token for cooperative user cancellation.
+    pub fn cancellation(&self) -> CancellationToken {
+        self.cancellation.clone()
     }
 
     /// Returns a reference to the loaded configuration.
@@ -277,13 +280,10 @@ impl Context {
         };
         let addr_s = addr.to_string();
         if addr_s == "//edo-build-cache" {
-            // This is a build cache so add it
             self.storage().set_build(&backend).await;
         } else if addr_s == "//edo-output-cache" {
-            // This is an output cache so add it
             self.storage().set_output(&backend).await;
         } else {
-            // This is a source cache
             self.storage()
                 .add_source_cache(addr_s.as_str(), &backend)
                 .await;
@@ -329,7 +329,6 @@ impl Context {
             "adding a farm {}",
             element.addr,
         );
-        // If we get here use the core plugin
         self.farms.insert(
             element.addr.clone(),
             self.registry().farm(element, self).await?,
@@ -387,12 +386,7 @@ impl Context {
 
 #[cfg(test)]
 impl Context {
-    /// Test-only: insert a [`Transform`] directly, bypassing the plugin registry.
-    ///
-    /// Exists because `add_transform` funnels through the registry which is
-    /// only populated by `edo-core::register_core`. The `edo` crate cannot
-    /// depend on `edo-core` (cycle), so scheduler tests instead construct
-    /// mock transforms and inject them here.
+    /// Inserts a test transform without the plugin registry.
     pub(crate) fn insert_transform_for_test(&self, addr: &Addr, transform: Transform) {
         self.transforms.insert(addr.clone(), transform);
     }
@@ -405,18 +399,7 @@ impl Context {
 
 #[cfg(test)]
 mod tests {
-    //! Integration tests for `Context`.
-    //!
-    //! `Context::init` installs a global `tracing` subscriber via
-    //! `LogManager::init`. That subscriber can only be installed once per
-    //! process, so these tests:
-    //!
-    //! 1. Share a single `Context` via a `OnceCell` (`shared_context`).
-    //! 2. Serialize on the `log_manager` tag (shared with any future tests
-    //!    in `log.rs` / `logmgr.rs` that also initialize the subscriber).
-    //! 3. Treat `ContextError::Log` as a soft skip — if another test in the
-    //!    same binary installed the subscriber first and we raced past the
-    //!    `OnceCell`, we cannot recover a `Context`, so we skip gracefully.
+    //! Serialized context tests sharing one tracing subscriber.
     use super::*;
     use std::sync::Arc;
     use tempfile::TempDir;
@@ -424,11 +407,7 @@ mod tests {
     type SharedCtx = (Context, Arc<TempDir>);
     static SHARED: OnceCell<SharedCtx> = OnceCell::const_new();
 
-    /// Returns the shared `Context` if available.
-    ///
-    /// Returns `None` only when `Context::init` fails with `ContextError::Log`
-    /// because a sibling test (in `log.rs`/`logmgr.rs`) already installed the
-    /// global subscriber. In that case each caller should return early.
+    /// Returns the shared context, or `None` if tracing is initialized elsewhere.
     async fn try_shared_context() -> Option<Context> {
         if let Some((ctx, _)) = SHARED.get() {
             return Some(ctx.clone());
@@ -452,8 +431,7 @@ mod tests {
         }
     }
 
-    /// Convenience that either yields a `Context` or executes `return` via the
-    /// caller (through `let ... else`).
+    /// Skips the test when no shared context is available.
     macro_rules! ctx_or_skip {
         () => {
             match try_shared_context().await {
@@ -496,15 +474,31 @@ mod tests {
     async fn context_get_handle_returns_snapshot() {
         let ctx = ctx_or_skip!();
         let h = ctx.get_handle();
-        // The shared context may have had transforms/farms registered by
-        // a previous test; the snapshot should, however, never be missing
-        // the args map.
         assert!(
             h.args().is_empty(),
             "no CLI args were passed to Context::init",
         );
-        // `transforms()` is just a `HashMap` borrow — we only assert access.
         let _ = h.transforms();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(log_manager)]
+    async fn handles_share_user_cancellation_without_phase_poisoning() {
+        let mut ctx = ctx_or_skip!();
+        ctx.cancellation = CancellationToken::new();
+        let first = ctx.get_handle();
+        let second = ctx.get_handle_with_args(HashMap::new());
+        let phase = first.cancellation().child_token();
+        let phase_handle = first.clone().with_cancellation(phase.clone());
+        phase_handle.cancellation().cancel();
+        assert!(phase.is_cancelled());
+        assert!(!ctx.cancellation().is_cancelled());
+        assert!(!second.cancellation().is_cancelled());
+        let next_phase = first.cancellation().child_token();
+        ctx.cancellation().cancel();
+        assert!(first.cancellation().is_cancelled());
+        assert!(second.cancellation().is_cancelled());
+        assert!(next_phase.is_cancelled());
     }
 
     #[tokio::test]
@@ -512,8 +506,7 @@ mod tests {
     async fn context_add_cache_routes_by_address() {
         let ctx = ctx_or_skip!();
 
-        // All three routes use the built-in `local` backend path, which is
-        // handled directly (not via the plugin registry).
+        // Use local backends for all cache roles.
         for addr_str in ["//edo-build-cache", "//edo-output-cache", "//some-src"] {
             let tmp = TempDir::new().unwrap();
             let element = Element::builder()
@@ -528,17 +521,12 @@ mod tests {
                 .await
                 .unwrap_or_else(|e| panic!("add_cache {addr_str} failed: {e}"));
         }
-        // Storage does not publicly expose slot inspection; reaching this
-        // point without panic or error is the assertion.
     }
 
     #[tokio::test]
     #[serial_test::serial(log_manager)]
     async fn context_add_transform_no_provider_errors() {
         let ctx = ctx_or_skip!();
-        // `script` has no plugin-registered provider in a fresh registry,
-        // so the registry surfaces a `NoProvider` error before any plugin
-        // is invoked.
         let element = Element {
             namespace: Addr::default(),
             addr: Addr::parse("//no-provider").unwrap(),
@@ -567,11 +555,6 @@ mod tests {
     #[serial_test::serial(log_manager)]
     async fn context_add_farm_unknown_kind_errors() {
         let ctx = ctx_or_skip!();
-        // An element with an unrecognised kind surfaces a `NoProvider`
-        // error from the registry. (Under the old `Node`-based API a
-        // missing `kind` field could not be expressed at all; with the
-        // typed schema `kind` is mandatory and serde rejects elements
-        // missing it at deserialisation time.)
         let element = Element::builder()
             .addr(Addr::parse("//bad-farm").unwrap())
             .kind("definitely-not-a-real-kind")
@@ -594,10 +577,6 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(log_manager)]
     async fn context_missing_kind_in_toml_fails_to_deserialize() {
-        // The typed schema requires every element to carry a `kind`. A
-        // TOML block without one is a deserialisation error — the
-        // strongest replacement for the old runtime `Field { field: "kind" }`
-        // check.
         let toml_str = "path = \"x\"\n";
         let result: std::result::Result<Element, _> = toml::from_str(toml_str);
         assert!(
@@ -619,13 +598,9 @@ mod tests {
     async fn context_load_empty_project_ok() {
         let ctx = ctx_or_skip!();
         let tmp = TempDir::new().unwrap();
-        // Bypass `self.project_dir` (bound to the CWD at Context::init time)
-        // by calling `Project::load` directly with our empty directory.
+        // Load the temporary project rather than the working directory.
         Project::load(tmp.path(), &ctx, false)
             .await
             .expect("empty project should load cleanly");
-        // An empty project still loads successfully; we do not assert on the
-        // presence of a lockfile since `Project::load` may write one
-        // unconditionally. Reaching this point is the assertion.
     }
 }

@@ -1,6 +1,8 @@
 use clap::Parser;
 use cmd::{Checkout, List, Prune, Run, Update};
 use std::path::PathBuf;
+use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 mod cmd;
 
@@ -12,6 +14,8 @@ pub mod error {
     #[derive(Snafu, Debug)]
     #[snafu(visibility(pub))]
     pub enum Error {
+        #[snafu(display("command cancelled"))]
+        Cancelled,
         #[snafu(display("io error: {source}"))]
         Io { source: std::io::Error },
         #[snafu(display("no transform registered for address {addr}"))]
@@ -60,6 +64,8 @@ pub struct Args {
     storage: Option<PathBuf>,
     #[clap(subcommand)]
     command: Commands,
+    #[arg(skip)]
+    cancellation: CancellationToken,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -76,12 +82,108 @@ enum Commands {
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    match args.clone().command {
-        Commands::Checkout(cmd) => cmd.run(args.clone()).await?,
-        Commands::Run(cmd) => cmd.run(args.clone()).await?,
-        Commands::Prune(cmd) => cmd.run(args.clone()).await?,
-        Commands::Update(cmd) => cmd.run(args.clone()).await?,
-        Commands::List(cmd) => cmd.run(args.clone()).await?,
+    // First Ctrl+C cancels; second exits 130 without cleanup.
+    let sigint_token = args.cancellation.clone();
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_err() {
+            return;
+        }
+        sigint_token.cancel();
+        if tokio::signal::ctrl_c().await.is_ok() {
+            std::process::exit(130);
+        }
+    });
+
+    let grace = if matches!(args.command, Commands::Run(_)) {
+        Duration::from_secs(5)
+    } else {
+        Duration::ZERO
+    };
+    let command = async {
+        match args.clone().command {
+            Commands::Checkout(cmd) => cmd.run(args.clone()).await,
+            Commands::Run(cmd) => cmd.run(args.clone()).await,
+            Commands::Prune(cmd) => cmd.run(args.clone()).await,
+            Commands::Update(cmd) => cmd.run(args.clone()).await,
+            Commands::List(cmd) => cmd.run(args.clone()).await,
+        }
+    };
+    run_cancellable(command, &args.cancellation, grace).await
+}
+
+async fn run_cancellable(
+    command: impl std::future::Future<Output = Result<()>>,
+    token: &CancellationToken,
+    grace: Duration,
+) -> Result<()> {
+    tokio::pin!(command);
+    tokio::select! {
+        result = &mut command => result,
+        _ = token.cancelled() => {
+            // Allow bounded cooperative teardown before dropping the command.
+            if !grace.is_zero() {
+                let _ = tokio::time::timeout(grace, &mut command).await;
+            }
+            error::CancelledSnafu.fail()
+        }
     }
-    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cancellation_stops_non_build_commands() {
+        let token = CancellationToken::new();
+        let command = async {
+            token.cancel();
+            std::future::pending::<Result<()>>().await
+        };
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            run_cancellable(command, &token, Duration::ZERO),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result, Err(error::Error::Cancelled)));
+    }
+
+    #[tokio::test]
+    async fn cancellation_allows_cooperative_build_cleanup() {
+        let token = CancellationToken::new();
+        let cleaned = std::sync::atomic::AtomicBool::new(false);
+        let command = async {
+            token.cancel();
+            tokio::task::yield_now().await;
+            cleaned.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        };
+        let _ = run_cancellable(command, &token, Duration::from_secs(1)).await;
+        assert!(cleaned.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn cancellation_bounds_unresponsive_builds() {
+        let token = CancellationToken::new();
+        token.cancel();
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            run_cancellable(std::future::pending(), &token, Duration::from_millis(10)),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result, Err(error::Error::Cancelled)));
+    }
+
+    #[tokio::test]
+    async fn command_errors_are_preserved() {
+        let result = run_cancellable(
+            async { error::UnknownTransformSnafu { addr: "//missing" }.fail() },
+            &CancellationToken::new(),
+            Duration::ZERO,
+        )
+        .await;
+        assert!(matches!(result, Err(error::Error::UnknownTransform { .. })));
+    }
 }
