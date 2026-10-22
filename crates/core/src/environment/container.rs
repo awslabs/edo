@@ -557,9 +557,9 @@ impl EnvironmentImpl for Container {
         trace!(component = "environment", type = "container", "running command in {}", work_dir.display());
         async move {
             let cli = &self.config.cli;
+            // Build commands do not attach stdin.
             let mut args = vec![
                 "exec".to_string(),
-                "-i".to_string(),
                 "--workdir".to_string(),
                 format!("{}", work_dir.display()),
             ];
