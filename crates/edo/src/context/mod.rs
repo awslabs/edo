@@ -147,6 +147,7 @@ impl Context {
         config: Option<ConfigPath>,
         args: HashMap<String, String>,
         verbosity: LogVerbosity,
+        event_log: EventLog,
     ) -> ContextResult<Self>
     where
         ProjectPath: AsRef<Path>,
@@ -161,10 +162,16 @@ impl Context {
         if !path.exists() {
             create_dir_all(&path).await.context(error::IoSnafu)?;
         }
+        debug!(
+            subsystem = "context",
+            component = "project",
+            op = "init",
+            "determined project edo target path to be: {path:?}",
+        );
         // Logs should be in a project specific folder, so they
         // do not clash with other project workspaces.
         let log_path = path.join("logs");
-        let log = LogManager::init(&log_path, verbosity).await?;
+        let log = LogManager::init(&log_path, verbosity, event_log).await?;
         // Adopt the CLI-installed cancellation token if one exists;
         // otherwise start fresh (e.g. under tests). The CLI's SIGINT
         // watcher (see `cli::main`) publishes a token here so both the
@@ -176,7 +183,20 @@ impl Context {
             .unwrap_or_else(CancellationToken::new);
         // Load the configuration
         let config = Config::load(config).await?;
+        debug!(
+            subsystem = "context",
+            component = "project",
+            op = "init",
+            "loaded edo configuration"
+        );
+
         // Initialize the storage with the default local cache
+        debug!(
+            subsystem = "context",
+            component = "project",
+            op = "init",
+            "initializing edo-local-cache and storage engine"
+        );
         let local_backend_addr = Addr::parse("//edo-local-cache")?;
         let storage = Storage::init(&Backend::new(
             LocalBackend::new(
@@ -316,9 +336,12 @@ impl Context {
     /// based on the address.
     pub async fn add_cache(&self, addr: &Addr, element: &Element) -> ContextResult<()> {
         debug!(
-            section = "context",
-            component = "context",
-            "adding a storage backend {addr}"
+            subsystem = "context",
+            component = "project",
+            op = "add-cache",
+            addr = %addr,
+            kind = %element.kind,
+            "adding a storage backend"
         );
         let backend = if element.kind == "local" || element.kind == "edo:local" {
             Backend::new(LocalBackend::new(element, self.config()).await?)
@@ -344,10 +367,12 @@ impl Context {
     /// Creates and registers a transform from the given node using the appropriate plugin.
     pub async fn add_transform(&self, element: &Element) -> ContextResult<()> {
         debug!(
-            section = "context",
-            component = "context",
-            "adding a transform {}",
-            element.addr,
+            subsystem = "context",
+            component = "project",
+            op = "add-transform",
+            addr = %element.addr,
+            kind = %element.kind,
+            "adding a transform"
         );
         self.transforms.insert(
             element.addr.clone(),
@@ -374,10 +399,12 @@ impl Context {
     /// Creates and registers an environment farm from the given node using the appropriate plugin.
     pub async fn add_farm(&self, element: &Element) -> ContextResult<()> {
         debug!(
-            section = "context",
-            component = "context",
-            "adding a farm {}",
-            element.addr,
+            subsystem = "context",
+            component = "project",
+            op = "add-farm",
+            addr = %element.addr,
+            kind = %element.kind,
+            "adding a farm"
         );
         // If we get here use the core plugin
         self.farms.insert(
@@ -390,10 +417,12 @@ impl Context {
     /// Creates a source fetcher from the given node using the appropriate plugin.
     pub async fn add_source(&self, element: &Element) -> ContextResult<Source> {
         debug!(
-            section = "context",
-            component = "context",
-            "adding a source {}",
-            element.addr,
+            subsystem = "context",
+            component = "project",
+            op = "add-source",
+            addr = %element.addr,
+            kind = %element.kind,
+            "adding a source"
         );
         let result = self.registry().source(element, self).await?;
         Ok(result)
@@ -401,6 +430,14 @@ impl Context {
 
     /// Creates a dependency vendor from the given node using the appropriate plugin.
     pub async fn add_vendor(&self, element: &Element) -> ContextResult<Vendor> {
+        debug!(
+            subsystem = "context",
+            component = "project",
+            op = "add-vendor",
+            addr = %element.addr,
+            kind = %element.kind,
+            "adding a vendor"
+        );
         let result = self.registry().vendor(element, self).await?;
         Ok(result)
     }
@@ -414,37 +451,67 @@ impl Context {
         // Run the initial setup for environments
         let log = self.log.create("setup").await?;
         log.set_subject("environment-setup");
+
+        // Provenance: surface farm-setup as its own pre-build phase so
+        // the canvas / JSONL log show what's happening between
+        // `ProjectLoaded` and `BuildStarted`. Container farms in
+        // particular can spend significant time here pulling images and
+        // loading them into the runtime; without these events the UI
+        // shows a blank screen for that whole window.
+        let total = self.farms.len();
+        crate::ui_info!(
+            subsystem  = "context",
+            component = "project",
+            op = "setup-environment";
+            "setting up {total} environment(s)"
+        );
+
         for entry in self.farms.iter() {
-            entry
+            let addr = entry.key().clone();
+            let id = addr.to_string();
+            crate::ui_start_task!(
+                subsystem = "context",
+                component = "project",
+                op = "setup-environment";
+                &id,
+                crate::log::TaskStatus::Running,
+                None
+            );
+            let result = entry
                 .setup(&log, self.storage())
                 .instrument(info_span!(
-                    target: "context",
-                    "setting up environment",
-                    addr = entry.key().to_string()
+                    "env-setup",
+                    subsystem = "environment",
+                    addr = %addr
                 ))
-                .await?;
+                .await;
+            let status = if result.is_ok() {
+                crate::log::TaskStatus::Success
+            } else {
+                crate::log::TaskStatus::Failed
+            };
+            crate::ui_update_task!(
+                subsystem = "context",
+                component = "project",
+                op = "setup-environment";
+                &id,
+                status,
+                None
+            );
+            // Emit the phase-end event before propagating the error so
+            // sinks see a balanced started/finished pair even on
+            // failure. The build won't start in this case.
+            if let Err(e) = result {
+                return Err(e.into());
+            }
         }
         Ok(())
     }
 
     /// Sets up environments and executes the build for the given transform address.
-    ///
-    /// The inline canvas is always shut down before this method returns,
-    /// regardless of which phase failed. Without this guarantee an early
-    /// `setup_environments` failure would `?`-propagate past the cleanup
-    /// and leave the tty in raw mode with a frozen canvas overlay —
-    /// the user would see the snafu error chain printed underneath but
-    /// have no functioning prompt or shell.
     pub async fn run(&self, addr: &Addr) -> ContextResult<()> {
-        let env_setup = self.setup_environments().await;
-        let build_result = if env_setup.is_ok() {
-            self.scheduler().run(self, addr).await
-        } else {
-            // Skip scheduling but still tear the canvas down below.
-            Ok(())
-        };
-        env_setup?;
-        build_result?;
+        self.setup_environments().await?;
+        self.scheduler().run(self, addr).await?;
         Ok(())
     }
 }
@@ -503,6 +570,7 @@ mod tests {
             None,
             HashMap::new(),
             LogVerbosity::Info,
+            EventLog::Disabled,
         )
         .await
         {

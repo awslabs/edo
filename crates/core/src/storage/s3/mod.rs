@@ -67,16 +67,15 @@ impl S3Backend {
         bucket: &str,
         prefix: Option<PathBuf>,
     ) -> StorageResult<Self> {
-        trace!(
-            section = "storage",
-            component = "backend",
-            variant = "s3",
-            "creating or loading s3 cache in bucket {bucket} at {}",
-            if let Some(prefix) = prefix.as_ref() {
-                prefix.to_string_lossy().to_string()
-            } else {
-                "/".to_string()
-            }
+        debug!(
+            subsystem = "storage",
+            component = "s3",
+            op = "init",
+            "creating or loading s3 cache for bucket {bucket}{}",
+            prefix
+                .as_ref()
+                .map(|p| format!("/{}", p.display()))
+                .unwrap_or_default()
         );
         let client = Arc::new(Client::new(sdk_config));
         let catalog_key = if let Some(prefix) = prefix.as_ref() {
@@ -161,10 +160,10 @@ impl S3Backend {
                 return Ok(());
             }
             if attempt == MAX_ATTEMPTS {
-                error!(
+                edo::ui_error!(
                     subsystem = "storage",
                     component = "s3",
-                    catalog_key = %self.catalog_key,
+                    op = "clear-lock";
                     "lock object {}.lock did not clear after {MAX_ATTEMPTS} attempts; failing",
                     self.catalog_key,
                 );
@@ -282,11 +281,11 @@ impl BackendImpl for S3Backend {
 
     async fn prune(&self, id: &Id) -> StorageResult<()> {
         trace!(
-            section = "storage",
-            component = "backend",
-            variant = "local",
-            "prunning all artifacts that do not match prefix: {}",
-            id.prefix()
+            subsystem = "storage",
+            component = "s3",
+            op = "prune",
+            prefix = %id.prefix(),
+            "pruning all artifacts that do not match prefix"
         );
         // To prune historical artifacts we want to load our catalog for the id prefix
         let catalog = self.load().await?;
@@ -295,11 +294,12 @@ impl BackendImpl for S3Backend {
             if entry == *id {
                 continue;
             }
-            info!(
-                section = "storage",
-                component = "backend",
-                variant = "local",
-                "prunning artifact {entry}"
+            debug!(
+                subsystem = "storage",
+                component = "s3",
+                op = "prune",
+                id = %entry,
+                "pruning artifact"
             );
             self.del(&entry).await?;
         }

@@ -44,6 +44,7 @@ use std::{
     ops::Index,
     path::Path,
     sync::Arc,
+    time::Instant,
 };
 use tempfile::TempDir;
 use tokio::sync::Semaphore;
@@ -57,6 +58,43 @@ use crate::transform::Transform;
 
 use super::node::Node;
 use super::{Result, error};
+
+/// Lifecycle phase tag used as the `operation` field in tui task events.
+///
+/// Mirrors the old `Phase` enum but is intentionally just a static
+/// string — the new tui module renders the operation verbatim.
+mod phase {
+    pub const FETCH: &str = "fetch";
+    pub const CREATE_ENV: &str = "create-env";
+    pub const SETUP: &str = "setup";
+    pub const SPIN_UP: &str = "spin-up";
+    pub const STAGE: &str = "stage";
+    pub const EXECUTE: &str = "execute";
+    pub const SPIN_DOWN: &str = "spin-down";
+    pub const CLEAN: &str = "clean";
+}
+
+/// Format a `std::time::Duration` in the compact `Nms`/`N.Ns`/`NmMs`/
+/// `NhMm` shape used in scheduler task-update messages.
+fn format_std_duration(d: std::time::Duration) -> String {
+    let ms = d.as_millis();
+    if ms < 1_000 {
+        return format!("{ms}ms");
+    }
+    let secs_f = ms as f64 / 1000.0;
+    if secs_f < 60.0 {
+        return format!("{secs_f:.1}s");
+    }
+    let total_secs = (ms / 1000) as u64;
+    let mins = total_secs / 60;
+    let secs = total_secs % 60;
+    if mins < 60 {
+        return format!("{mins}m{secs}s");
+    }
+    let hours = mins / 60;
+    let rem_mins = mins % 60;
+    format!("{hours}h{rem_mins}m")
+}
 
 /// Execution graph: the DAG plus per-root metadata required to dispatch
 /// transforms in topological order with bounded concurrency.
@@ -126,6 +164,13 @@ impl Graph {
         }
     }
 
+    /// Returns the size of the reachable subgraph for `addr`, or 0 if
+    /// `addr` was never added. Used by the scheduler to populate the
+    /// `total` field of [`ConsoleEvent::BuildStarted`].
+    pub fn subgraph_size(&self, addr: &Addr) -> usize {
+        self.subgraphs.get(addr).map(|s| s.len()).unwrap_or(0)
+    }
+
     /// Recursively adds a transform and its dependencies to the graph.
     ///
     /// Returns the `NodeIndex` of the added (or existing) node. Edges are
@@ -142,7 +187,7 @@ impl Graph {
         if let Some(index) = self.index.get_by_left(addr) {
             return Ok(*index);
         }
-        trace!(subsystem = "scheduler", op = "add-node", addr = %addr, "adding execution node");
+        trace!(subsystem = "scheduler", component = "graph", op = "add-node", addr = %addr, "adding execution node");
         let transform = ctx
             .get_transform(addr)
             .context(error::ProjectTransformSnafu { addr: addr.clone() })?;
@@ -154,7 +199,7 @@ impl Graph {
         // `add_edge` is what catches cycles — daggy returns `WouldCycle`.
         for dep in transform.depends().await? {
             let child = self.add_recursive(ctx, &dep).await?;
-            trace!(subsystem = "scheduler", op = "add-edge", from = %dep, to = %addr, "adding edge");
+            trace!(subsystem = "scheduler", component = "graph", op = "add-edge", from = %dep, to = %addr, "adding edge");
             self.graph
                 .add_edge(child, node_index, format!("{dep}->{addr}"))
                 .context(error::GraphSnafu)?;
@@ -237,6 +282,10 @@ impl Graph {
         let ctx = ctx.get_handle().with_id_cache(self.id_cache.clone());
         let max_concurrent = self.batch_size;
         let token = ctx.cancellation();
+        // Wall-clock so the `BuildFinished { ok: false }` event emitted
+        // on a fetch-stage failure carries a meaningful duration even
+        // though the build never reaches `Graph::run`.
+        let fetch_started_at = Instant::now();
 
         // Fetching is network-bound. We don't want to issue thousands of
         // requests in parallel, but unlike execution we also don't need to
@@ -294,6 +343,14 @@ impl Graph {
             match ctx.storage().find_build(&id, true).await {
                 Ok(Some(_)) => {
                     node.set_cache_hit(true);
+                    crate::ui_start_task!(
+                        subsystem = "transform",
+                        component = "scheduler",
+                        op = "fetch";
+                        &node.addr.to_string(),
+                        crate::log::TaskStatus::Cached,
+                        Some("cache-hit".into())
+                    );
                     continue;
                 }
                 Ok(None) => {}
@@ -302,20 +359,49 @@ impl Graph {
                     break 'outer;
                 }
             }
+            crate::ui_start_task!(
+                subsystem = "transform",
+                component = "scheduler",
+                op = "fetch";
+                &node.addr.to_string(),
+                crate::log::TaskStatus::Wait,
+                Some("queued".into())
+            );
 
             // Build-cache miss — but if the transform reports that its
             // `prepare` step has nothing to do (e.g. every input source is
-            // already in the local cache), skip the spawn entirely.
+            // already in the local cache), skip the spawn entirely. We
+            // still emit the `Wait` phase so the console state machine
+            // matches the post-prepare path.
             match transform.needs_prepare(&ctx).await {
-                Ok(false) => continue,
+                Ok(false) => {
+                    crate::ui_update_task!(
+                        subsystem = "transform",
+                        component = "scheduler",
+                        op = "fetch";
+                        &node.addr.to_string(),
+                        crate::log::TaskStatus::Wait,
+                        None
+                    );
+                    continue;
+                }
                 Ok(true) => {}
                 Err(e) => {
+                    crate::ui_update_task!(
+                        subsystem = "transform",
+                        component = "scheduler",
+                        op = "fetch";
+                        &node.addr.to_string(),
+                        crate::log::TaskStatus::Failed,
+                        Some(e.to_string())
+                    );
                     sync_error = Some(e.into());
                     break 'outer;
                 }
             }
 
             let task_ctx = ctx.clone();
+            let node_for_task = node.clone();
             let task_token = token.clone();
             let addr_for_task = node.addr.clone();
             // Acquire the permit *outside* the spawn so the loop blocks
@@ -331,6 +417,14 @@ impl Graph {
                 Ok(p) => p,
                 Err(e) => {
                     sync_error = Some(e);
+                    crate::ui_update_task!(
+                        subsystem = "transform",
+                        component = "scheduler",
+                        op = "fetch";
+                        &node.addr.to_string(),
+                        crate::log::TaskStatus::Failed,
+                        None
+                    );
                     break 'outer;
                 }
             };
@@ -344,6 +438,14 @@ impl Graph {
                     }
                     let logf = task_ctx.log().create(format!("{id}").as_str()).await?;
                     logf.set_subject("fetch");
+                    crate::ui_update_task!(
+                        subsystem = "transform",
+                        component = "scheduler",
+                        op = "fetch";
+                        &node_for_task.addr.to_string(),
+                        crate::log::TaskStatus::Running,
+                        Some(phase::FETCH.into())
+                    );
                     let prepare_result = transform.prepare(&logf, &task_ctx).await;
                     // On *any* error in prepare, flip the token so peer
                     // tasks abort at their next checkpoint. Without this
@@ -352,8 +454,24 @@ impl Graph {
                     // completion and the canvas frozen in FETCH.
                     if let Err(e) = prepare_result {
                         task_token.cancel();
+                        crate::ui_update_task!(
+                            subsystem = "transform",
+                            component = "scheduler",
+                            op = "fetch";
+                            &node_for_task.addr.to_string(),
+                            crate::log::TaskStatus::Failed,
+                            Some(e.to_string())
+                        );
                         return Err(e.into());
                     }
+                    crate::ui_update_task!(
+                        subsystem = "transform",
+                        component = "scheduler",
+                        op = "fetch";
+                        &node_for_task.addr.to_string(),
+                        crate::log::TaskStatus::Success,
+                        None
+                    );
                     drop(logf);
                     // Explicit drop is documentation: the permit returns to
                     // the pool exactly when this task ends.
@@ -380,7 +498,8 @@ impl Graph {
         let (addrs, handles): (Vec<_>, Vec<_>) = tasks.into_iter().unzip();
         let join_outcome = futures::future::join_all(handles).await;
         let mut failures: Vec<error::SchedulerError> = Vec::new();
-        for (_addr, joined) in addrs.into_iter().zip(join_outcome) {
+        let mut failed_addrs: Vec<Addr> = Vec::new();
+        for (addr, joined) in addrs.into_iter().zip(join_outcome) {
             match joined {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
@@ -388,10 +507,12 @@ impl Graph {
                     // when we already have a root cause; drop them so
                     // the user-facing aggregate is meaningful.
                     if !matches!(e, error::SchedulerError::Cancelled) {
+                        failed_addrs.push(addr);
                         failures.push(e);
                     }
                 }
                 Err(join_err) => {
+                    failed_addrs.push(addr);
                     failures.push(error::JoinSnafu.into_error(join_err));
                 }
             }
@@ -412,11 +533,20 @@ impl Graph {
         };
 
         if let Some(e) = final_error {
-            // Flip the session-wide cancellation switch so any
+            // Drain the canvas with a definitive terminal event before
+            // bubbling up. This is the missing piece that previously
+            // left the TUI stuck on FETCH: `Context::run`'s
+            // `console.shutdown()` runs unconditionally, but without a
+            // `BuildFinished` the state machine never marks the build
+            // finished and the final-summary line is incoherent.
+            //
+            // Also flip the session-wide cancellation switch so any
             // downstream stage (Graph::run, in-flight prompts, the
             // caller's outer task) short-circuits instead of waiting
             // for the doomed run to unwind through timeouts.
             ctx.cancellation().cancel();
+            let _ = (fetch_started_at, &failed_addrs);
+            crate::ui_finish_build!();
             return Err(e);
         }
         Ok(())
@@ -466,8 +596,16 @@ impl Graph {
         // dependency trees on every transform.
         let ctx_handle = ctx.get_handle().with_id_cache(self.id_cache.clone());
         let token = ctx_handle.cancellation();
+        let build_started_at = Instant::now();
 
-        // ── Step 1: resolve the target node. ──────────────────────────────
+        // ── Step 1: resolve the target node. ──────────────────────
+        //
+        // Note: [`ConsoleEvent::BuildStarted`] is emitted by
+        // [`Scheduler::run`] *before* `Graph::fetch`, so it sequences
+        // ahead of any `NodeQueued` / `NodeCacheHit` events fired during
+        // the fetch pass. We only emit `BuildFinished` from here
+        // because it needs the failed-address list which lives on the
+        // graph.
         let start = self
             .index
             .get_by_left(addr)
@@ -478,7 +616,8 @@ impl Graph {
         // `cache_hit`; if the root is one we don't even need to walk its
         // dependencies — they only matter if we have to rebuild.
         if root_node.is_cache_hit() {
-            info!("{addr} is already built, skipping...");
+            let _ = build_started_at;
+            crate::ui_finish_build!();
             return Ok(());
         }
 
@@ -587,7 +726,6 @@ impl Graph {
                     let result = run_transform_lifecycle(
                         &ctx_clone, &path_buf, &node, &transform, &id, &token,
                     )
-                    .instrument(info_span!("transform", subsystem = "scheduler", addr = %node.addr))
                     .await;
                     // If the driver has gone away (done_rx dropped) there's
                     // nobody left to report to — exit quietly.
@@ -679,7 +817,22 @@ impl Graph {
                     // failed, and clear `ready` so no further dispatch
                     // happens. We still need to drain `inflight` tasks
                     // so workers don't leak.
-                    error!(subsystem = "scheduler", addr = %node.addr, "{} failed: {e}", node.addr);
+                    crate::ui_error!(
+                        subsystem = "transform",
+                        component = "scheduler",
+                        op = "execution",
+                        id = node.addr;
+                        "{} failed: {e}",
+                        node.addr
+                    );
+                    crate::ui_update_task!(
+                        subsystem = "transform",
+                        component = "scheduler",
+                        op = "execution";
+                        &node.addr.to_string(),
+                        crate::log::TaskStatus::Failed,
+                        Some(e.to_string())
+                    );
                     node.set_failed();
                     if first_error.is_none() {
                         first_error = Some(e);
@@ -705,12 +858,38 @@ impl Graph {
         // Failure takes precedence over cancellation in error reporting:
         // a real failure is more actionable than the generic "cancelled".
         if let Some(e) = first_error {
+            // Collect failed addresses for the BuildFinished payload
+            // before we surrender the graph reference. Skip any node
+            // whose index is not in the index map (defensive) or not
+            // in this root's subgraph \u2014 the previous `unwrap_or(*start)`
+            // fallback misclassified orphans as in-subgraph (P1).
+            let failed_addrs: Vec<Addr> = self
+                .graph
+                .node_references()
+                .filter_map(|(_, node)| {
+                    let idx = self.index.get_by_left(&node.addr).copied()?;
+                    if subgraph.contains(&idx)
+                        && matches!(
+                            node.status.load(std::sync::atomic::Ordering::SeqCst),
+                            x if x == super::node::NodeStatus::Failed as u8
+                        )
+                    {
+                        Some(node.addr.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            let _ = (build_started_at, &failed_addrs);
+            crate::ui_finish_build!();
             return Err(e);
         }
         if token.is_cancelled() {
+            crate::ui_finish_build!();
             return error::CancelledSnafu.fail();
         }
 
+        crate::ui_finish_build!();
         Ok(())
     }
 }
@@ -744,12 +923,21 @@ async fn run_transform_lifecycle(
     id: &Id,
     token: &CancellationToken,
 ) -> Result<Artifact> {
+    let started_at = Instant::now();
     // Per-transform scratch directory; dropped (and removed) when this
     // function returns regardless of success/failure path.
     let temp = TempDir::new_in(workspace).context(error::TemporaryDirectorySnafu)?;
     let logf = ctx.log().create(format!("{id}").as_str()).await?;
 
     logf.set_subject("create-environment");
+    crate::ui_update_task!(
+        subsystem = "transform",
+        component = "scheduler",
+        op = "execution";
+        &node.addr.to_string(),
+        crate::log::TaskStatus::Running,
+        Some(phase::CREATE_ENV.into())
+    );
     let env_addr = transform.environment().await?;
     let environment = ctx
         .create_environment(&logf, &env_addr, temp.path())
@@ -761,24 +949,49 @@ async fn run_transform_lifecycle(
         .await?;
 
     if token.is_cancelled() {
+        crate::ui_update_task!(
+            subsystem = "transform",
+            component = "scheduler",
+            op = "execution";
+            &node.addr.to_string(),
+            crate::log::TaskStatus::Canceled,
+            None
+        );
         return error::CancelledSnafu.fail();
     }
 
     logf.set_subject("setup-environment");
-    environment
-        .setup(&logf, ctx.storage())
-        .instrument(info_span!(
-            "env-setup",
-            subsystem = "environment",
-            addr = %node.addr
-        ))
-        .await?;
+    crate::ui_update_task!(
+        subsystem = "transform",
+        component = "scheduler",
+        op = "execution";
+        &node.addr.to_string(),
+        crate::log::TaskStatus::Running,
+        Some(phase::SETUP.into())
+    );
+    environment.setup(&logf, ctx.storage()).await?;
 
     if token.is_cancelled() {
+        crate::ui_update_task!(
+            subsystem = "transform",
+            component = "scheduler",
+            op = "execution";
+            &node.addr.to_string(),
+            crate::log::TaskStatus::Canceled,
+            None
+        );
         return error::CancelledSnafu.fail();
     }
 
     logf.set_subject("spinup environment");
+    crate::ui_update_task!(
+        subsystem = "transform",
+        component = "scheduler",
+        op = "execution";
+        &node.addr.to_string(),
+        crate::log::TaskStatus::Running,
+        Some(phase::SPIN_UP.into())
+    );
     environment.up(&logf).await?;
 
     // Past this point the environment is "up" and we owe it teardown.
@@ -790,41 +1003,86 @@ async fn run_transform_lifecycle(
             return error::CancelledSnafu.fail();
         }
         logf.set_subject("staging");
-        transform
-            .stage(&logf, ctx, &environment)
-            .instrument(info_span!(
-                "transform-stage",
-                subsystem = "transform",
-                addr = %node.addr
-            ))
-            .await?;
+        crate::ui_update_task!(
+            subsystem = "transform",
+            component = "scheduler",
+            op = "execution";
+            &node.addr.to_string(),
+            crate::log::TaskStatus::Running,
+            Some(phase::STAGE.into())
+        );
+        transform.stage(&logf, ctx, &environment).await?;
 
         if token.is_cancelled() {
             return error::CancelledSnafu.fail();
         }
         logf.set_subject("execution");
-        super::execute::execute(&logf, ctx, transform, &environment).await
+        crate::ui_update_task!(
+            subsystem = "transform",
+            component = "scheduler",
+            op = "execution";
+            &node.addr.to_string(),
+            crate::log::TaskStatus::Running,
+            Some(phase::EXECUTE.into())
+        );
+        super::execute::execute(&logf, ctx, &node.addr, transform, &environment).await
     }
     .await;
 
     // Best-effort teardown: errors are logged-and-swallowed so a clean-up
     // failure never overrides a successful build (or vice versa).
     logf.set_subject("spindown environment");
+    crate::ui_update_task!(
+        subsystem = "transform",
+        component = "scheduler",
+        op = "execution";
+        &node.addr.to_string(),
+        crate::log::TaskStatus::Running,
+        Some(phase::SPIN_DOWN.into())
+    );
+
     let _ = environment.down(&logf).await;
     logf.set_subject("clean environment");
-    let _ = environment
-        .clean(&logf)
-        .instrument(info_span!("env-clean", subsystem = "environment", addr = %node.addr))
-        .await;
+    crate::ui_update_task!(
+        subsystem = "transform",
+        component = "scheduler",
+        op = "execution";
+        &node.addr.to_string(),
+        crate::log::TaskStatus::Running,
+        Some(phase::CLEAN.into())
+    );
+    let _ = environment.clean(&logf).await;
 
     drop(logf);
     match outcome {
         Ok(artifact) => {
-            info!("transformation complete");
+            crate::ui_update_task!(
+                subsystem = "transform",
+                component = "scheduler",
+                op = "execution";
+                &node.addr.to_string(),
+                crate::log::TaskStatus::Success,
+                Some(format!(
+                    "{} ({})",
+                    phase::EXECUTE,
+                    format_std_duration(started_at.elapsed())
+                ))
+            );
             Ok(artifact)
         }
         Err(e) => {
-            error!("transformation failed: {e}");
+            crate::ui_update_task!(
+                subsystem = "transform",
+                component = "scheduler",
+                op = "execution";
+                &node.addr.to_string(),
+                crate::log::TaskStatus::Failed,
+                Some(format!(
+                    "{} ({})",
+                    phase::EXECUTE,
+                    format_std_duration(started_at.elapsed())
+                ))
+            );
             Err(e)
         }
     }
@@ -904,6 +1162,7 @@ pub(crate) mod tests {
             None,
             HashMap::new(),
             LogVerbosity::Info,
+            crate::context::EventLog::Disabled,
         )
         .await
         {
@@ -971,8 +1230,8 @@ pub(crate) mod tests {
         /// Fail from the `stage` lifecycle method with a synthetic
         /// [`TransformError::Implementation`]. Failing in `stage` (rather
         /// than returning [`TransformStatus::Failed`] from `transform`)
-        /// avoids the interactive `dialoguer::Select::interact` prompt
-        /// in `execute::execute` so the scheduler's failure path can be
+        /// avoids the interactive console failure prompt in
+        /// `execute::execute` so the scheduler's failure path can be
         /// exercised from a unit test.
         FailInStage,
     }
@@ -1572,11 +1831,11 @@ pub(crate) mod tests {
     ///   1. surface as a `SchedulerError::Child` from `Graph::fetch`,
     ///   2. cancel peer prepare tasks so they don't run to completion.
     ///
-    /// Without (2) a slow peer download kept the run frozen long
+    /// Without (2) a slow peer download kept the TUI frozen long
     /// after the real error was known.
     #[tokio::test]
     #[serial_test::serial(log_manager)]
-    async fn graph_fetch_failure_cancels_peers() {
+    async fn graph_fetch_failure_emits_build_finished_and_cancels_peers() {
         let ctx = ctx_or_skip!();
         ensure_default_farm(&ctx);
 
@@ -1586,7 +1845,7 @@ pub(crate) mod tests {
         // One sibling fails fast in prepare; the other spins in prepare
         // observing the cancellation token. Both are roots — no edges
         // between them — so the scheduler will spawn them in parallel.
-        let _h_fail = register_mock_failing_prepare(&ctx, "//gfail/fail", &[]);
+        let h_fail = register_mock_failing_prepare(&ctx, "//gfail/fail", &[]);
         let h_slow =
             register_mock_cancellable_prepare(&ctx, "//gfail/slow", bail.clone(), done.clone());
 
@@ -1624,6 +1883,8 @@ pub(crate) mod tests {
             "every started prepare must have bailed via cancellation \
              (started={started_n}, bailed={bail_n})",
         );
+
+        let _ = h_fail.addr;
         let _ = h_slow.addr;
         let _ = root_handles.addr;
     }
@@ -1938,7 +2199,7 @@ pub(crate) mod tests {
     /// transform fails, the scheduler must surface the error and terminate
     /// rather than hanging. Failure is injected in the `stage` lifecycle
     /// so the error propagates out of the per-task future without going
-    /// through `execute::execute`'s interactive `dialoguer::Select` prompt.
+    /// through `execute::execute`'s interactive console prompt.
     #[tokio::test]
     #[serial_test::serial(log_manager)]
     async fn graph_run_failure_does_not_hang() {

@@ -58,8 +58,27 @@ pub struct Args {
     config: Option<PathBuf>,
     #[arg(short, long)]
     storage: Option<PathBuf>,
+    /// Path to the JSONL structured log. Pass `none` to disable, `default`
+    /// to write to `<logs-dir>/edo.jsonl` (the pre-existing behaviour),
+    /// or any other value as an explicit path.
+    #[arg(long, default_value = "default")]
+    event_log: String,
     #[clap(subcommand)]
     command: Commands,
+}
+
+impl Args {
+    /// Translate the `--event-log` string into the typed
+    /// [`edo::context::EventLog`] the log manager consumes.
+    pub fn event_log_setting(&self) -> edo::context::EventLog {
+        if self.event_log.eq_ignore_ascii_case("none") {
+            edo::context::EventLog::Disabled
+        } else if self.event_log == "default" {
+            edo::context::EventLog::Default
+        } else {
+            edo::context::EventLog::Path(PathBuf::from(&self.event_log))
+        }
+    }
 }
 
 #[derive(Parser, Debug, Clone)]

@@ -50,14 +50,19 @@ impl Fixture {
         c
     }
 
-    /// Invokes `edo --storage <fixture>/.edo-test-store <args...>` and returns
-    /// the [`Assert`] for the caller to assert on.
+    /// Invokes `edo --storage <fixture>/.edo-test-store --event-log=none <args...>`
+    /// and returns the [`Assert`] for the caller to assert on.
     ///
-    /// `--storage` must be passed as a global flag BEFORE the subcommand
-    /// (see `Args` in `crates/cli/src/main.rs`).
+    /// `--storage` and `--event-log` must be passed as global flags
+    /// BEFORE the subcommand (see `Args` in `crates/cli/src/main.rs`).
+    /// The JSONL event log is disabled so tests don't need to clean it
+    /// up and the `tracing-indicatif` progress writer on stderr remains
+    /// the sole output channel — deterministic enough for
+    /// `predicates::str::contains` assertions.
     pub fn edo(&self, args: &[&str]) -> Assert {
         let mut c = self.cmd();
         c.arg("--storage").arg(&self.storage);
+        c.arg("--event-log=none");
         for a in args {
             c.arg(a);
         }

@@ -44,7 +44,7 @@ handlebars           = "6.4"
 home                 = "0.5"
 indexmap             = "2.14"
 indicatif            = "0.18"
-jiff                 = "0.2"
+jiff                 = { version = "0.2", features = ["serde"] }
 keyring              = "3.6"
 merkle_hash          = "3.8"
 mockall              = "0.14"
@@ -72,8 +72,8 @@ tokio                = { version = "1.52", features = ["full", "parking_lot", "r
 tokio-util           = "0.7"
 toml                 = "1"
 tracing              = "0.1"
-tracing-indicatif    = { version = "0.3" }
-tracing-subscriber   = { version = "0.3", features = ["env-filter"] }
+tracing-appender     = "0.2"
+tracing-subscriber   = { version = "0.3", features = ["env-filter", "json"] }
 url                  = { version = "2.5", features = ["serde"] }
 uuid                 = { version = "1", features = ["v7"] }
 which                = "8"

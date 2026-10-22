@@ -31,6 +31,12 @@ impl Config {
                 .join(".config/edo.toml")
         };
         if !path.exists() {
+            trace!(
+                subsystem = "context",
+                component = "config",
+                op = "load",
+                "found configuration file at {path:?}"
+            );
             return Ok(Self {
                 configs: Arc::new(DashMap::new()),
             });
