@@ -31,6 +31,7 @@ use edo::{
 };
 use sha2::{Digest, Sha256};
 use snafu::OptionExt;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 #[derive(serde::Deserialize, Debug, Clone)]
@@ -38,6 +39,8 @@ use std::path::{Path, PathBuf};
 struct GoVendorOptions {
     #[serde(default)]
     modules: Vec<PathBuf>,
+    #[serde(default)]
+    env: BTreeMap<String, String>,
 }
 
 /// A transform that runs `go mod vendor` over one or more modules of a single
@@ -58,6 +61,8 @@ pub struct GoVendorTransform {
     /// Module sub-paths within [`source`](Self::source) to vendor, relative
     /// to the source root. Empty means "vendor the root module only".
     pub modules: Vec<PathBuf>,
+    /// Environment variables for `go mod vendor`.
+    pub env: BTreeMap<String, String>,
 }
 
 #[async_trait]
@@ -65,6 +70,8 @@ impl FromElement for GoVendorTransform {
     type Error = error::Error;
 
     async fn new(element: &Element, ctx: &Context) -> Result<Self, error::Error> {
+        let options: GoVendorOptions = element.get()?;
+        vendor_command(&options.env)?;
         let addr = element.addr.clone();
         let environment = element
             .environment
@@ -81,13 +88,13 @@ impl FromElement for GoVendorTransform {
                     .context(error::NoSourceSnafu { addr: addr.clone() })?,
             )
             .await?;
-        let options: GoVendorOptions = element.get()?;
 
         Ok(Self {
             addr: addr.clone(),
             environment,
             source,
             modules: options.modules,
+            env: options.env,
         })
     }
 }
@@ -107,6 +114,12 @@ impl TransformImpl for GoVendorTransform {
         hash.update(source_id.digest().as_bytes());
         for module in self.modules.iter() {
             hash.update(module.to_string_lossy().as_bytes());
+        }
+        for (k, v) in self.env.iter() {
+            hash.update(k.as_bytes());
+            hash.update(b"=");
+            hash.update(v.as_bytes());
+            hash.update(b"\0");
         }
         let digest = hash.finalize();
         let id = Id::builder()
@@ -208,7 +221,7 @@ impl TransformImpl for GoVendorTransform {
                         "vendoring go sources"
                     );
                     src_path
-                        .command("go-vendor", "go", &["mod", "vendor"])
+                        .command("go-vendor", vendor_command(&self.env)?, ["mod", "vendor"])
                         .await?;
                     // Copy the resulting vendor directory into target_path
                     let target_vendor = target_path.entry("vendor").await;
@@ -261,6 +274,28 @@ impl TransformImpl for GoVendorTransform {
     }
 }
 
+fn vendor_command(env: &BTreeMap<String, String>) -> Result<String, error::Error> {
+    let mut command = String::new();
+    for (key, value) in env {
+        // Shell assignment names must be portable identifiers.
+        if key.is_empty()
+            || !key
+                .bytes()
+                .enumerate()
+                .all(|(i, c)| c == b'_' || c.is_ascii_alphabetic() || (i > 0 && c.is_ascii_digit()))
+            || value.contains('\0')
+        {
+            return error::InvalidEnvSnafu { key: key.clone() }.fail();
+        }
+        command.push_str(key);
+        command.push_str("='");
+        command.push_str(&value.replace('\'', "'\\''"));
+        command.push_str("' ");
+    }
+    command.push_str("go");
+    Ok(command)
+}
+
 /// Errors produced while loading or running a [`GoVendorTransform`].
 pub mod error {
     use snafu::Snafu;
@@ -275,6 +310,10 @@ pub mod error {
     #[derive(Snafu, Debug)]
     #[snafu(visibility(pub))]
     pub enum Error {
+        #[snafu(display(
+            "invalid go-vendor environment variable {key:?}: expected a shell identifier and a NUL-free value"
+        ))]
+        InvalidEnv { key: String },
         /// Bubbled up from the engine [`Context`](edo::context::Context) layer
         /// (e.g. parsing an [`Addr`](edo::context::Addr) failed).
         #[snafu(transparent)]
@@ -308,5 +347,45 @@ pub mod error {
                 source: Box::new(value),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vendor_env_preserves_shell_metacharacters() {
+        for value in [
+            "https://proxy.golang.org|direct",
+            "-mod=mod -tags=foo",
+            "'\"$HOME; `printf expanded` $(printf expanded)\nnext",
+            "",
+        ] {
+            let env = BTreeMap::from([("GOFLAGS".to_string(), value.to_string())]);
+            let command = vendor_command(&env).unwrap();
+            let output = std::process::Command::new("sh")
+                .args([
+                    "-c",
+                    &format!("go() {{ printf '%s' \"$GOFLAGS\"; }}; {command} mod vendor"),
+                ])
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            assert_eq!(output.stdout, value.as_bytes());
+        }
+    }
+
+    #[test]
+    fn vendor_env_rejects_invalid_names_and_nul_values() {
+        for key in ["", "A=B", "A\0B", "1A", "A-B", "A;echo"] {
+            assert!(vendor_command(&BTreeMap::from([(key.into(), "v".into())])).is_err());
+        }
+        assert!(vendor_command(&BTreeMap::from([("A".into(), "v\0".into())])).is_err());
+        assert_eq!(vendor_command(&BTreeMap::new()).unwrap(), "go");
+        assert_eq!(
+            vendor_command(&BTreeMap::from([("GO_MAJOR".into(), "1.26".into())])).unwrap(),
+            "GO_MAJOR='1.26' go"
+        );
     }
 }
