@@ -32,7 +32,11 @@ use super::catalog::Catalog;
 ///   [`tokio::sync::RwLock`] so the write path can hold the guard across
 ///   async filesystem operations (atomic catalog flush, blob deletion).
 ///   Mutating ops serialize with each other; reads run in parallel and
-///   only block when a write is in progress.
+///   only block when a write is in progress. A synchronous primitive
+///   (e.g. `parking_lot::RwLock`) would instead park a tokio worker
+///   thread and — under the default 8 concurrent workers, all of which
+///   call `upload_build` on completion — could starve the TUI task
+///   scheduled on that thread.
 /// * Across processes, mutating ops acquire an exclusive advisory
 ///   [`flock`] on `catalog.lock` (a sibling of `catalog.json`) before
 ///   reloading the on-disk catalog into the snapshot, applying the
