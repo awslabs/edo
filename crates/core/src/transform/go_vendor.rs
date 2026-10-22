@@ -31,6 +31,7 @@ use edo::{
 };
 use sha2::{Digest, Sha256};
 use snafu::OptionExt;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 #[derive(serde::Deserialize, Debug, Clone)]
@@ -38,6 +39,11 @@ use std::path::{Path, PathBuf};
 struct GoVendorOptions {
     #[serde(default)]
     modules: Vec<PathBuf>,
+    /// Extra environment variables to export before running `go mod vendor`.
+    /// Useful for SDKs that ship multiple Go toolchains and select between
+    /// them via an env var (e.g. `GO_MAJOR=1.26`).
+    #[serde(default)]
+    env: BTreeMap<String, String>,
 }
 
 /// A transform that runs `go mod vendor` over one or more modules of a single
@@ -58,6 +64,10 @@ pub struct GoVendorTransform {
     /// Module sub-paths within [`source`](Self::source) to vendor, relative
     /// to the source root. Empty means "vendor the root module only".
     pub modules: Vec<PathBuf>,
+    /// Extra environment variables to set for the `go mod vendor` command.
+    /// Sorted lexicographically before the command is built so the resulting
+    /// invocation (and this transform's unique id) is deterministic.
+    pub env: BTreeMap<String, String>,
 }
 
 #[async_trait]
@@ -88,6 +98,7 @@ impl FromElement for GoVendorTransform {
             environment,
             source,
             modules: options.modules,
+            env: options.env,
         })
     }
 }
@@ -107,6 +118,13 @@ impl TransformImpl for GoVendorTransform {
         hash.update(source_id.digest().as_bytes());
         for module in self.modules.iter() {
             hash.update(module.to_string_lossy().as_bytes());
+        }
+        // BTreeMap iterates in key order, so this is deterministic.
+        for (k, v) in self.env.iter() {
+            hash.update(k.as_bytes());
+            hash.update(b"=");
+            hash.update(v.as_bytes());
+            hash.update(b"\0");
         }
         let digest = hash.finalize();
         let id = Id::builder()
@@ -207,9 +225,24 @@ impl TransformImpl for GoVendorTransform {
                         path = ?src_path.path(),
                         "vendoring go sources"
                     );
-                    src_path
-                        .command("go-vendor", "go", &["mod", "vendor"])
-                        .await?;
+                    if self.env.is_empty() {
+                        src_path
+                            .command("go-vendor", "go", &["mod", "vendor"])
+                            .await?;
+                    } else {
+                        // Invoke via `env` so extra variables (e.g. GO_MAJOR)
+                        // are exported for the `go` process. Keys are already
+                        // ordered thanks to BTreeMap.
+                        let mut args: Vec<String> =
+                            Vec::with_capacity(self.env.len() + 3);
+                        for (k, v) in self.env.iter() {
+                            args.push(format!("{k}={v}"));
+                        }
+                        args.push("go".to_string());
+                        args.push("mod".to_string());
+                        args.push("vendor".to_string());
+                        src_path.command("go-vendor", "env", &args).await?;
+                    }
                     // Copy the resulting vendor directory into target_path
                     let target_vendor = target_path.entry("vendor").await;
                     let src_vendor = src_path.entry("vendor").await;
