@@ -43,7 +43,12 @@ pub mod error;
 mod handle;
 mod lock;
 mod log;
-mod logmgr;
+// Widened from private `mod` to `pub(crate)` so `#[cfg(test)]` code in
+// sibling modules (currently `crate::source::tests`) can reach
+// `logmgr::test_support::shared_log_manager`. Non-test callers should
+// keep going through the `LogManager` re-export below rather than
+// touching `logmgr::` directly.
+pub(crate) mod logmgr;
 mod registry;
 mod schema;
 
