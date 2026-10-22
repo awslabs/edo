@@ -45,8 +45,8 @@ use std::{
     sync::Arc,
 };
 use tempfile::TempDir;
-use tokio::sync::{Mutex, Semaphore, mpsc::channel};
-use tokio::task::JoinHandle;
+use tokio::sync::Semaphore;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
@@ -475,22 +475,12 @@ impl Graph {
             }
         }
 
-        // ── Step 4: spawn the worker pool. ────────────────────────────────
-        // Two MPSC channels:
-        //   - work_tx/work_rx: driver -> workers, carries NodeIndex.
-        //   - done_tx/done_rx: workers -> driver, carries (idx, result).
-        // Capacities equal `batch_size` so the driver never blocks on send
-        // while the pool has free slots.
-        //
-        // `work_rx` is wrapped in `Arc<Mutex<_>>` because tokio's MPSC
-        // receiver isn't `Clone`; the lock is held only across `recv()`
-        // and contention is rare (workers are usually busy executing).
-        let (work_tx, work_rx) = channel::<NodeIndex>(self.batch_size as usize);
-        let (done_tx, mut done_rx) =
-            channel::<(NodeIndex, Result<Artifact>)>(self.batch_size as usize);
-        let work_rx = Arc::new(Mutex::new(work_rx));
+        // Bound dispatch and completion queues to the worker count.
+        let (work_tx, work_rx) = flume::bounded::<NodeIndex>(self.batch_size as usize);
+        let (done_tx, done_rx) =
+            flume::bounded::<(NodeIndex, Result<Artifact>)>(self.batch_size as usize);
 
-        let mut worker_handles: Vec<JoinHandle<Result<()>>> = Vec::new();
+        let mut workers = JoinSet::new();
         for _ in 0..self.batch_size {
             let work_rx = work_rx.clone();
             let done_tx = done_tx.clone();
@@ -498,27 +488,17 @@ impl Graph {
             let path_buf = path.to_path_buf();
             let graph = self.graph.clone();
             let token = token.clone();
-            worker_handles.push(tokio::spawn(async move {
+            workers.spawn(async move {
                 loop {
-                    // Briefly hold the receive lock just long enough to
-                    // pull one item — releasing it before the (long-running)
-                    // transform lifecycle so siblings can pick up new work.
-                    let next = {
-                        let mut guard = work_rx.lock().await;
-                        guard.recv().await
-                    };
-                    // `None` means the driver dropped `work_tx`; we're done.
-                    let Some(idx) = next else {
+                    let Ok(idx) = work_rx.recv_async().await else {
                         return Ok::<(), error::SchedulerError>(());
                     };
                     let node = graph.index(idx).clone();
                     let transform = match ctx_clone.get(&node.addr) {
                         Some(t) => t,
                         None => {
-                            // Vanishingly unlikely (the transform was here
-                            // when `add` ran) but report it cleanly anyway.
                             let _ = done_tx
-                                .send((
+                                .send_async((
                                     idx,
                                     error::ProjectTransformSnafu {
                                         addr: node.addr.clone(),
@@ -529,24 +509,19 @@ impl Graph {
                             continue;
                         }
                     };
-                    // `fetch` is required to have run before `run`, so the
-                    // id is always populated by this point.
                     let id = node.id().context(error::InfallableSnafu)?.clone();
                     let result = run_transform_lifecycle(
                         &ctx_clone, &path_buf, &node, &transform, &id, &token,
                     )
                     .instrument(info_span!("transform", subsystem = "scheduler", addr = %node.addr))
                     .await;
-                    // If the driver has gone away (done_rx dropped) there's
-                    // nobody left to report to — exit quietly.
-                    if done_tx.send((idx, result)).await.is_err() {
+                    if done_tx.send_async((idx, result)).await.is_err() {
                         return Ok::<(), error::SchedulerError>(());
                     }
                 }
-            }));
+            });
         }
-        // Drop the driver's clone of `done_tx` so once every worker exits,
-        // `done_rx.recv()` returns `None` instead of hanging forever.
+        drop(work_rx);
         drop(done_tx);
 
         // ── Step 5: driver loop. ──────────────────────────────────────────
@@ -561,7 +536,7 @@ impl Graph {
         let mut failed = false;
         let mut first_error: Option<error::SchedulerError> = None;
 
-        loop {
+        'driver: loop {
             // Saturate the pool: push ready work into `work_tx` until
             // either we run out of ready nodes or hit the concurrency cap.
             // We pause dispatching on failure or cancellation so the
@@ -573,9 +548,10 @@ impl Graph {
             {
                 let n = ready.pop_front().context(error::InfallableSnafu)?;
                 self.graph.index(n).set_running();
-                // `try_send` is infallible here: channel capacity is
-                // `batch_size` and `inflight < batch_size` guarantees space.
-                work_tx.try_send(n).ok().context(error::InfallableSnafu)?;
+                if let Err(e) = work_tx.try_send(n).context(error::DispatchSnafu) {
+                    first_error = Some(e);
+                    break 'driver;
+                }
                 inflight += 1;
             }
 
@@ -587,10 +563,13 @@ impl Graph {
                 break;
             }
 
-            // Block on the next completion. `unwrap` is safe because we
-            // hold the original `work_tx`, so `done_tx` clones held by
-            // workers stay alive while there's anything to wait for.
-            let (idx, res) = done_rx.recv().await.context(error::InfallableSnafu)?;
+            let (idx, res) = match next_completion(&done_rx, &mut workers).await {
+                Ok(completion) => completion,
+                Err(e) => {
+                    first_error = Some(e);
+                    break;
+                }
+            };
             inflight -= 1;
             let node = self.graph.index(idx);
             match res {
@@ -633,11 +612,17 @@ impl Graph {
                 ready.clear();
             }
         }
-        // Closing `work_tx` lets workers see end-of-stream and exit their
-        // recv loops; we then await each so panics surface as `JoinError`.
         drop(work_tx);
-        for h in worker_handles {
-            h.await.context(error::JoinSnafu)??;
+        let mut worker_error = None;
+        while let Some(result) = workers.join_next().await {
+            if let Err(e) = result.context(error::JoinSnafu).and_then(|result| result) {
+                worker_error.get_or_insert(e);
+            }
+        }
+        drop(done_rx);
+
+        if let Some(e) = worker_error {
+            return Err(e);
         }
 
         // Failure takes precedence over cancellation in error reporting:
@@ -650,6 +635,29 @@ impl Graph {
         }
 
         Ok(())
+    }
+}
+
+/// Receives a completion or surfaces an exited worker's failure.
+async fn next_completion(
+    done: &flume::Receiver<(NodeIndex, Result<Artifact>)>,
+    workers: &mut JoinSet<Result<()>>,
+) -> Result<(NodeIndex, Result<Artifact>)> {
+    tokio::select! {
+        biased;
+        result = workers.join_next() => {
+            result.context(error::NoRunSnafu)?.context(error::JoinSnafu)??;
+            error::NoRunSnafu.fail()
+        }
+        result = done.recv_async() => {
+            match result {
+                Ok(completion) => Ok(completion),
+                Err(_) => {
+                    workers.join_next().await.context(error::NoRunSnafu)?.context(error::JoinSnafu)??;
+                    error::NoRunSnafu.fail()
+                }
+            }
+        }
     }
 }
 
@@ -791,6 +799,50 @@ pub(crate) mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use tempfile::TempDir;
     use tokio::sync::{Notify, OnceCell};
+
+    #[tokio::test]
+    async fn completion_surfaces_worker_error_with_another_worker_alive() {
+        let (done_tx, done_rx) = flume::bounded(1);
+        let mut workers = JoinSet::new();
+        workers.spawn(async {
+            error::PassthroughSnafu {
+                message: "worker failed",
+            }
+            .fail()
+        });
+        workers.spawn(async move {
+            let _sender = done_tx;
+            std::future::pending::<Result<()>>().await
+        });
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            next_completion(&done_rx, &mut workers),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert_eq!(error.to_string(), "worker failed");
+    }
+
+    #[tokio::test]
+    async fn completion_surfaces_last_worker_panic() {
+        let (done_tx, done_rx) = flume::bounded(1);
+        let mut workers = JoinSet::new();
+        workers.spawn(async move {
+            let _sender = done_tx;
+            panic!("worker panic");
+            #[allow(unreachable_code)]
+            Ok(())
+        });
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            next_completion(&done_rx, &mut workers),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(matches!(error, error::SchedulerError::Join { source } if source.is_panic()));
+    }
 
     // ── context bootstrapping (mirrors context/mod.rs pattern) ──────────────
 

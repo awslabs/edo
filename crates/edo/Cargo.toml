@@ -21,6 +21,7 @@ daggy              = { workspace = true }
 dashmap            = { workspace = true }
 dialoguer          = { workspace = true }
 duct               = { workspace = true }
+flume              = { workspace = true }
 futures            = { workspace = true }
 handlebars         = { workspace = true }
 home               = { workspace = true }

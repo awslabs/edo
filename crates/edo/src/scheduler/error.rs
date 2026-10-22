@@ -1,7 +1,7 @@
 //! Error types for the scheduler subsystem.
 
 use snafu::Snafu;
-use tokio::{sync::mpsc::error::SendError, task::JoinError};
+use tokio::task::JoinError;
 
 use crate::context::Addr;
 
@@ -15,6 +15,10 @@ pub enum SchedulerError {
     },
     #[snafu(display("execution was cancelled"))]
     Cancelled,
+    #[snafu(display("failed to dispatch work: {source}"))]
+    Dispatch {
+        source: flume::TrySendError<daggy::NodeIndex<u32>>,
+    },
     #[snafu(display("errors occured during execution: {}", children.iter().map(|x| x.to_string()).collect::<Vec<_>>().join("\n")))]
     Child { children: Vec<SchedulerError> },
     #[snafu(display("dependency does not exist in execution graph: {addr}"))]
@@ -47,7 +51,7 @@ pub enum SchedulerError {
     ProjectTransform { addr: Addr },
     #[snafu(display("failed to signal task completion: {source}"))]
     Signal {
-        source: SendError<daggy::NodeIndex<u32>>,
+        source: flume::SendError<daggy::NodeIndex<u32>>,
     },
     #[snafu(display("could not await on a result from a non-building node"))]
     State,

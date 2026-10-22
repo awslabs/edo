@@ -37,6 +37,7 @@ daggy                = "0.9"
 dashmap              = { version = "6.2", features = ["serde"] }
 dialoguer            = "0.12"
 duct                 = "1"
+flume                = "0.12"
 futures              = "0.3"
 futures-util         = "0.3"
 handlebars           = "6.4"
