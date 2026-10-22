@@ -7,6 +7,8 @@ use snafu::Snafu;
 #[derive(Snafu, Debug)]
 #[snafu(visibility(pub))]
 pub enum SourceError {
+    #[snafu(transparent)]
+    Shared { source: std::sync::Arc<SourceError> },
     /// A propagated environment-layer error encountered during staging.
     #[snafu(transparent)]
     Environment {

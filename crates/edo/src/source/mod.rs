@@ -15,10 +15,14 @@ use crate::storage::{Artifact, Id, Storage};
 use crate::util::Reader;
 use arc_handle::arc_handle;
 use async_trait::async_trait;
+use dashmap::DashMap;
+use futures::FutureExt;
+use futures::future::{BoxFuture, Shared};
 #[cfg(test)]
 use mockall::automock;
 use snafu::ensure;
 use std::path::Path;
+use std::sync::{Arc, LazyLock, Weak};
 
 mod error;
 mod require;
@@ -33,6 +37,20 @@ pub use require::*;
 pub use resolver::*;
 pub use vendor::*;
 pub use version::*;
+
+/// In-flight source fetches; assumes one storage per process.
+static SOURCE_FETCHES: LazyLock<DashMap<String, Weak<Fetch>>> = LazyLock::new(DashMap::new);
+
+struct Fetch {
+    key: String,
+    result: Shared<BoxFuture<'static, Result<Artifact, Arc<SourceError>>>>,
+}
+
+impl Drop for Fetch {
+    fn drop(&mut self) {
+        SOURCE_FETCHES.remove_if(&self.key, |_, fetch| fetch.strong_count() == 0);
+    }
+}
 
 /// A source of code or artifacts, whether local or remote.
 ///
@@ -59,19 +77,10 @@ impl Source {
         self.get_unique_id().await
     }
 
-    /// Fetches a source-cache miss using the current run's source id.
-    ///
-    /// The source still owns its id: on a miss `fetch` computes the id it
-    /// stores the artifact under, and that id must match the one memoized
-    /// for this run. A mismatch means the source changed after it was
-    /// hashed (e.g. a local file edited mid-build), so staging and the
-    /// dependent transform ids would disagree with the fetched bytes.
+    /// Caches a source and validates it against the current run's id.
     pub async fn cache_in(&self, log: &Log, ctx: &Handle) -> SourceResult<Artifact> {
         let id = self.cached_unique_id(ctx).await?;
-        if let Some(artifact) = ctx.storage().fetch_source(&id).await? {
-            return Ok(artifact);
-        }
-        let artifact = self.fetch(log, ctx.storage()).await?;
+        let artifact = self.cache_id(log, ctx.storage(), &id).await?;
         ensure!(
             artifact.config().id() == &id,
             error::ChangedSnafu {
@@ -82,20 +91,46 @@ impl Source {
         Ok(artifact)
     }
 
-    /// Check the cache if this source already exists, and only if it does not
-    /// call fetch to get the artifact. Use this in most cases instead of calling
-    /// fetch() as fetch will ALWAYS repull the source.
+    /// Caches a source, sharing concurrent downloads and fetch outcomes per id.
     pub async fn cache(&self, log: &Log, storage: &Storage) -> SourceResult<Artifact> {
-        // Now we want to check if our caches already have this artifact
         let id = self.get_unique_id().await?;
-        // See if our storage can find this source artifact already
-        // Note: we use fetch_source because we want to ensure when this is called
-        // the artifact is in the local cache.
-        if let Some(artifact) = storage.fetch_source(&id).await? {
-            return Ok(artifact.clone());
+        self.cache_id(log, storage, &id).await
+    }
+
+    async fn cache_id(&self, log: &Log, storage: &Storage, id: &Id) -> SourceResult<Artifact> {
+        if storage.has_local(id).await? {
+            return Ok(storage.safe_open(id).await?);
         }
-        // Otherwise perform the fetch
-        self.fetch(log, storage).await
+        let key = id.to_string();
+        let fetch = {
+            let mut entry = SOURCE_FETCHES.entry(key.clone()).or_default();
+            if let Some(fetch) = entry.upgrade() {
+                fetch
+            } else {
+                let source = self.clone();
+                let storage = storage.clone();
+                let log = log.clone();
+                let id = id.clone();
+                let result = async move {
+                    match storage.fetch_source(&id).await? {
+                        Some(artifact) => Ok(artifact),
+                        None => source.fetch(&log, &storage).await,
+                    }
+                }
+                .map(|result: SourceResult<Artifact>| result.map_err(Arc::new))
+                .boxed()
+                .shared();
+                let fetch = Arc::new(Fetch {
+                    key: key.clone(),
+                    result,
+                });
+                *entry = Arc::downgrade(&fetch);
+                fetch
+            }
+        };
+        let result = fetch.result.clone().await;
+        SOURCE_FETCHES.remove_if(&key, |_, entry| entry.ptr_eq(&Arc::downgrade(&fetch)));
+        result.map_err(|source| SourceError::Shared { source })
     }
 
     /// Probes only the local source cache using the current run's source id.
@@ -127,5 +162,290 @@ impl Source {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::context::logmgr::test_support::shared_log_manager;
+    use crate::context::{Addr, Config, Element, FromElementNoContext, Log};
+    use crate::storage::{Backend, LocalBackend, Storage};
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tempfile::TempDir;
+
+    async fn make_storage(root: &std::path::Path) -> Storage {
+        Storage::init(&make_backend(root).await).await.unwrap()
+    }
+
+    async fn make_backend(root: &std::path::Path) -> Backend {
+        let addr = Addr::parse("//edo-test-cache").unwrap();
+        let mut config_map = BTreeMap::new();
+        config_map.insert(
+            "path".to_string(),
+            serde_json::Value::String(root.to_string_lossy().to_string()),
+        );
+        let element = Element::builder()
+            .addr(addr)
+            .kind("local")
+            .config(config_map)
+            .build();
+        let config = Config::load::<&std::path::Path>(None).await.unwrap();
+        let local = LocalBackend::new(&element, &config).await.unwrap();
+        Backend::new(local)
+    }
+
+    struct CountingSource {
+        id: Id,
+        calls: Arc<AtomicUsize>,
+        gate: Option<Arc<tokio::sync::Notify>>,
+        fail: bool,
+    }
+
+    #[async_trait]
+    impl SourceImpl for CountingSource {
+        async fn get_unique_id(&self) -> SourceResult<Id> {
+            Ok(self.id.clone())
+        }
+        async fn fetch(&self, _log: &Log, storage: &Storage) -> SourceResult<Artifact> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(gate) = &self.gate {
+                gate.notified().await;
+            }
+            if self.fail {
+                return Err(SourceError::Io {
+                    source: std::io::Error::other("fetch failed"),
+                });
+            }
+            use crate::storage::{Artifact as A, Config as ArtCfg, LayerOptions, MediaType};
+            let mut writer = storage.safe_start_layer().await?;
+            use tokio::io::AsyncWriteExt;
+            writer.write_all(b"x").await.unwrap();
+            writer.shutdown().await.unwrap();
+            let layer = storage
+                .safe_finish_layer(
+                    &writer,
+                    &LayerOptions::builder()
+                        .media_type(MediaType::Manifest)
+                        .build(),
+                )
+                .await?;
+            let artifact = A::builder()
+                .media_type(MediaType::Manifest)
+                .config(ArtCfg::builder().id(self.id.clone()).build())
+                .layers(vec![layer])
+                .build();
+            storage.safe_save(&artifact).await?;
+            Ok(artifact)
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(log_manager)]
+    async fn singleflight_coalesces_concurrent_cache_calls() {
+        let dir = TempDir::new().expect("tempdir");
+        let storage = make_storage(dir.path()).await;
+        let logmgr = shared_log_manager().await;
+        let log = logmgr.create("singleflight-test").await.expect("log");
+
+        let id = Id::builder()
+            .name("singleflight_test")
+            .digest("0".repeat(64))
+            .build();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let source = Source::new(CountingSource {
+            id: id.clone(),
+            calls: calls.clone(),
+            gate: Some(gate.clone()),
+            fail: false,
+        });
+
+        let mut handles = Vec::new();
+        for _ in 0..10 {
+            let src = source.clone();
+            let log = log.clone();
+            let storage = storage.clone();
+            handles.push(tokio::spawn(async move { src.cache(&log, &storage).await }));
+        }
+        wait_for_callers(&id, 10).await;
+        // Cancel the original caller; peers must finish the shared fetch.
+        handles.remove(0).abort();
+        gate.notify_one();
+        for h in handles {
+            h.await.expect("join").expect("cache");
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "singleflight should collapse 10 concurrent cache() calls to a single fetch"
+        );
+        assert!(!SOURCE_FETCHES.contains_key(&id.to_string()));
+    }
+
+    async fn wait_for_callers(id: &Id, count: usize) {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if SOURCE_FETCHES
+                    .get(&id.to_string())
+                    .is_some_and(|fetch| fetch.strong_count() == count)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("callers should join the same fetch");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(log_manager)]
+    async fn singleflight_shares_failure_and_allows_retry() {
+        let dir = TempDir::new().unwrap();
+        let storage = make_storage(dir.path()).await;
+        let log = shared_log_manager()
+            .await
+            .create("singleflight-error")
+            .await
+            .unwrap();
+        let id = Id::builder()
+            .name("singleflight_error")
+            .digest("1".repeat(64))
+            .build();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let source = Source::new(CountingSource {
+            id: id.clone(),
+            calls: calls.clone(),
+            gate: Some(gate.clone()),
+            fail: true,
+        });
+        let mut handles = Vec::new();
+        for _ in 0..10 {
+            let source = source.clone();
+            let storage = storage.clone();
+            let log = log.clone();
+            handles.push(tokio::spawn(
+                async move { source.cache(&log, &storage).await },
+            ));
+        }
+        wait_for_callers(&id, 10).await;
+        gate.notify_one();
+        let mut shared_error = None;
+        for handle in handles {
+            let SourceError::Shared { source } = handle.await.unwrap().unwrap_err() else {
+                panic!("expected shared error")
+            };
+            assert!(source.to_string().contains("fetch failed"));
+            if let Some(error) = &shared_error {
+                assert!(Arc::ptr_eq(error, &source));
+            }
+            shared_error = Some(source);
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(!SOURCE_FETCHES.contains_key(&id.to_string()));
+        gate.notify_one();
+        assert!(source.cache(&log, &storage).await.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(!SOURCE_FETCHES.contains_key(&id.to_string()));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(log_manager)]
+    async fn singleflight_reclaims_cancelled_fetch() {
+        let dir = TempDir::new().unwrap();
+        let storage = make_storage(dir.path()).await;
+        let log = shared_log_manager()
+            .await
+            .create("singleflight-cancel")
+            .await
+            .unwrap();
+        let id = Id::builder()
+            .name("singleflight_cancel")
+            .digest("2".repeat(64))
+            .build();
+        let source = Source::new(CountingSource {
+            id: id.clone(),
+            calls: Arc::new(AtomicUsize::new(0)),
+            gate: Some(Arc::new(tokio::sync::Notify::new())),
+            fail: false,
+        });
+        let handle = tokio::spawn(async move { source.cache(&log, &storage).await });
+        wait_for_callers(&id, 1).await;
+        handle.abort();
+        assert!(handle.await.unwrap_err().is_cancelled());
+        assert!(!SOURCE_FETCHES.contains_key(&id.to_string()));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(log_manager)]
+    async fn singleflight_coalesces_source_cache_downloads() {
+        let remote_dir = TempDir::new().unwrap();
+        let remote = make_storage(remote_dir.path()).await;
+        let local_dir = TempDir::new().unwrap();
+        let local = make_storage(local_dir.path()).await;
+        let log = shared_log_manager()
+            .await
+            .create("singleflight-remote")
+            .await
+            .unwrap();
+        let id = Id::builder()
+            .name("singleflight_remote")
+            .digest("3".repeat(64))
+            .build();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let source = Source::new(CountingSource {
+            id: id.clone(),
+            calls: calls.clone(),
+            gate: None,
+            fail: false,
+        });
+        let artifact = source.fetch(&log, &remote).await.unwrap();
+        local
+            .add_source_cache("remote", &make_backend(remote_dir.path()).await)
+            .await;
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let fetch = Arc::new(Fetch {
+            key: id.to_string(),
+            result: {
+                let local = local.clone();
+                let id = id.clone();
+                let gate = gate.clone();
+                async move {
+                    gate.notified().await;
+                    local
+                        .fetch_source(&id)
+                        .await
+                        .map(|artifact| artifact.unwrap())
+                        .map_err(|error| Arc::new(SourceError::from(error)))
+                }
+                .boxed()
+                .shared()
+            },
+        });
+        SOURCE_FETCHES.insert(id.to_string(), Arc::downgrade(&fetch));
+        let mut handles = Vec::new();
+        for _ in 0..10 {
+            let source = source.clone();
+            let local = local.clone();
+            let log = log.clone();
+            handles.push(tokio::spawn(
+                async move { source.cache(&log, &local).await },
+            ));
+        }
+        wait_for_callers(&id, 11).await;
+        assert!(!local.has_local(&id).await.unwrap());
+        gate.notify_one();
+        for handle in handles {
+            assert_eq!(
+                handle.await.unwrap().unwrap().config().id(),
+                artifact.config().id()
+            );
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(local.has_local(&id).await.unwrap());
+        assert!(!SOURCE_FETCHES.contains_key(&id.to_string()));
     }
 }

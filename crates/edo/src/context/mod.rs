@@ -43,7 +43,7 @@ pub mod error;
 mod handle;
 mod lock;
 mod log;
-mod logmgr;
+pub(crate) mod logmgr;
 mod registry;
 mod schema;
 
