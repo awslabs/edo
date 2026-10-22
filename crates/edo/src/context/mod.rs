@@ -31,9 +31,28 @@ use snafu::ResultExt;
 use std::collections::{BTreeMap, HashMap};
 use std::env::current_dir;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::fs::create_dir_all;
+use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
+
+/// Process-wide slot for the CLI-owned cancellation token.
+///
+/// The CLI installs a `tokio::signal::ctrl_c` watcher on process start
+/// (before any `Context` exists) that flips this token on the first
+/// SIGINT. `Context::init` clones this token into its own state so both
+/// the signal handler and the scheduler observers see the same switch.
+/// If never installed (e.g. under tests), `Context::init` falls back to
+/// a fresh token.
+static SIGINT_TOKEN: OnceLock<CancellationToken> = OnceLock::new();
+
+/// Install a session-wide cancellation token that [`Context::init`]
+/// will adopt. Callable exactly once per process; subsequent calls
+/// return the already-installed token so a caller can still get a
+/// clone. Used by the CLI's SIGINT watcher.
+pub fn install_cancellation() -> CancellationToken {
+    SIGINT_TOKEN.get_or_init(CancellationToken::new).clone()
+}
 
 mod address;
 mod builder;
@@ -109,6 +128,12 @@ pub struct Context {
     farms: ArcMap<Addr, Farm>,
     /// Command Line Arguments
     args: HashMap<String, String>,
+    /// Session-wide cancellation token. Handed to every [`Handle`]
+    /// produced by [`Context::get_handle`] / [`Context::get_handle_with_args`]
+    /// so that a quit-prompt choice or a peer fetch failure can flip a
+    /// single switch every worker observes. Also cancelled by the
+    /// installed `SIGINT` handler in the CLI (see `main.rs`).
+    cancellation: CancellationToken,
 }
 
 unsafe impl Send for Context {}
@@ -140,6 +165,15 @@ impl Context {
         // do not clash with other project workspaces.
         let log_path = path.join("logs");
         let log = LogManager::init(&log_path, verbosity).await?;
+        // Adopt the CLI-installed cancellation token if one exists;
+        // otherwise start fresh (e.g. under tests). The CLI's SIGINT
+        // watcher (see `cli::main`) publishes a token here so both the
+        // signal handler and every scheduler worker observe the same
+        // switch.
+        let cancellation = SIGINT_TOKEN
+            .get()
+            .cloned()
+            .unwrap_or_else(CancellationToken::new);
         // Load the configuration
         let config = Config::load(config).await?;
         // Initialize the storage with the default local cache
@@ -171,6 +205,7 @@ impl Context {
             scheduler: Scheduler::new(&path.join("env"), &config).await?,
             farms: Arc::new(DashMap::new()),
             transforms: Arc::new(DashMap::new()),
+            cancellation,
         };
         Ok(ctx.clone())
     }
@@ -212,6 +247,7 @@ impl Context {
                 .map(|x| (x.key().clone(), x.value().clone()))
                 .collect(),
             self.args.clone(),
+            self.cancellation.clone(),
         )
     }
 
@@ -232,7 +268,16 @@ impl Context {
                 .map(|x| (x.key().clone(), x.value().clone()))
                 .collect(),
             merged,
+            self.cancellation.clone(),
         )
+    }
+
+    /// Returns a clone of the session-wide cancellation token. Flipping
+    /// this token cancels the scheduler cooperatively (see the checks
+    /// in `crates/edo/src/scheduler/graph.rs`). Wired to Ctrl+C via the
+    /// TUI `App` and to `tokio::signal::ctrl_c()` in the CLI.
+    pub fn cancellation(&self) -> CancellationToken {
+        self.cancellation.clone()
     }
 
     /// Returns a reference to the loaded configuration.

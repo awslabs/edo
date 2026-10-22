@@ -76,12 +76,33 @@ enum Commands {
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    match args.clone().command {
-        Commands::Checkout(cmd) => cmd.run(args.clone()).await?,
-        Commands::Run(cmd) => cmd.run(args.clone()).await?,
-        Commands::Prune(cmd) => cmd.run(args.clone()).await?,
-        Commands::Update(cmd) => cmd.run(args.clone()).await?,
-        Commands::List(cmd) => cmd.run(args.clone()).await?,
-    }
+    // SIGINT (Ctrl+C) belt-and-braces handler. First tap flips the
+    // shared cancellation switch cooperatively (`Context::cancellation`
+    // observers see it between lifecycle stages). Second tap hard-exits
+    // 130 (128 + SIGINT) so the user always has an escape hatch even if
+    // a worker is stuck in a syscall.
+    //
+    // The `CancellationToken` is published to `Context::init` via the
+    // shared `edo::context::install_cancellation` slot below, so both
+    // this watcher and the scheduler flip the same switch.
+    let sigint_token = edo::context::install_cancellation();
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_err() {
+            return;
+        }
+        sigint_token.cancel();
+        if tokio::signal::ctrl_c().await.is_ok() {
+            std::process::exit(130);
+        }
+    });
+
+    let result = match args.clone().command {
+        Commands::Checkout(cmd) => cmd.run(args.clone()).await,
+        Commands::Run(cmd) => cmd.run(args.clone()).await,
+        Commands::Prune(cmd) => cmd.run(args.clone()).await,
+        Commands::Update(cmd) => cmd.run(args.clone()).await,
+        Commands::List(cmd) => cmd.run(args.clone()).await,
+    };
+    result?;
     Ok(())
 }

@@ -412,6 +412,11 @@ impl Graph {
         };
 
         if let Some(e) = final_error {
+            // Flip the session-wide cancellation switch so any
+            // downstream stage (Graph::run, in-flight prompts, the
+            // caller's outer task) short-circuits instead of waiting
+            // for the doomed run to unwind through timeouts.
+            ctx.cancellation().cancel();
             return Err(e);
         }
         Ok(())
