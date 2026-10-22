@@ -48,7 +48,15 @@ impl SourceImpl for GitSource {
         );
         let digest = base16::encode_lower(hasher.finalize().as_slice());
         let id = Id::builder()
-            .name(format!("{}@{}", self.url, self.reference))
+            .name(format!(
+                "{}@{}-{:?}",
+                self.url,
+                self.reference,
+                self.out
+                    .as_ref()
+                    .and_then(|x| x.to_str())
+                    .unwrap_or_default()
+            ))
             .digest(digest)
             .build();
         trace!(component = "source", type = "git", "calculated id to be {id}");
