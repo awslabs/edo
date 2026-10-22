@@ -320,6 +320,24 @@ impl Inner {
     pub async fn prune_local_all(&self) -> StorageResult<()> {
         self.local.prune_all().await
     }
+
+    pub async fn drop_local(&self, id: &Id) -> StorageResult<()> {
+        self.local.del(id).await
+    }
+
+    pub async fn drop_local_matching(&self, id: &Id) -> StorageResult<()> {
+        // Snapshot the prefix listing first; deletions run under the
+        // backend's own locking, so we cannot hold a catalog read guard
+        // across them.
+        let matching = self.local.list().await?;
+        let prefix = id.prefix();
+        for entry in matching {
+            if entry.prefix() == prefix {
+                self.local.del(&entry).await?;
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Storage {
@@ -467,6 +485,27 @@ impl Storage {
     /// Remove all artifacts and blobs from the local cache.
     pub async fn prune_local_all(&self) -> StorageResult<()> {
         self.inner.read().await.prune_local_all().await
+    }
+
+    /// Remove exactly the artifact with the given `id` from the local cache.
+    ///
+    /// Unlike [`Self::prune_local`], which retains `id` and drops other
+    /// artifacts sharing its prefix, this method removes only `id` itself
+    /// and is a no-op when the local cache does not contain it. Blobs shared
+    /// with surviving artifacts are refcounted by the catalog and kept.
+    pub async fn drop_local(&self, id: &Id) -> StorageResult<()> {
+        self.inner.read().await.drop_local(id).await
+    }
+
+    /// Remove every artifact whose id shares a prefix with the given `id`
+    /// from the local cache, including `id` itself.
+    ///
+    /// Use this to drop every build variant produced by a single transform
+    /// while leaving other transforms' artifacts and any source-cache blobs
+    /// untouched. Shared blobs are retained as long as some other artifact
+    /// still references them.
+    pub async fn drop_local_matching(&self, id: &Id) -> StorageResult<()> {
+        self.inner.read().await.drop_local_matching(id).await
     }
 }
 
