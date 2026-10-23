@@ -5,7 +5,6 @@ use edo::{
     storage::{Artifact, ArtifactStageOptions, Compression, Config, Id, LayerOptions, MediaType},
     transform::{TransformImpl, TransformResult, TransformStatus},
 };
-use snafu::OptionExt;
 use std::path::Path;
 
 #[derive(serde::Deserialize, Debug, Clone)]
@@ -55,10 +54,7 @@ impl TransformImpl for ComposeTransform {
         let mut depend = self.depends.clone();
         depend.sort();
         for depend in depend.iter() {
-            let t = ctx.get(depend).context(error::NotFoundSnafu {
-                addr: depend.clone(),
-            })?;
-            let id = t.get_unique_id(ctx).await?;
+            let id = ctx.unique_id_of(depend).await?;
             hash.update(id.digest().as_bytes());
         }
         let hash_bytes = hash.finalize();
@@ -77,6 +73,10 @@ impl TransformImpl for ComposeTransform {
         Ok(self.depends.clone())
     }
 
+    async fn needs_prepare(&self, _ctx: &Handle) -> TransformResult<bool> {
+        Ok(false)
+    }
+
     async fn prepare(&self, _log: &Log, _ctx: &Handle) -> TransformResult<()> {
         // Do nothing for a compose
         Ok(())
@@ -88,11 +88,15 @@ impl TransformImpl for ComposeTransform {
 
         // Stage all the dependencies
         for dep in self.depends().await? {
-            let t = ctx
-                .get(&dep)
-                .context(error::NotFoundSnafu { addr: dep.clone() })?;
-            let id = t.get_unique_id(ctx).await?;
-            trace!(component = "transform", type = "compose", "staging dependencies {dep} with id {id} into install-root");
+            let id = ctx.unique_id_of(&dep).await?;
+            trace!(
+                subsystem = "transform",
+                component = "compose",
+                op = "stage",
+                addr = %dep,
+                id = %id,
+                "staging dependency into install-root"
+            );
             env.stage(
                 ctx,
                 ArtifactStageOptions::builder()
@@ -107,7 +111,7 @@ impl TransformImpl for ComposeTransform {
 
     async fn transform(&self, _log: &Log, ctx: &Handle, env: &Environment) -> TransformStatus {
         match async move {
-            let id = self.get_unique_id(ctx).await?;
+            let id = ctx.unique_id_of(&self.addr).await?;
 
             // Create the artifact manifest
             let mut artifact = Artifact::builder()
