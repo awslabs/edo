@@ -164,7 +164,7 @@ impl TransformImpl for CargoVendorTransform {
     /// from colliding and makes the staged paths content-addressed.
     async fn stage(&self, _log: &Log, ctx: &Handle, env: &Environment) -> TransformResult<()> {
         // For each source we are going to stage things into addr centered directories
-        for (_, source) in self.sources.iter() {
+        for source in self.sources.values() {
             let id = source.cached_unique_id(ctx).await?;
             trace!(
                 subsystem = "transform",
