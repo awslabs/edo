@@ -59,7 +59,7 @@ where
 
 /// Run a command capturing stdout into a byte vector; stderr goes to the log.
 ///
-/// Stdin is `/dev/null`.
+/// Stdin is `/dev/null`. A nonzero exit status returns an I/O error.
 pub fn cmd_collect_out<P, S, A, I>(
     path: P,
     log: &Log,
@@ -77,7 +77,6 @@ where
         .stdin_null()
         .stdout_capture()
         .stderr_file(log)
-        .unchecked()
         .dir(path.as_ref());
     for (key, value) in env.iter() {
         expr = expr.env(key.clone(), value.clone());
@@ -213,6 +212,29 @@ mod tests {
     use crate::context::logmgr::test_support::shared_log_manager;
     use std::collections::HashMap;
     use tempfile::TempDir;
+
+    #[tokio::test]
+    #[serial_test::serial(log_manager)]
+    async fn test_cmd_collect_out_rejects_nonzero_exit_and_logs_stderr() {
+        let mgr = shared_log_manager().await;
+        let log = mgr.create("cmd-collect-failed").await.expect("log");
+        let result = cmd_collect_out(
+            ".",
+            &log,
+            "sh",
+            ["-c", "echo misleading-stdout; echo diagnostic >&2; exit 7"],
+            &HashMap::new(),
+        );
+        assert!(
+            result.is_err(),
+            "nonzero exit must not return output as success"
+        );
+        let captured = std::fs::read_to_string(log.path()).expect("read log");
+        assert!(
+            captured.contains("diagnostic"),
+            "stderr must be preserved in the log"
+        );
+    }
 
     fn rerun_with_piped_stdin(test: &str) -> bool {
         if std::env::var("EDO_STDIN_TEST").as_deref() == Ok(test) {

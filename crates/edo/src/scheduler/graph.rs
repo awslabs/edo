@@ -378,6 +378,22 @@ impl Graph {
         Ok(())
     }
 
+    /// Reports prepared nodes as successful when execution is not requested.
+    pub(crate) fn finish_fetch(&self) {
+        for (_, node) in self.graph.node_references() {
+            if !node.is_cache_hit() {
+                crate::ui_update_task!(
+                    subsystem = "transform",
+                    component = "scheduler",
+                    op = "fetch";
+                    &node.addr.to_string(),
+                    TaskStatus::Success,
+                    Some(phase::FETCHED.into())
+                );
+            }
+        }
+    }
+
     /// Executes the target subgraph in topological order with bounded concurrency.
     pub async fn run(&self, path: &Path, ctx: &Context, addr: &Addr) -> Result<()> {
         // Preserve fetch-phase ids during staging and output storage.

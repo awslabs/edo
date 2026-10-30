@@ -25,7 +25,10 @@ pub struct Requirement {
     pub kind: String,
     /// Semver constraint the resolved version must satisfy.
     pub at: VersionReq,
-    /// Optional vendor address restricting dependency resolution.
+    /// Optional absolute vendor address (`//…`) restricting resolution.
+    ///
+    /// This address is not rerooted for subprojects. When absent, any
+    /// vendor providing a matching version is eligible.
     pub vendor: Option<String>,
 }
 
@@ -228,6 +231,20 @@ impl Schema {
         &self.source
     }
 
+    /// Inserts a source cache rooted at `//edo-source-cache/<name>`.
+    ///
+    /// Leaves an existing cache with the same name unchanged.
+    pub fn add_source_cache(&mut self, name: &str, mut element: Element) {
+        self.cache
+            .source
+            .entry(name.to_string())
+            .or_insert_with(|| {
+                element.addr = Addr::parse(&format!("//edo-source-cache/{name}"))
+                    .expect("source cache names form valid addresses");
+                element
+            });
+    }
+
     /// Inserts a resolved source element. Used by the lockfile / resolver
     /// path to fold vendor-provided sources back into the schema before
     /// [`Schema::resolve_sources`] runs.
@@ -257,6 +274,16 @@ impl Schema {
     pub fn requires(&self) -> &BTreeMap<Addr, Requirement> {
         &self.requires
     }
+
+    /// Removes and returns the requirement at `addr`, if one is present.
+    pub fn remove_require(&mut self, addr: &Addr) -> Option<Requirement> {
+        self.requires.remove(addr)
+    }
+
+    /// Mutably access a vendor element by address.
+    pub fn vendor_mut(&mut self, addr: &Addr) -> Option<&mut Element> {
+        self.vendor.get_mut(addr)
+    }
 }
 
 #[cfg(test)]
@@ -266,6 +293,62 @@ mod tests {
     //! to lock down the deserialization shape.
     use super::*;
     use crate::context::{SourceMap, error};
+
+    #[test]
+    fn test_add_source_cache_normalizes_address_and_preserves_existing() {
+        let mut schema = Schema::default();
+        let cache = Element::builder()
+            .addr(addr("//wrong"))
+            .kind("local")
+            .config(BTreeMap::new())
+            .build();
+        schema.add_source_cache("downloads", cache);
+        let inserted = &schema.get_source_caches()["downloads"];
+        assert_eq!(inserted.addr, addr("//edo-source-cache/downloads"));
+        assert_eq!(inserted.kind, "local");
+
+        let replacement = Element::builder()
+            .addr(addr("//other"))
+            .kind("s3")
+            .config(BTreeMap::new())
+            .build();
+        schema.add_source_cache("downloads", replacement);
+        let retained = &schema.get_source_caches()["downloads"];
+        assert_eq!(retained.addr, addr("//edo-source-cache/downloads"));
+        assert_eq!(retained.kind, "local");
+    }
+
+    #[test]
+    fn test_remove_require_returns_requirement_once() {
+        let mut schema = parse_schema("[requires.sdk]\nkind = 'image'\nat = '=0.77.0'\n");
+        let key = schema.requires().keys().next().unwrap().clone();
+        let removed = schema.remove_require(&key).expect("requirement exists");
+        assert_eq!(removed.kind, "image");
+        assert_eq!(removed.at, VersionReq::parse("=0.77.0").unwrap());
+        assert!(removed.vendor.is_none(), "missing vendor defaults to None");
+        assert!(schema.requires().is_empty(), "requirement must be removed");
+        assert!(
+            schema.remove_require(&key).is_none(),
+            "missing requirement returns None"
+        );
+    }
+
+    #[test]
+    fn test_vendor_mut_updates_only_existing_vendor() {
+        let mut schema = parse_schema("[vendor.registry]\nkind = 'image'\nuri = 'old'\n");
+        let key = schema.vendors().keys().next().unwrap().clone();
+        schema
+            .vendor_mut(&key)
+            .expect("vendor exists")
+            .config
+            .insert("uri".into(), serde_json::json!("new"));
+        assert_eq!(schema.vendors()[&key].config["uri"], "new");
+        assert!(
+            schema.vendor_mut(&addr("//missing")).is_none(),
+            "missing vendor returns None"
+        );
+        assert_eq!(schema.vendors().len(), 1);
+    }
 
     fn addr(s: &str) -> Addr {
         Addr::parse(s).unwrap()

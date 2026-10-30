@@ -20,6 +20,7 @@ indicatif         = { workspace = true }
 merkle_hash       = { workspace = true }
 names             = { workspace = true }
 ocilot            = { workspace = true }
+regex             = { workspace = true }
 reqwest           = { workspace = true }
 semver            = { workspace = true }
 serde             = { workspace = true }

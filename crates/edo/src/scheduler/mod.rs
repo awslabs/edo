@@ -123,6 +123,15 @@ impl Scheduler {
     pub async fn run(&self, ctx: &Context, addr: &Addr) -> Result<()> {
         self.inner.run(ctx, addr).await
     }
+
+    /// Builds the dependency graph for `addr` and drives it through
+    /// [`Graph::fetch`] only — no transform execution.
+    ///
+    /// Convenience wrapper around [`Inner::fetch`]; see that method for the
+    /// phase-by-phase walk-through.
+    pub async fn fetch(&self, ctx: &Context, addr: &Addr) -> Result<()> {
+        self.inner.fetch(ctx, addr).await
+    }
 }
 
 /// Inner state held behind the [`Scheduler`]'s `Arc`.
@@ -152,16 +161,27 @@ impl Inner {
     ///    we want shared ownership across worker tasks) and `Graph::run`
     ///    spawns the worker pool and drives the topological dispatch.
     pub async fn run(&self, ctx: &Context, addr: &Addr) -> Result<()> {
-        let mut graph = Graph::new(self.workers);
-        graph.add(ctx, addr).await?;
-
-        // Must precede `fetch` so it precedes task-start events.
-        crate::ui_start_build!(&addr.to_string(), graph.subgraph_size(addr));
-
-        graph.fetch(ctx).await?;
+        let graph = self.build_and_fetch(ctx, addr).await?;
         let graph_ref = Arc::new(graph);
         graph_ref.run(&self.path, ctx, addr).await?;
         Ok(())
+    }
+
+    /// Prepares the target graph without executing transforms.
+    pub async fn fetch(&self, ctx: &Context, addr: &Addr) -> Result<()> {
+        let graph = self.build_and_fetch(ctx, addr).await?;
+        graph.finish_fetch();
+        crate::ui_finish_build!();
+        Ok(())
+    }
+
+    /// Builds the target DAG and prepares uncached nodes for either mode.
+    async fn build_and_fetch(&self, ctx: &Context, addr: &Addr) -> Result<Graph> {
+        let mut graph = Graph::new(self.workers);
+        graph.add(ctx, addr).await?;
+        crate::ui_start_build!(&addr.to_string(), graph.subgraph_size(addr));
+        graph.fetch(ctx).await?;
+        Ok(graph)
     }
 }
 
@@ -177,11 +197,47 @@ mod tests {
     //! imports out of the hot path); `scheduler::tests` is adjacent to
     //! `graph::tests` in the same module tree and can share.
 
-    use super::graph::tests::{ensure_default_farm, register_mock, try_shared_context};
+    use super::graph::tests::{
+        ensure_default_farm, register_mock, register_mock_no_prepare, try_shared_context,
+    };
     use super::*;
+    use std::collections::BTreeMap;
     use std::sync::Arc;
     use std::sync::atomic::Ordering as AtomicOrdering;
     use tempfile::TempDir;
+    use tracing::instrument::WithSubscriber;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    /// Records final task states and the build-finished event in emission order.
+    #[derive(Clone, Default)]
+    struct FetchEvents(Arc<std::sync::Mutex<Vec<BTreeMap<String, String>>>>);
+
+    #[derive(Default)]
+    struct EventFields(BTreeMap<String, String>);
+
+    impl tracing::field::Visit for EventFields {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.insert(field.name().into(), format!("{value:?}"));
+        }
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.insert(field.name().into(), value.into());
+        }
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for FetchEvents {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut fields = EventFields::default();
+            event.record(&mut fields);
+            self.0
+                .lock()
+                .expect("event mutex is not poisoned")
+                .push(fields.0);
+        }
+    }
 
     /// Build a `Config` from an inline TOML snippet. Using a real file is
     /// the only public path — `Config::load` has no in-memory constructor.
@@ -276,6 +332,136 @@ mod tests {
         assert_eq!(h_a.transform_called.load(AtomicOrdering::SeqCst), 1);
         assert_eq!(h_b.transform_called.load(AtomicOrdering::SeqCst), 1);
         assert_eq!(h_c.transform_called.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    // ── Scheduler::fetch stops after prepare ─────────────────────────────
+
+    #[tokio::test]
+    #[serial_test::serial(log_manager)]
+    async fn fetch_runs_prepare_and_stops_before_execution() {
+        let Some(ctx) = try_shared_context().await else {
+            eprintln!(
+                "skip: global tracing subscriber already initialized by a \
+                 sibling test"
+            );
+            return;
+        };
+        ensure_default_farm(&ctx);
+
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mi = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let h_d = register_mock_no_prepare(&ctx, "//sf/d", &[]);
+        let h_c = register_mock(&ctx, "//sf/c", &["//sf/d"], order.clone(), mi.clone());
+        let h_b = register_mock(&ctx, "//sf/b", &["//sf/c"], order.clone(), mi.clone());
+        let h_a = register_mock(&ctx, "//sf/a", &["//sf/b"], order, mi);
+
+        let dir = TempDir::new().unwrap();
+        let cfg = empty_config(&dir).await;
+        let s = Scheduler::new(dir.path().join("ws"), &cfg).await.unwrap();
+        let events = FetchEvents::default();
+        let subscriber = tracing_subscriber::registry().with(events.clone());
+        s.fetch(&ctx, &Addr::parse("//sf/a").unwrap())
+            .with_subscriber(subscriber)
+            .await
+            .expect("fetch");
+
+        let captured = events.0.lock().expect("event mutex is not poisoned");
+        let finished = captured
+            .iter()
+            .position(|event| {
+                event
+                    .get("message")
+                    .is_some_and(|message| message == "finishing build")
+            })
+            .expect("build must finish");
+        for addr in ["//sf/a", "//sf/b", "//sf/c", "//sf/d"] {
+            let (position, event) = captured
+                .iter()
+                .enumerate()
+                .rfind(|(_, event)| event.get("id").is_some_and(|id| id == addr))
+                .expect("task must have a final event");
+            assert_eq!(
+                event["status"], "success",
+                "{addr} must finish successfully"
+            );
+            assert_eq!(event["phase"], "fetched");
+            assert!(
+                position < finished,
+                "task must finish before the build finishes"
+            );
+        }
+        drop(captured);
+
+        // Only nodes requiring preparation invoke `prepare`.
+        assert_eq!(h_d.prepare_called.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(h_a.prepare_called.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(h_b.prepare_called.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(h_c.prepare_called.load(AtomicOrdering::SeqCst), 1);
+        // … and no node advanced past prepare into stage/transform.
+        assert_eq!(h_a.stage_called.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(h_b.stage_called.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(h_c.stage_called.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(h_a.transform_called.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(h_b.transform_called.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(h_c.transform_called.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(log_manager)]
+    async fn test_fetch_preserves_cached_terminal_status() {
+        let ctx = try_shared_context().await.expect("shared context");
+        ensure_default_farm(&ctx);
+        let state = register_mock(
+            &ctx,
+            "//fetch-cached/target",
+            &[],
+            Arc::new(std::sync::Mutex::new(Vec::new())),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        );
+        let addr = Addr::parse("//fetch-cached/target").unwrap();
+        let dir = TempDir::new().unwrap();
+        let cfg = empty_config(&dir).await;
+        let scheduler = Scheduler::new(dir.path(), &cfg).await.unwrap();
+        let id = ctx.get_handle().unique_id_of(&addr).await.unwrap();
+        let artifact = crate::storage::Artifact::builder()
+            .media_type(crate::storage::MediaType::File(
+                crate::storage::Compression::None,
+            ))
+            .config(crate::storage::Config::builder().id(id).build())
+            .build();
+        ctx.storage()
+            .safe_save(&artifact)
+            .await
+            .expect("populate the build cache");
+        let events = FetchEvents::default();
+        scheduler
+            .fetch(&ctx, &addr)
+            .with_subscriber(tracing_subscriber::registry().with(events.clone()))
+            .await
+            .expect("fetch a cached target");
+        let captured = events.0.lock().expect("event mutex is not poisoned");
+        let task_events: Vec<_> = captured
+            .iter()
+            .filter(|event| {
+                event.contains_key("status") && event.get("id") == Some(&addr.to_string())
+            })
+            .collect();
+        assert_eq!(
+            task_events.len(),
+            1,
+            "cached status must not be overwritten: {task_events:?}"
+        );
+        assert_eq!(task_events[0]["status"], "cached");
+        assert_eq!(
+            state.prepare_called.load(AtomicOrdering::SeqCst),
+            0,
+            "cached fetch must not prepare"
+        );
+        assert_eq!(
+            state.transform_called.load(AtomicOrdering::SeqCst),
+            0,
+            "cached fetch must not execute"
+        );
     }
 
     #[tokio::test]
