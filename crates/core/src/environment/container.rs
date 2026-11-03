@@ -451,15 +451,9 @@ impl EnvironmentImpl for Container {
                 std::path::absolute(self.path.clone()).unwrap().display()
             ));
         }
-        if !self.env.is_empty() {
+        for entry in self.env.iter() {
             args.push("--env".into());
-            let env_list = self
-                .env
-                .iter()
-                .map(|x| format!("{}={}", x.key(), x.value()))
-                .collect::<Vec<_>>()
-                .join(",");
-            args.push(env_list);
+            args.push(format!("{}={}", entry.key(), entry.value()));
         }
         args.push("--name".into());
         args.push(self.name.clone());
@@ -674,15 +668,9 @@ impl EnvironmentImpl for Container {
             args.push("-u".into());
             args.push("0:0".into());
         }
-        if !self.env.is_empty() {
+        for entry in self.env.iter() {
             args.push("--env".into());
-            let env_list = self
-                .env
-                .iter()
-                .map(|x| format!("{}={}", x.key(), x.value()))
-                .collect::<Vec<_>>()
-                .join(",");
-            args.push(env_list);
+            args.push(format!("{}={}", entry.key(), entry.value()));
         }
         args.push(self.name.clone());
         let mut run_args = args.clone();
@@ -714,15 +702,9 @@ impl EnvironmentImpl for Container {
             args.push("-u".into());
             args.push("0:0".into());
         }
-        if !self.env.is_empty() {
+        for entry in self.env.iter() {
             args.push("--env".into());
-            let env_list = self
-                .env
-                .iter()
-                .map(|x| format!("{}={}", x.key(), x.value()))
-                .collect::<Vec<_>>()
-                .join(",");
-            args.push(env_list);
+            args.push(format!("{}={}", entry.key(), entry.value()));
         }
         args.push(self.name.clone());
         let mut run_args = args.clone();
