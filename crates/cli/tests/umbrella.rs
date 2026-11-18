@@ -1,4 +1,5 @@
-use edo_integration_tests::common::*;
+mod common;
+use common::*;
 use predicates::str::contains;
 use serial_test::serial;
 
@@ -23,7 +24,7 @@ fn list_from_umbrella_root() {
 #[serial]
 fn manual_smoke() {
     // Regressions the link between the committed in-tree fixtures and the
-    // manual-run cheatsheet in tests/fixtures/README.md. Edo writes
+    // manual-run cheatsheet in crates/cli/tests/fixtures/README.md. Edo writes
     // `edo.lock.json` into the CWD on load, so we cannot invoke it directly
     // against the repo — we copy first, and assert the same commands the
     // README advertises succeed against an identical tree.

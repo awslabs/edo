@@ -8,7 +8,6 @@ license    = "MIT OR Apache-2.0"
 keywords   = ["edo"]
 
 [dependencies]
-astral-tokio-tar  = { workspace = true }
 async-compression = { workspace = true }
 clap              = { workspace = true }
 edo               = { path = "../edo" }
@@ -17,3 +16,12 @@ mockall           = { workspace = true }
 snafu             = { workspace = true }
 tokio             = { workspace = true }
 tokio-util        = { workspace = true }
+
+[dev-dependencies]
+assert_cmd  = { workspace = true }
+predicates  = { workspace = true }
+regex       = { workspace = true }
+serde_json  = { workspace = true }
+serial_test = { workspace = true }
+tempfile    = { workspace = true }
+which       = { workspace = true }

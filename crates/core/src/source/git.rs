@@ -9,7 +9,6 @@ use snafu::{ResultExt, ensure};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use tempfile::tempdir;
-use tokio::io::AsyncWriteExt;
 
 /// A source that clones a Git repository at a specific reference.
 #[derive(serde::Deserialize, Debug, Clone)]
@@ -90,14 +89,10 @@ impl SourceImpl for GitSource {
             .build();
 
         // Archive the checkout as a single layer.
-        let mut writer = storage.safe_start_layer().await?;
-        let mut archive = tokio_tar::Builder::new(writer.clone());
-        archive
-            .append_dir_all(".", temp.path())
+        let writer = storage.safe_start_layer().await?;
+        edo::util::archive::pack_dir(writer.clone(), temp.path())
             .await
             .context(error::ArchiveSnafu)?;
-        writer.flush().await.context(error::ArchiveSnafu)?;
-        archive.finish().await.context(error::ArchiveSnafu)?;
         let layer = storage
             .safe_finish_layer(
                 &writer,

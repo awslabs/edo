@@ -597,11 +597,7 @@ impl EnvironmentImpl for Container {
                     path = %file_path.display(),
                     "unpacking archive"
                 );
-                let mut archive = tokio_tar::ArchiveBuilder::new(reader)
-                    .set_preserve_permissions(true)
-                    .build();
-                archive
-                    .unpack(&file_path)
+                edo::util::archive::unpack(reader, &file_path, true)
                     .await
                     .context(error::ExtractSnafu)?;
             }
@@ -637,12 +633,9 @@ impl EnvironmentImpl for Container {
                 path = %file_path.display(),
                 "archiving directory"
             );
-            let mut archive = tokio_tar::Builder::new(writer);
-            archive
-                .append_dir_all(".", &file_path)
+            edo::util::archive::pack_dir(writer, &file_path)
                 .await
                 .context(error::ArchiveSnafu)?;
-            archive.finish().await.context(error::ArchiveSnafu)?;
         }
         Ok(())
     }

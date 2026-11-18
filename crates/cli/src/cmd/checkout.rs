@@ -20,7 +20,6 @@ use snafu::ResultExt;
 use std::pin::Pin;
 use tokio::fs::{File, create_dir_all};
 use tokio::io::BufReader;
-use tokio_tar::Archive;
 
 use crate::Args;
 
@@ -63,7 +62,7 @@ impl Checkout {
             match media_type {
                 MediaType::Tar(compression) => {
                     let buffered = BufReader::new(raw_reader);
-                    let reader: Pin<Box<dyn tokio::io::AsyncRead>> = match compression {
+                    let reader: Pin<Box<dyn tokio::io::AsyncRead + Send>> = match compression {
                         Compression::Bzip2 => Box::pin(BzDecoder::new(buffered)),
                         Compression::Lz4 => Box::pin(Lz4Decoder::new(buffered)),
                         Compression::Lzma => Box::pin(LzmaDecoder::new(buffered)),
@@ -72,8 +71,9 @@ impl Checkout {
                         Compression::Zstd => Box::pin(ZstdDecoder::new(buffered)),
                         Compression::None => Box::pin(buffered),
                     };
-                    let mut archive = Archive::new(reader);
-                    archive.unpack(&self.output).await.context(error::IoSnafu)?;
+                    edo::util::archive::unpack(reader, &self.output, false)
+                        .await
+                        .context(error::IoSnafu)?;
                 }
                 MediaType::Zip(compression) => {
                     // Outer compression for zip layers is unusual, but honor

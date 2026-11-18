@@ -8,7 +8,6 @@ use sha2::{Digest, Sha256};
 use snafu::{ResultExt, ensure};
 use std::path::{PathBuf, absolute};
 use tokio::{fs::File, io::AsyncWriteExt};
-use tokio_tar::Builder;
 
 /// A source backed by a local filesystem path.
 #[derive(serde::Deserialize, Debug, Clone)]
@@ -123,13 +122,9 @@ impl SourceImpl for LocalSource {
                 "archiving contents of directory at {:?}",
                 self.path
             );
-            let mut archive = Builder::new(writer.clone());
-            archive.mode(tokio_tar::HeaderMode::Complete);
-            archive
-                .append_dir_all(".", &self.path)
+            edo::util::archive::pack_dir(writer.clone(), &self.path)
                 .await
                 .context(error::ArchiveSnafu)?;
-            archive.finish().await.context(error::ArchiveSnafu)?;
             (MediaType::Tar(Compression::None), self.out.clone())
         };
         writer.flush().await.context(error::ReadFileSnafu)?;

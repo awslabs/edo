@@ -5,7 +5,6 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-astral-tokio-tar  = { workspace = true }
 async-trait       = { workspace = true }
 async_zip         = { workspace = true }
 aws-config        = { workspace = true }

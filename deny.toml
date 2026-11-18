@@ -74,8 +74,7 @@ workspace-default-features = "allow"
 external-default-features  = "allow"
 # List of crates that are allowed. Use with care!
 allow                      = [
-  # "ansi_term@0.11.0",
-  # { crate = "ansi_term@0.11.0", reason = "you can specify a reason it is allowed" },
+  
 ]
 # List of crates to deny
 deny                       = [
@@ -111,10 +110,9 @@ skip      = [
     { crate = "lock_api", reason = "dashmap" },
     { crate = "parking_lot", reason = "aws-sdk and tokio" },
     { crate = "parking_lot_core", reason = "dashmap caused" },
-    { crate = "rand", reason = "names relies on old version but we use latest"},
-    { crate = "rand_core", reason = "product of getrandom" },
     { crate = "redox_syscall", reason = "dashmap and aws-sdk use different parking_lot leading to this"},
     { crate = "r-efi", reason = "product of getrandom" },
+    { crate = "spin", reason = "flume brings in and older copy of spin" },
     { crate = "supports-color", reason = "owo-colors brings in two copies"},
     { crate = "syn", reason = "rust ecosystem and aws-sdk has not moved to 3.0 yet"}
 ]
