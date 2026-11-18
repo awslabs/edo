@@ -1,4 +1,5 @@
-use edo_integration_tests::common::*;
+mod common;
+use common::*;
 
 #[test]
 fn run_git_source() {

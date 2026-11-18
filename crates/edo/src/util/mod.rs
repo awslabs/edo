@@ -1,18 +1,17 @@
 //! Utility helpers shared across the crate.
 //!
 //! Provides [`Reader`] and [`Writer`] wrappers with integrated SHA256 hashing,
-//! synchronous adapters for async I/O ([`SyncReader`], [`sync`], [`sync_fn`]),
+//! tar packing/extraction over async streams ([`archive`]),
 //! filesystem helpers ([`copy_r`]), and subprocess execution functions that
 //! pipe output through the build log.
 
+pub mod archive;
 mod command;
 mod fs;
 mod reader;
-mod sync;
 mod writer;
 
 pub use command::*;
 pub use fs::*;
 pub use reader::*;
-pub use sync::*;
 pub use writer::*;

@@ -22,7 +22,7 @@ Edo is a Rust build tool for reproducible, environment-controlled builds (OS ima
 crates/cli/   binary `edo-cli` — clap entry, subcommands in src/cmd/
 crates/edo/   library — abstractions, Context, Scheduler, Storage model
 crates/core/  library — builtin Storage/Source/Environment/Transform/Vendor impls
-tests/        `edo-integration-tests` crate — black-box CLI tests
+crates/cli/tests/  black-box CLI integration tests + fixtures
 docs/         design.md, requirements.md, components/{storage,source,environment,transform}.md
 ```
 
@@ -82,7 +82,7 @@ Test commands — see "Testing & QA" below.
 - **Source caching**: prefer `Source::cache(log, storage)` (cache-aware) over the raw `Source::fetch` (always re-pulls).
 - **Builders**: `bon` macro is used for typed builders (e.g. `Id::builder()`).
 - **Templating**: `handlebars` is used by `ScriptTransform`. Known variables include `{{install-root}}`, `{{build-root}}`, `{{arch}}`, plus any `--arg KEY=VALUE` passed on the CLI. Read `crates/core/src/transform/script.rs` for the full set.
-- **No new abstraction layers**: the README/design docs reference Starlark and a "Build Engine" struct — both are alternatives that were rejected; the implementation is TOML + `Context`/`Scheduler`. Trust `crates/edo/src/context/schema.rs` and `tests/fixtures/**/edo.toml`.
+- **No new abstraction layers**: the README/design docs reference Starlark and a "Build Engine" struct — both are alternatives that were rejected; the implementation is TOML + `Context`/`Scheduler`. Trust `crates/edo/src/context/schema.rs` and `crates/cli/tests/fixtures/**/edo.toml`.
 
 ## Important Files
 
@@ -102,29 +102,29 @@ Test commands — see "Testing & QA" below.
 | Environment / Farm / VFS | `crates/edo/src/environment/{mod,farm,vfs}.rs` |
 | Transform trait + macro | `crates/edo/src/transform/mod.rs` |
 | Workspace config | `Cargo.toml`, `deny.toml` |
-| Canonical TOML examples | `tests/fixtures/hello_local/edo.toml`, `hello_script/edo.toml`, `hello_compose/edo.toml`, `tests/net_fixtures/net_container_script/edo.toml` |
+| Canonical TOML examples | `crates/cli/tests/fixtures/hello_local/edo.toml`, `hello_script/edo.toml`, `hello_compose/edo.toml`, `crates/cli/tests/net_fixtures/net_container_script/edo.toml` |
 
-There is no `examples/` directory on disk despite README references; use `tests/fixtures/` and `tests/net_fixtures/` for canonical configurations. `examples/hello_oci` is referenced as broken in the docs and does not exist.
+There is no `examples/` directory on disk despite README references; use `crates/cli/tests/fixtures/` and `crates/cli/tests/net_fixtures/` for canonical configurations. `examples/hello_oci` is referenced as broken in the docs and does not exist.
 
 ## Runtime/Tooling Preferences
 
 - **Toolchain**: stable Rust supporting edition 2024 (Rust ≥ 1.85). No `rust-toolchain.toml` is committed; do not add one without team agreement.
 - **Package manager**: cargo only. Workspace `[workspace.dependencies]` pins all versions — every crate consumes deps via `{ workspace = true }`. Add new deps to root `Cargo.toml` first, then reference from member crates.
 - **Build artefact name**: the CLI binary is `edo-cli` (Cargo default; no `[[bin]]` override). Integration tests resolve it via `assert_cmd::Command::cargo_bin("edo-cli")`.
-- **Excluded paths**: `examples/`, `.edo/`, `tests/error_fixtures/`, `tests/fixtures/`, `tests/net_fixtures/` are listed in `Cargo.toml`'s `exclude` so cargo never treats fixtures as packages.
+- **Excluded paths**: `examples/`, `.edo/`, `crates/cli/tests/{error_fixtures,fixtures,net_fixtures}/` are listed in `Cargo.toml`'s `exclude` so cargo never treats fixtures as packages.
 - **Supply chain**: `cargo-deny` is the gate. License allowlist (Apache-2.0/MIT/BSD-2/3-Clause/ISC/MPL-2.0/Zlib/Unicode-3.0/CDLA-Permissive-2.0/BSL-1.0/CC0-1.0/Unlicense/MIT-0/bzip2-1.0.6) is in `deny.toml`; `multiple-versions = "warn"`; only `crates.io` is allowed as a registry. Run `cargo deny check` before adding or upgrading dependencies.
 - **Lint / format config**: none committed (`rustfmt.toml`, `clippy.toml`, `[workspace.lints]` all absent). Default `rustfmt --edition 2024` and stock `clippy` apply. Do not add a project-local config without coordinating.
 - **No CI / Makefile / justfile** is committed.
 
 ## Testing & QA
 
-- Test crate: `tests/` → `edo-integration-tests` (workspace member, `publish = false`). Fixture trees (`tests/fixtures/`, `tests/net_fixtures/`, `tests/error_fixtures/`) are `exclude`d so cargo never compiles them.
-- Strategy: black-box CLI tests via `assert_cmd::Command::cargo_bin("edo-cli")`. Each test calls `common::copy_fixture(...)` (or `copy_umbrella()`) to clone the fixture into a `TempDir`, then injects `--storage <tempdir>/.edo-test-store` to isolate state. Helpers live in `tests/src/common/{fixtures,network}.rs`.
+- Integration tests live in `crates/cli/tests/*.rs` (one test binary per file) so cargo sets `CARGO_BIN_EXE_edo-cli` for them. Do not move them to a separate crate: `cargo_bin`'s fallback lookup breaks under the cargo ≥1.100 build-dir layout. Fixture trees (`crates/cli/tests/{fixtures,net_fixtures,error_fixtures}/`) are `exclude`d so cargo never compiles them.
+- Strategy: black-box CLI tests via `assert_cmd::Command::cargo_bin("edo-cli")`. Each test calls `common::copy_fixture(...)` (or `copy_umbrella()`) to clone the fixture into a `TempDir`, then injects `--storage <tempdir>/.edo-test-store` to isolate state. Helpers live in `crates/cli/tests/common/{fixtures,network,catalog}.rs`, pulled in by each test file with `mod common;`.
 - Unit tests live inline in `crates/edo/src/**/*.rs` (`#[cfg(test)] mod tests` in ~14 modules including scheduler, context, storage, util). `crates/core` has no inline tests. Several traits (`Source`, `Vendor`, `Backend`, `Environment`, `Farm`, `Transform`) generate mocks under `#[cfg(test)] use mockall::automock`.
 - Network gating is **runtime-only** (no `#[ignore]`, no Cargo features):
   - `network::run_git_source`, `run_remote_source`, `run_cargo_vendor_build`, `run_go_vendor_build` always execute and require live internet.
   - `run_script_in_container` early-returns unless `EDO_TEST_CONTAINER=1` and `podman` or `docker` is on `PATH`.
-- `tests/tests/umbrella.rs::manual_smoke` is annotated `#[serial]` (`serial_test`) — it mutates shared filesystem state; do not parallelize it.
+- `crates/cli/tests/umbrella.rs::manual_smoke` is annotated `#[serial]` (`serial_test`) — it mutates shared filesystem state; do not parallelize it.
 
 Common invocations:
 
@@ -136,19 +136,19 @@ cargo test --workspace
 cargo test -p edo
 
 # Integration tests, single file
-cargo test -p edo-integration-tests --test run
-cargo test -p edo-integration-tests --test checkout
-cargo test -p edo-integration-tests --test errors
-cargo test -p edo-integration-tests --test list
-cargo test -p edo-integration-tests --test update_and_lock
-cargo test -p edo-integration-tests --test prune
-cargo test -p edo-integration-tests --test umbrella
+cargo test -p edo-cli --test run
+cargo test -p edo-cli --test checkout
+cargo test -p edo-cli --test errors
+cargo test -p edo-cli --test list
+cargo test -p edo-cli --test update_and_lock
+cargo test -p edo-cli --test prune
+cargo test -p edo-cli --test umbrella
 
 # Network tests (require connectivity)
-cargo test -p edo-integration-tests --test network
+cargo test -p edo-cli --test network
 
 # Container test (additionally requires podman/docker)
-EDO_TEST_CONTAINER=1 cargo test -p edo-integration-tests --test network run_script_in_container
+EDO_TEST_CONTAINER=1 cargo test -p edo-cli --test network run_script_in_container
 ```
 
-When fixing or adding behaviour, write tests at the layer that can actually break: prefer the `crates/edo` unit module that owns the invariant; fall back to a CLI fixture under `tests/fixtures/` when the surface is end-to-end. Do not create mocks; the existing `mockall::automock` setup is sufficient.
+When fixing or adding behaviour, write tests at the layer that can actually break: prefer the `crates/edo` unit module that owns the invariant; fall back to a CLI fixture under `crates/cli/tests/fixtures/` when the surface is end-to-end. Do not create mocks; the existing `mockall::automock` setup is sufficient.

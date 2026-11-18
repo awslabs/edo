@@ -68,7 +68,7 @@ use std::{
 };
 
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
-use jiff::Zoned;
+use jiff::ZonedDateTime;
 use owo_colors::{OwoColorize, Stream};
 use parking_lot::{Mutex, MutexGuard};
 use snafu::ResultExt;
@@ -694,7 +694,7 @@ fn render_running_message(id: &str, status: TaskStatus, phase: &str) -> String {
 /// status.  `elapsed == ZERO` renders without the duration slot (used
 /// for cache-hits and tasks that skipped straight past `running`).
 fn render_terminal_line(id: &str, status: TaskStatus, phase: &str, elapsed: Duration) -> String {
-    let timestamp = Zoned::now().strftime("%H:%M:%S").to_string();
+    let timestamp = ZonedDateTime::now().strftime("%H:%M:%S").to_string();
     let ts = format!("[{timestamp}]")
         .if_supports_color(Stream::Stderr, |t| t.dimmed().to_string())
         .to_string();
@@ -818,7 +818,7 @@ where
         let mut v = LineVisitor::default();
         event.record(&mut v);
 
-        let timestamp = Zoned::now().strftime("%H:%M:%S").to_string();
+        let timestamp = ZonedDateTime::now().strftime("%H:%M:%S").to_string();
         let level_str = match level {
             Level::ERROR => "ERROR"
                 .if_supports_color(Stream::Stderr, |t| t.bold().red().to_string())

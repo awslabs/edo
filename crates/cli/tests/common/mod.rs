@@ -1,3 +1,8 @@
+//! Helpers shared by the CLI integration tests.
+//!
+//! Each test file compiles this module separately and uses a subset of it.
+#![allow(dead_code, unused_imports)]
+
 pub mod catalog;
 pub mod fixtures;
 pub mod network;

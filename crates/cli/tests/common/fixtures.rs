@@ -4,19 +4,25 @@ use assert_cmd::Command;
 use assert_cmd::assert::Assert;
 use tempfile::TempDir;
 
-/// Absolute path to the offline fixture tree (`tests/fixtures/`).
+/// Absolute path to the offline fixture tree (`crates/cli/tests/fixtures/`).
 pub fn fixtures_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
 }
 
-/// Absolute path to the expected-failure fixture tree (`tests/error_fixtures/`).
+/// Absolute path to the expected-failure fixture tree (`crates/cli/tests/error_fixtures/`).
 pub fn error_fixtures_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("error_fixtures")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("error_fixtures")
 }
 
-/// Absolute path to the network/container opt-in fixture tree (`tests/net_fixtures/`).
+/// Absolute path to the network/container opt-in fixture tree (`crates/cli/tests/net_fixtures/`).
 pub fn net_fixtures_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("net_fixtures")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("net_fixtures")
 }
 
 /// A copy of a fixture placed in a temporary directory so tests cannot pollute each other.
@@ -43,8 +49,8 @@ impl Fixture {
     /// Does not inject `--storage` — use [`Fixture::edo`] when you want that
     /// isolation (which is what every test default does).
     pub fn cmd(&self) -> Command {
-        let mut c =
-            Command::cargo_bin("edo-cli").expect("edo-cli binary should be built by dev-dep");
+        let mut c = Command::cargo_bin("edo-cli")
+            .expect("CARGO_BIN_EXE_edo-cli is set by cargo for integration tests");
         c.current_dir(&self.path);
         c.env_remove("RUST_LOG");
         c
