@@ -9,17 +9,17 @@
 //! All fallible operations return [`EnvResult`], with failures modelled by
 //! [`EnvironmentError`] in [`error`].
 
-use super::storage::Id;
-use super::storage::Storage;
-use crate::context::Handle;
-use crate::context::Log;
-use crate::storage::{ArtifactStageOptions, MediaType};
-use crate::util::{Reader, Writer};
 use arc_handle::arc_handle;
 use async_trait::async_trait;
 #[cfg(test)]
 use mockall::automock;
 use std::path::{Component, Path, PathBuf};
+
+use crate::{
+    context::{Handle, Log},
+    storage::{ArtifactStageOptions, Id, MediaType, Storage},
+    util::{Reader, Writer},
+};
 
 /// Archive suffixes recognized by [`resolved_stage_subpath`], ordered
 /// longest-first so compound suffixes like `.tar.gz` win over their base
@@ -150,6 +150,15 @@ pub trait Environment {
     async fn read_bytes(&self, path: &Path) -> EnvResult<Vec<u8>>;
     async fn read_stream(&self, path: &Path, writer: Writer) -> EnvResult<()>;
     async fn execute(&self, log: &Log, id: &Id, path: &Path, command: &str) -> EnvResult<bool>;
+    async fn execute_privileged(
+        &self,
+        log: &Log,
+        id: &Id,
+        path: &Path,
+        command: &str,
+    ) -> EnvResult<bool> {
+        self.execute(log, id, path, command).await
+    }
     /// Open a shell in the environment
     fn shell(&self, path: &Path) -> EnvResult<()>;
 }
@@ -194,7 +203,7 @@ impl Environment {
                 // we do this by seeing if a filename has been set
                 let mut filepath = options.path().to_path_buf();
                 if !options.ignore_artifact_path() {
-                    let filename = safe_hint.unwrap_or(PathBuf::from(layer.digest().digest()));
+                    let filename = safe_hint.unwrap_or(layer.digest().as_path());
                     filepath = filepath.join(filename);
                 }
 

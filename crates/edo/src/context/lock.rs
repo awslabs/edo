@@ -4,13 +4,11 @@
 //! so that subsequent builds can skip resolution when the project
 //! configuration has not changed. It is serialized as `edo.lock.json`.
 
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-use serde::{Deserialize, Serialize};
-
-use crate::context::Element;
-
 use super::Addr;
+use crate::context::Element;
 
 /// A serializable lock file that records the digest of the project
 /// configuration and the resolved dependency nodes.

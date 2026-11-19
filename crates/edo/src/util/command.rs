@@ -1,13 +1,13 @@
-use crate::context::Log;
-use std::ffi::OsString;
-use std::io::Result;
-use std::os::fd::IntoRawFd;
-use std::path::Path;
-
 use dashmap::DashMap;
 use duct::IntoExecutablePath;
 use std::collections::HashMap;
+use std::ffi::OsString;
+use std::io::Result;
 use std::io::Write;
+use std::os::fd::IntoRawFd;
+use std::path::Path;
+
+use crate::context::Log;
 
 /// Convert a [`DashMap`] into a standard [`HashMap`] by cloning all entries.
 pub fn from_dash<K, V>(input: &DashMap<K, V>) -> HashMap<K, V>

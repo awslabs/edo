@@ -1,17 +1,16 @@
 use std::collections::BTreeSet;
 
+use crate::util::{Reader, Writer};
 use arc_handle::arc_handle;
 use async_trait::async_trait;
 #[cfg(test)]
 #[allow(unused_imports)]
 use mockall::automock;
 
-use crate::storage::LayerOptions;
-use crate::util::{Reader, Writer};
-
-use super::StorageResult;
 use super::{
-    artifact::{Artifact, Layer},
+    artifact::{Artifact, Layer, LayerOptions},
+    digest::Digest,
+    error::StorageResult,
     id::Id,
 };
 
@@ -48,12 +47,12 @@ pub trait Backend {
     /// Reports whether a blob with the given bare hex digest is already
     /// stored by this backend, without performing IO outside the backend's
     /// own state.
-    async fn has_blob(&self, _digest: &str) -> StorageResult<bool>;
+    async fn has_blob(&self, _digest: &Digest) -> StorageResult<bool>;
     /// Return the size in bytes of a stored blob, if present.
     ///
     /// Used by content-addressed sources to populate accurate `size`
     /// fields when reusing an existing blob (the manifest is the
     /// source-of-truth for the data model and lying about size is a
     /// footgun for any future consumer that range-reads by size).
-    async fn blob_size(&self, _digest: &str) -> StorageResult<Option<u64>>;
+    async fn blob_size(&self, _digest: &Digest) -> StorageResult<Option<u64>>;
 }

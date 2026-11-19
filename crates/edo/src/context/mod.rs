@@ -1,12 +1,5 @@
 //! Build configuration, component registration, and session coordination.
 
-use super::{
-    environment::Farm,
-    scheduler::Scheduler,
-    source::{Source, Vendor},
-    transform::Transform,
-};
-use crate::storage::{Backend, LocalBackend, Storage};
 use dashmap::DashMap;
 use serde_json::json;
 use snafu::ResultExt;
@@ -17,6 +10,14 @@ use std::sync::Arc;
 use tokio::fs::create_dir_all;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
+
+use super::{
+    environment::Farm,
+    scheduler::Scheduler,
+    source::{Source, Vendor},
+    storage::{Backend, LocalBackend, Storage},
+    transform::Transform,
+};
 
 mod address;
 mod builder;

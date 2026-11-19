@@ -16,13 +16,13 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
-use crate::context::{Addr, Context, Handle, IdCache};
-use crate::log::TaskStatus;
-use crate::storage::{Artifact, Id};
-use crate::transform::Transform;
-
-use super::node::Node;
-use super::{Result, error};
+use super::{Result, error, node::Node};
+use crate::{
+    context::{Addr, Context, Handle, IdCache},
+    log::TaskStatus,
+    storage::{Artifact, Id},
+    transform::Transform,
+};
 
 /// Lifecycle phase names recorded as the `phase` field of task events.
 mod phase {
@@ -780,10 +780,11 @@ pub(crate) mod tests {
     use super::*;
     use crate::context::{Addr, Context, LogVerbosity};
     use crate::environment::{Environment, Farm, MockEnvironmentImpl, MockFarmImpl};
-    use crate::storage::{Artifact as StorageArtifact, Config as ArtifactConfig, Id, MediaType};
+    use crate::storage::{
+        Artifact as StorageArtifact, Config as ArtifactConfig, Digest, Id, MediaType,
+    };
     use crate::transform::{MockTransformImpl, Transform, TransformStatus};
     use futures::FutureExt;
-    use sha2::{Digest, Sha256};
     use std::collections::HashMap;
     use std::path::Path;
     use std::sync::Arc;
@@ -920,10 +921,10 @@ pub(crate) mod tests {
         FailInStage,
     }
 
-    fn make_artifact(digest: &str) -> StorageArtifact {
+    fn make_artifact(digest: &Digest) -> StorageArtifact {
         let id = Id::builder()
             .name("mock".to_string())
-            .digest(digest.to_string())
+            .digest(digest.clone())
             .build();
         StorageArtifact::builder()
             .media_type(MediaType::File(crate::storage::Compression::None))
@@ -956,7 +957,7 @@ pub(crate) mod tests {
         }
         {
             let addr = addr.clone();
-            let digest = digest.clone();
+            let digest = Digest::builder().update(digest.clone().as_bytes()).build();
             m.expect_get_unique_id().returning(move |_ctx| {
                 Ok(Id::builder()
                     .name(addr.to_string())
@@ -995,7 +996,7 @@ pub(crate) mod tests {
             let max_inflight = max_inflight.clone();
             let order_log = order_log.clone();
             let addr_for_log = addr.clone();
-            let digest_for_status = digest.clone();
+            let digest_for_status = Digest::builder().update(digest.clone().as_bytes()).build();
             m.expect_transform().returning(move |_log, _ctx, _env| {
                 transform_called.fetch_add(1, AtomicOrdering::SeqCst);
                 let now = inflight.fetch_add(1, AtomicOrdering::SeqCst) + 1;
@@ -1104,7 +1105,9 @@ pub(crate) mod tests {
             .map(|s| Addr::parse(s).expect("dep addr"))
             .collect();
         let env_addr = Addr::parse("//default").unwrap();
-        let digest = format!("{:064x}", fxhash(addr_str));
+        let digest = Digest::builder()
+            .update(format!("{:064x}", fxhash(addr_str)).as_bytes())
+            .build();
         let prepare_called = Arc::new(AtomicUsize::new(0));
         let stage_called = Arc::new(AtomicUsize::new(0));
         let transform_called = Arc::new(AtomicUsize::new(0));
@@ -1177,7 +1180,9 @@ pub(crate) mod tests {
             .map(|s| Addr::parse(s).expect("dep addr"))
             .collect();
         let env_addr = Addr::parse("//default").unwrap();
-        let digest = format!("{:064x}", fxhash(addr_str));
+        let digest = Digest::builder()
+            .update(format!("{:064x}", fxhash(addr_str)).as_bytes())
+            .build();
         let prepare_called = Arc::new(AtomicUsize::new(0));
         let stage_called = Arc::new(AtomicUsize::new(0));
         let transform_called = Arc::new(AtomicUsize::new(0));
@@ -1252,7 +1257,9 @@ pub(crate) mod tests {
     ) -> MockHandles {
         let addr = Addr::parse(addr_str).unwrap();
         let env_addr = Addr::parse("//default").unwrap();
-        let digest = format!("{:064x}", fxhash(addr_str));
+        let digest = Digest::builder()
+            .update(format!("{:064x}", fxhash(addr_str)).as_bytes())
+            .build();
         let prepare_called = Arc::new(AtomicUsize::new(0));
         let stage_called = Arc::new(AtomicUsize::new(0));
         let transform_called = Arc::new(AtomicUsize::new(0));
@@ -1548,7 +1555,9 @@ pub(crate) mod tests {
             mock.expect_get_unique_id().returning(move |_| {
                 Ok(Id::builder()
                     .name(name.clone())
-                    .digest("a".repeat(64))
+                    .digest(
+                        Digest::try_from(format!("sha256:{}", "a".repeat(64)).as_str()).unwrap(),
+                    )
                     .build())
             });
             mock.expect_needs_prepare().returning(|_| Ok(true));
@@ -1564,7 +1573,7 @@ pub(crate) mod tests {
         let log = ctx.log().create("glogfail-probe").await.unwrap();
         let id = Id::builder()
             .name(first.to_id())
-            .digest("a".repeat(64))
+            .digest(Digest::try_from(format!("sha256:{}", "a".repeat(64)).as_str()).unwrap())
             .build();
         let blocked_path = log.path().parent().unwrap().join(format!("{id}.log"));
         tokio::fs::create_dir(&blocked_path).await.unwrap();
@@ -1583,7 +1592,7 @@ pub(crate) mod tests {
         let ctx = ctx_or_skip!();
         ensure_default_farm(&ctx);
         let addr = Addr::parse("//gskip/node").unwrap();
-        let artifact = make_artifact(&format!("{:064x}", fxhash("gskip")));
+        let artifact = make_artifact(&Digest::builder().update(b"gskip").build());
         let id = artifact.config().id().clone();
         let mut mock = MockTransformImpl::new();
         mock.expect_depends().returning(|| Ok(Vec::new()));
@@ -1651,15 +1660,15 @@ pub(crate) mod tests {
                 .times(1)
                 .returning(move |handle| {
                     count.fetch_add(1, AtomicOrdering::SeqCst);
-                    let mut hash = Sha256::new();
+                    let mut hash = Digest::builder();
                     hash.update(name.as_bytes());
                     for dep in &deps {
                         let id = handle.unique_id_of(dep).now_or_never().unwrap()?;
-                        hash.update(id.digest().as_bytes());
+                        hash.update(id.digest().hash());
                     }
                     Ok(Id::builder()
                         .name(addr.to_id())
-                        .digest(base16::encode_lower(hash.finalize().as_slice()))
+                        .digest(hash.build())
                         .build())
                 });
             mock.expect_needs_prepare().returning(|_| Ok(false));

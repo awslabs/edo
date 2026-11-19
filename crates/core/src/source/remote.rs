@@ -1,9 +1,6 @@
 use async_trait::async_trait;
-use edo::record;
-use edo::storage::{Layer, LayerOptions};
 use futures::TryStreamExt;
 use serde_json::json;
-use sha2::{Digest, Sha256};
 use snafu::{ResultExt, ensure};
 use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
 use std::path::PathBuf;
@@ -12,9 +9,12 @@ use tokio_util::io::StreamReader;
 use tracing::Instrument;
 use url::Url;
 
-use edo::context::{Context, Element, FromElement, Log};
-use edo::source::{SourceImpl, SourceResult};
-use edo::storage::{Artifact, Config, Id, MediaType, Storage};
+use edo::{
+    context::{Context, Element, FromElement, Log},
+    record,
+    source::{SourceImpl, SourceResult},
+    storage::{Artifact, Config, Digest, Id, Layer, LayerOptions, MediaType, Storage},
+};
 
 /// A source that fetches a file from a remote URL and stores it as an artifact.
 #[derive(serde::Deserialize, Debug, Clone)]
@@ -22,7 +22,7 @@ use edo::storage::{Artifact, Config, Id, MediaType, Storage};
 pub struct RemoteSource {
     url: Url,
     #[serde(rename = "ref")]
-    digest: String,
+    digest: Digest,
     out: Option<PathBuf>,
 }
 
@@ -35,34 +35,24 @@ impl FromElement for RemoteSource {
     }
 }
 
-impl RemoteSource {
-    /// Returns the content reference without its optional `sha256:` prefix.
-    fn blob_digest(&self) -> &str {
-        self.digest
-            .strip_prefix("sha256:")
-            .unwrap_or(self.digest.as_str())
-    }
-}
-
 #[async_trait]
 impl SourceImpl for RemoteSource {
     async fn get_unique_id(&self) -> SourceResult<Id> {
         // Hash the user-supplied content digest together with `out` so a
         // change to `out` invalidates the cached *manifest*, even though
         // the blob itself is still content-addressed by `self.digest`.
-        let mut hasher = Sha256::new();
-        hasher.update(self.digest.as_bytes());
-        hasher.update(
+        let mut digest = Digest::with_algorithm(self.digest.algorithm());
+        digest.update(self.digest.hash());
+        digest.update(
             self.out
                 .as_ref()
                 .and_then(|p| p.to_str())
                 .unwrap_or("")
                 .as_bytes(),
         );
-        let manifest_digest = base16::encode_lower(hasher.finalize().as_slice());
         let id = Id::builder()
             .name(self.url.path().to_string())
-            .digest(manifest_digest)
+            .digest(digest.build())
             .build();
         trace!(subsystem = "source", component = "remote", id = %id, "calculated id");
         Ok(id)
@@ -72,7 +62,7 @@ impl SourceImpl for RemoteSource {
         let id = self.get_unique_id().await?;
         let id_s = id.to_string();
         let url = self.url.clone();
-        let blob_digest = self.blob_digest().to_string();
+        let blob_digest = self.digest.clone();
         async move {
             // Build the manifest skeleton once; we'll fill in the layer
             // either from a fresh download or by reusing an existing blob.
@@ -136,6 +126,7 @@ impl SourceImpl for RemoteSource {
 
                 // Remote sources are stored in a single layer of the artifact
                 let mut writer = storage.safe_start_layer().await?;
+                writer.set_algorithm(blob_digest.algorithm());
                 tokio::io::copy(&mut reader, &mut writer)
                     .await
                     .context(error::IoSnafu)?;
@@ -148,9 +139,9 @@ impl SourceImpl for RemoteSource {
 
                 // Validate content against `ref`, not the manifest digest.
                 ensure!(
-                    layer.digest().digest() == blob_digest,
+                    *layer.digest() == blob_digest,
                     error::DigestSnafu {
-                        actual: layer.digest().digest(),
+                        actual: layer.digest().clone(),
                         expected: blob_digest.clone()
                     }
                 );
@@ -163,7 +154,7 @@ impl SourceImpl for RemoteSource {
                 artifact
                     .config_mut()
                     .path_hints_mut()
-                    .insert(layer.digest().digest(), hint);
+                    .insert(layer.digest().clone(), hint);
             }
             artifact.layers_mut().push(layer);
 
@@ -280,7 +271,7 @@ async fn send_with_ipv4_fallback(
 pub mod error {
     use snafu::Snafu;
 
-    use edo::{context::error::ContextError, source::SourceError};
+    use edo::{context::error::ContextError, source::SourceError, storage::Digest};
 
     #[derive(Snafu, Debug)]
     #[snafu(visibility(pub))]
@@ -293,7 +284,7 @@ pub mod error {
         #[snafu(display("failed to fetch remote source from '{url}': {message}"))]
         Failed { url: url::Url, message: String },
         #[snafu(display("remote source has hash '{actual}' instead of expected '{expected}'"))]
-        Digest { actual: String, expected: String },
+        Digest { actual: Digest, expected: Digest },
         #[snafu(display("io error occured during remote source fetch: {source}"))]
         Io { source: std::io::Error },
         #[snafu(display("failed to make request to remote: {source}"))]

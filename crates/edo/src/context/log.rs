@@ -5,8 +5,6 @@
 //! so it can be used as both a Rust writer and a raw file descriptor for
 //! child processes.
 
-use super::LogManager;
-use super::{ContextResult as Result, error};
 use parking_lot::Mutex;
 use snafu::ResultExt;
 use std::fs::{File, OpenOptions};
@@ -14,6 +12,9 @@ use std::io::Write;
 use std::os::fd::IntoRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+use super::LogManager;
+use super::{ContextResult as Result, error};
 
 /// A cloneable, thread-safe log file for a single build task.
 #[derive(Clone)]
